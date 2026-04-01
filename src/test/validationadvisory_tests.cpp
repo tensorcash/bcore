@@ -1,0 +1,487 @@
+// Copyright (c) 2024-present The TensorCash developers
+// Distributed under the MIT software license, see the accompanying
+// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+
+#include <validationadvisory.h>
+
+#include <consensus/consensus.h>
+#include <arith_uint256.h>
+#include <test/util/setup_common.h>
+#include <uint256.h>
+#include <util/strencodings.h>
+#include <primitives/transaction.h>
+
+#include <chrono>
+#include <map>
+#include <set>
+#include <thread>
+
+#include <boost/test/unit_test.hpp>
+
+BOOST_FIXTURE_TEST_SUITE(validationadvisory_tests, BasicTestingSetup)
+
+BOOST_AUTO_TEST_CASE(should_trigger_advisory_thresholds)
+{
+    // Test ShouldTriggerAdvisory function with explicit config
+    // to avoid depending on gArgs in unit tests
+
+    ReorgAdvisoryConfig config;
+    config.enabled = true;
+    config.depth_threshold = 3;  // default
+    config.offline_threshold_secs = 6 * 60 * 60;  // 6 hours default
+
+    // Depth <= 3 should NOT trigger (regardless of time)
+    BOOST_CHECK(!ShouldTriggerAdvisory(0, 0, config));
+    BOOST_CHECK(!ShouldTriggerAdvisory(1, 0, config));
+    BOOST_CHECK(!ShouldTriggerAdvisory(2, 0, config));
+    BOOST_CHECK(!ShouldTriggerAdvisory(3, 0, config));
+    BOOST_CHECK(!ShouldTriggerAdvisory(3, 3600, config));  // 1 hour
+
+    // Depth > 3 with reasonable time SHOULD trigger
+    BOOST_CHECK(ShouldTriggerAdvisory(4, 0, config));
+    BOOST_CHECK(ShouldTriggerAdvisory(4, 3600, config));       // 1 hour
+    BOOST_CHECK(ShouldTriggerAdvisory(10, 1800, config));      // 30 minutes
+    BOOST_CHECK(ShouldTriggerAdvisory(100, 7200, config));     // 2 hours
+
+    // Depth > 3 but offline > 6 hours should NOT trigger
+    const int64_t six_hours = 6 * 60 * 60;
+    BOOST_CHECK(!ShouldTriggerAdvisory(4, six_hours + 1, config));
+    BOOST_CHECK(!ShouldTriggerAdvisory(10, six_hours + 3600, config));
+    BOOST_CHECK(!ShouldTriggerAdvisory(100, 24 * 60 * 60, config));  // 24 hours
+
+    // Boundary at exactly 6 hours
+    BOOST_CHECK(ShouldTriggerAdvisory(4, six_hours - 1, config));
+    BOOST_CHECK(ShouldTriggerAdvisory(4, six_hours, config));
+    BOOST_CHECK(!ShouldTriggerAdvisory(4, six_hours + 1, config));
+}
+
+BOOST_AUTO_TEST_CASE(should_trigger_advisory_disabled)
+{
+    // Test that disabled config prevents advisory
+    ReorgAdvisoryConfig config;
+    config.enabled = false;
+    config.depth_threshold = 3;
+    config.offline_threshold_secs = 6 * 60 * 60;
+
+    // Even deep reorgs should NOT trigger when disabled
+    BOOST_CHECK(!ShouldTriggerAdvisory(100, 0, config));
+    BOOST_CHECK(!ShouldTriggerAdvisory(1000, 0, config));
+}
+
+BOOST_AUTO_TEST_CASE(should_trigger_advisory_custom_thresholds)
+{
+    // Test with custom thresholds
+    ReorgAdvisoryConfig config;
+    config.enabled = true;
+    config.depth_threshold = 10;  // Higher threshold
+    config.offline_threshold_secs = 3600;  // Only 1 hour offline threshold
+
+    // Depth 5 should NOT trigger with threshold 10
+    BOOST_CHECK(!ShouldTriggerAdvisory(5, 0, config));
+    BOOST_CHECK(!ShouldTriggerAdvisory(10, 0, config));
+
+    // Depth 11 SHOULD trigger
+    BOOST_CHECK(ShouldTriggerAdvisory(11, 0, config));
+
+    // But offline > 1 hour should NOT trigger
+    BOOST_CHECK(!ShouldTriggerAdvisory(11, 3601, config));
+}
+
+BOOST_AUTO_TEST_CASE(tx_overlap_calculation)
+{
+    // Test ComputeTxOverlap with various scenarios
+
+    // Empty sets - degenerate case returns 100%
+    {
+        SegmentStats seg_a, seg_b;
+        BOOST_CHECK_CLOSE(ComputeTxOverlap(seg_a, seg_b), 100.0, 0.01);
+    }
+
+    // Identical sets - 100% overlap
+    {
+        SegmentStats seg_a, seg_b;
+        uint256 tx1 = uint256::FromHex("0000000000000000000000000000000000000000000000000000000000000001").value();
+        uint256 tx2 = uint256::FromHex("0000000000000000000000000000000000000000000000000000000000000002").value();
+        uint256 tx3 = uint256::FromHex("0000000000000000000000000000000000000000000000000000000000000003").value();
+
+        seg_a.txids = {tx1, tx2, tx3};
+        seg_b.txids = {tx1, tx2, tx3};
+
+        BOOST_CHECK_CLOSE(ComputeTxOverlap(seg_a, seg_b), 100.0, 0.01);
+    }
+
+    // No overlap - 0%
+    {
+        SegmentStats seg_a, seg_b;
+        uint256 tx1 = uint256::FromHex("0000000000000000000000000000000000000000000000000000000000000001").value();
+        uint256 tx2 = uint256::FromHex("0000000000000000000000000000000000000000000000000000000000000002").value();
+        uint256 tx3 = uint256::FromHex("0000000000000000000000000000000000000000000000000000000000000003").value();
+        uint256 tx4 = uint256::FromHex("0000000000000000000000000000000000000000000000000000000000000004").value();
+
+        seg_a.txids = {tx1, tx2};
+        seg_b.txids = {tx3, tx4};
+
+        BOOST_CHECK_CLOSE(ComputeTxOverlap(seg_a, seg_b), 0.0, 0.01);
+    }
+
+    // Partial overlap - Jaccard index calculation
+    // A = {1, 2, 3}, B = {2, 3, 4}
+    // Intersection = {2, 3} = 2 elements
+    // Union = {1, 2, 3, 4} = 4 elements
+    // Jaccard = 2/4 = 50%
+    {
+        SegmentStats seg_a, seg_b;
+        uint256 tx1 = uint256::FromHex("0000000000000000000000000000000000000000000000000000000000000001").value();
+        uint256 tx2 = uint256::FromHex("0000000000000000000000000000000000000000000000000000000000000002").value();
+        uint256 tx3 = uint256::FromHex("0000000000000000000000000000000000000000000000000000000000000003").value();
+        uint256 tx4 = uint256::FromHex("0000000000000000000000000000000000000000000000000000000000000004").value();
+
+        seg_a.txids = {tx1, tx2, tx3};
+        seg_b.txids = {tx2, tx3, tx4};
+
+        BOOST_CHECK_CLOSE(ComputeTxOverlap(seg_a, seg_b), 50.0, 0.01);
+    }
+
+    // One empty, one non-empty - 0%
+    {
+        SegmentStats seg_a, seg_b;
+        uint256 tx1 = uint256::FromHex("0000000000000000000000000000000000000000000000000000000000000001").value();
+
+        seg_a.txids = {tx1};
+        // seg_b.txids is empty
+
+        BOOST_CHECK_CLOSE(ComputeTxOverlap(seg_a, seg_b), 0.0, 0.01);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(advisory_summary_format)
+{
+    // Test ReorgAdvisory::Summary() output format
+
+    ReorgAdvisory advisory;
+    advisory.is_valid = false;
+
+    // Invalid advisory
+    std::string summary = advisory.Summary();
+    BOOST_CHECK(summary.find("invalid") != std::string::npos);
+
+    // Valid advisory
+    advisory.is_valid = true;
+    advisory.lca_height = 100000;
+    advisory.depth_current = 5;
+    advisory.depth_fork = 8;
+    advisory.tx_overlap_pct = 85.5;
+    advisory.first_block_delay_secs = 3600;  // 1 hour
+    advisory.hashrate_current_pct = 95.0;
+    advisory.hashrate_fork_pct = 150.0;
+    advisory.calibration.sec_per_tick = 0.001;
+    advisory.calibration.is_valid = true;
+
+    summary = advisory.Summary();
+    BOOST_CHECK(summary.find("LCA=100000") != std::string::npos);
+    BOOST_CHECK(summary.find("depth_cur=5") != std::string::npos);
+    BOOST_CHECK(summary.find("depth_fork=8") != std::string::npos);
+    BOOST_CHECK(summary.find("tx_overlap=85.5%") != std::string::npos);
+    BOOST_CHECK(summary.find("first_block_delay=3600s") != std::string::npos);
+    BOOST_CHECK(summary.find("calibration_ok=true") != std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(tick_calibration_edge_cases)
+{
+    // Test TickTimeCalibration structure
+
+    TickTimeCalibration cal;
+
+    // Default should be invalid
+    BOOST_CHECK(!cal.is_valid);
+    BOOST_CHECK_EQUAL(cal.sec_per_tick, 0.0);
+    BOOST_CHECK_EQUAL(cal.baseline_hashrate, 0.0);
+
+    // Set valid values
+    cal.is_valid = true;
+    cal.sec_per_tick = 0.0005;  // 0.5ms per tick
+    cal.baseline_hashrate = 1e15;  // 1 PH/s
+    cal.window_blocks = 2000;
+
+    BOOST_CHECK(cal.is_valid);
+    BOOST_CHECK_GT(cal.sec_per_tick, 0.0);
+    BOOST_CHECK_GT(cal.baseline_hashrate, 0.0);
+}
+
+BOOST_AUTO_TEST_CASE(segment_stats_structure)
+{
+    // Test SegmentStats structure and methods
+
+    SegmentStats seg;
+
+    // Default values
+    BOOST_CHECK_EQUAL(seg.block_count, 0);
+    BOOST_CHECK_EQUAL(seg.ticks_diff, 0);
+    BOOST_CHECK_EQUAL(seg.clock_time_secs, 0);
+    BOOST_CHECK_EQUAL(seg.miner_time_secs, 0);
+    BOOST_CHECK(seg.txids.empty());
+    BOOST_CHECK(!seg.data_complete);
+
+    // Set some values
+    seg.block_count = 10;
+    seg.ticks_diff = 100000;
+    seg.clock_time_secs = 6000;  // 100 minutes
+    seg.miner_time_secs = 5900;  // ~98 minutes
+    seg.data_complete = true;
+
+    uint256 tx1 = uint256::FromHex("0000000000000000000000000000000000000000000000000000000000000001").value();
+    seg.txids.insert(tx1);
+
+    BOOST_CHECK_EQUAL(seg.block_count, 10);
+    BOOST_CHECK_EQUAL(seg.txids.size(), 1u);
+    BOOST_CHECK(seg.data_complete);
+}
+
+BOOST_AUTO_TEST_CASE(constants_values)
+{
+    // Verify constants are set to expected values
+
+    BOOST_CHECK_EQUAL(ADVISORY_DEPTH_THRESHOLD, 3);
+    BOOST_CHECK_EQUAL(ADVISORY_OFFLINE_THRESHOLD_SECS, 6 * 60 * 60);  // 6 hours
+    BOOST_CHECK_EQUAL(ADVISORY_CALIBRATION_WINDOW, 2000);
+}
+
+BOOST_AUTO_TEST_CASE(config_struct_defaults)
+{
+    // Test ReorgAdvisoryConfig default values
+    ReorgAdvisoryConfig config;
+
+    BOOST_CHECK(config.enabled);
+    BOOST_CHECK_EQUAL(config.depth_threshold, ADVISORY_DEPTH_THRESHOLD);
+    BOOST_CHECK_EQUAL(config.offline_threshold_secs, ADVISORY_OFFLINE_THRESHOLD_SECS);
+}
+
+BOOST_AUTO_TEST_CASE(should_gate_reorg_skips_disconnect_only_retreat)
+{
+    ReorgGatingConfig config;
+    config.enabled = true;
+    config.gating_depth_threshold = ADVISORY_DEPTH_THRESHOLD;
+
+    BOOST_CHECK(ShouldGateReorg(ADVISORY_DEPTH_THRESHOLD + 1, 0, /*disconnect_only=*/false, config));
+    BOOST_CHECK(!ShouldGateReorg(ADVISORY_DEPTH_THRESHOLD + 1, 0, /*disconnect_only=*/true, config));
+}
+
+BOOST_AUTO_TEST_CASE(advisory_store_operations)
+{
+    // Test ReorgAdvisoryStore functionality
+    ReorgAdvisoryStore store;
+
+    // Initially empty
+    BOOST_CHECK_EQUAL(store.Size(), 0u);
+    BOOST_CHECK(!store.GetLatest().has_value());
+    BOOST_CHECK(store.GetAll().empty());
+
+    // Add an advisory
+    ReorgAdvisory adv1;
+    adv1.lca_height = 100;
+    adv1.depth_current = 5;
+    adv1.is_valid = true;
+    store.Add(adv1);
+
+    BOOST_CHECK_EQUAL(store.Size(), 1u);
+    BOOST_CHECK(store.GetLatest().has_value());
+    BOOST_CHECK_EQUAL(store.GetLatest()->lca_height, 100);
+
+    // Add another advisory
+    ReorgAdvisory adv2;
+    adv2.lca_height = 200;
+    adv2.depth_current = 10;
+    adv2.is_valid = true;
+    store.Add(adv2);
+
+    BOOST_CHECK_EQUAL(store.Size(), 2u);
+    // Latest should be the newest one
+    BOOST_CHECK_EQUAL(store.GetLatest()->lca_height, 200);
+
+    // GetRecent should return newest first
+    auto recent = store.GetRecent(2);
+    BOOST_CHECK_EQUAL(recent.size(), 2u);
+    BOOST_CHECK_EQUAL(recent[0].lca_height, 200);
+    BOOST_CHECK_EQUAL(recent[1].lca_height, 100);
+
+    // Clear
+    store.Clear();
+    BOOST_CHECK_EQUAL(store.Size(), 0u);
+    BOOST_CHECK(!store.GetLatest().has_value());
+}
+
+BOOST_AUTO_TEST_CASE(max_blocks_for_txids_default)
+{
+    // Test that GetMaxBlocksForTxids returns default when no arg is set
+    // Note: In unit tests, gArgs may not have the arg set, so we get the default
+    int max_blocks = GetMaxBlocksForTxids();
+    // Should be the default value (100) when no arg is set
+    BOOST_CHECK_EQUAL(max_blocks, DEFAULT_MAX_BLOCKS_FOR_TXIDS);
+}
+
+BOOST_AUTO_TEST_CASE(constants_updated)
+{
+    // Verify the new constant is correct
+    BOOST_CHECK_EQUAL(DEFAULT_MAX_BLOCKS_FOR_TXIDS, 100);
+}
+
+BOOST_AUTO_TEST_CASE(generate_advisory_metrics_basic)
+{
+    // Build a small synthetic fork with explicit ticks, times, and first_seen values.
+    // Use lambda-backed data source to avoid disk I/O.
+    struct BlockNode {
+        std::unique_ptr<CBlockIndex> index;
+        uint256 hash;
+    };
+
+    auto MakeBlock = [](int64_t nTime, uint64_t cumulative_tick, int tx_tag) {
+        CBlock blk;
+        blk.nTime = nTime;
+        blk.cumulative_tick = cumulative_tick;
+
+        CMutableTransaction coinbase;
+        coinbase.vin.resize(1);
+        coinbase.vout.resize(1);
+        coinbase.vout[0].nValue = 50 * COIN;
+        blk.vtx.push_back(MakeTransactionRef(coinbase));
+
+        CMutableTransaction tx;
+        tx.vin.resize(1);
+        tx.vout.resize(1);
+        tx.vout[0].nValue = 1 * COIN;
+        tx.vout[0].scriptPubKey.assign(reinterpret_cast<const unsigned char*>(&tx_tag),
+                                       reinterpret_cast<const unsigned char*>(&tx_tag) + sizeof(tx_tag));
+        blk.vtx.push_back(MakeTransactionRef(tx));
+        return blk;
+    };
+
+    std::vector<BlockNode> nodes;
+    std::map<uint256, CBlock> blocks;
+    std::map<uint256, int64_t> first_seen;
+
+    auto add_block = [&](int height, const std::string& hash_hex, uint64_t chainwork,
+                         int64_t nTime, uint64_t cumulative_tick, int tx_tag, CBlockIndex* prev) -> CBlockIndex* {
+        nodes.push_back({});
+        BlockNode& node = nodes.back();
+        node.hash = uint256::FromHex(hash_hex).value();
+        node.index = std::make_unique<CBlockIndex>();
+        node.index->nHeight = height;
+        node.index->nTime = nTime;
+        uint256 cw = uint256::FromHex(strprintf("%064x", chainwork)).value();
+        node.index->nChainWork = UintToArith256(cw);
+        node.index->pprev = prev;
+        node.index->phashBlock = &node.hash;
+
+        CBlock blk = MakeBlock(nTime, cumulative_tick, tx_tag);
+        blocks.emplace(node.hash, blk);
+        first_seen[node.hash] = nTime + 5;
+        return node.index.get();
+    };
+
+    // Base chain: b0 -> b1 -> lca (b2)
+    CBlockIndex* b0 = add_block(0, "0000000000000000000000000000000000000000000000000000000000000001", 10, 100, 0, 1, nullptr);
+    CBlockIndex* b1 = add_block(1, "0000000000000000000000000000000000000000000000000000000000000002", 20, 160, 10, 2, b0);
+    CBlockIndex* lca = add_block(2, "0000000000000000000000000000000000000000000000000000000000000003", 30, 220, 30, 3, b1);
+
+    // Current chain: lca -> c3 -> c4
+    CBlockIndex* c3 = add_block(3, "0000000000000000000000000000000000000000000000000000000000000004", 45, 280, 50, 4, lca);
+    CBlockIndex* current_tip = add_block(4, "0000000000000000000000000000000000000000000000000000000000000005", 60, 340, 70, 5, c3);
+
+    // Fork chain: lca -> f3 -> f4 -> f5
+    CBlockIndex* f3 = add_block(3, "0000000000000000000000000000000000000000000000000000000000000006", 50, 280, 55, 6, lca);
+    CBlockIndex* f4 = add_block(4, "0000000000000000000000000000000000000000000000000000000000000007", 70, 340, 80, 7, f3);
+    CBlockIndex* fork_tip = add_block(5, "0000000000000000000000000000000000000000000000000000000000000008", 90, 400, 100, 8, f4);
+
+    auto reader = [&](const CBlockIndex& idx, CBlock& out) {
+        auto it = blocks.find(idx.GetBlockHash());
+        if (it == blocks.end()) return false;
+        out = it->second;
+        return true;
+    };
+    auto seen = [&](const uint256& h) {
+        auto it = first_seen.find(h);
+        return it == first_seen.end() ? int64_t{0} : it->second;
+    };
+
+    LambdaBlockDataSource source(reader, seen);
+
+    // Supply a safe calibration window (>= min window) to avoid optional access issues.
+    ReorgAdvisory adv = GenerateReorgAdvisory(
+        source,
+        current_tip,
+        fork_tip,
+        lca,
+        /*calibration_window=*/3,
+        /*calibration_min_window=*/1);
+
+    BOOST_CHECK(adv.is_valid);
+    BOOST_CHECK_EQUAL(adv.lca_height, 2);
+    BOOST_CHECK_EQUAL(adv.depth_current, 2);
+    BOOST_CHECK_EQUAL(adv.depth_fork, 3);
+
+    // sec_per_tick: (220 - 100) / (30 - 0) = 120 / 30 = 4, but our window (3) walks back only 2 blocks ->  (220-160)/(30-10)=60/20=3
+    BOOST_CHECK(adv.calibration.is_valid);
+    BOOST_CHECK_CLOSE(adv.calibration.sec_per_tick, 3.0, 0.1);
+
+    BOOST_CHECK_EQUAL(adv.seg_current.ticks_diff, 40u); // 70 - 30
+    BOOST_CHECK_EQUAL(adv.seg_fork.ticks_diff, 70u);    // 100 - 30
+
+    // Fork has more work and higher hashrate than current branch
+    BOOST_CHECK_GT(adv.hashrate_fork_pct, adv.hashrate_current_pct);
+    BOOST_CHECK_GT(adv.first_block_delay_secs, 0);
+    BOOST_CHECK_EQUAL(static_cast<int>(adv.tx_overlap_pct), 0);
+}
+
+BOOST_AUTO_TEST_CASE(worker_pool_basic)
+{
+    // Test AdvisoryWorkerPool basic lifecycle
+    AdvisoryWorkerPool pool;
+
+    // Not running initially
+    BOOST_CHECK(!pool.IsRunning());
+
+    // Start the pool
+    pool.Start();
+    BOOST_CHECK(pool.IsRunning());
+
+    // Submit an advisory
+    ReorgAdvisory adv;
+    adv.lca_height = 12345;
+    adv.depth_current = 5;
+    adv.is_valid = true;
+    pool.Submit(adv);
+
+    // Give the worker a moment to process
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    // Stop the pool
+    pool.Stop();
+    BOOST_CHECK(!pool.IsRunning());
+
+    // Start is idempotent
+    pool.Start();
+    pool.Start();  // Should not crash or create duplicate threads
+    pool.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(worker_pool_multiple_submits)
+{
+    AdvisoryWorkerPool pool;
+    pool.Start();
+
+    // Submit multiple advisories
+    for (int i = 0; i < 10; ++i) {
+        ReorgAdvisory adv;
+        adv.lca_height = 1000 + i;
+        adv.depth_current = 5;
+        adv.is_valid = true;
+        pool.Submit(adv);
+    }
+
+    // Give the worker time to process all
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    pool.Stop();
+}
+
+BOOST_AUTO_TEST_SUITE_END()
