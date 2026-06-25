@@ -1483,28 +1483,57 @@ static bool RebuildModelDbFromActiveChain(ChainstateManager& chainman, const Con
         const CChain& chain = chainman.ActiveChain();
         active_chain.reserve(std::max(0, chain.Height()) + 1);
         for (int h = 0; h <= chain.Height(); ++h) active_chain.push_back(chain[h]);
+    }
 
-        if (has_synced_tip) {
-            const CBlockIndex* synced_index = chainman.m_blockman.LookupBlockIndex(synced_hash);
-            const bool can_incremental =
-                synced_index != nullptr &&
-                chain.Contains(synced_index) &&
-                synced_index->nHeight == synced_height;
+    const int active_tip_height = static_cast<int>(active_chain.size()) - 1;
+    const auto block_on_active_chain = [&](int height, const uint256& hash) -> bool {
+        return height >= 0 && height <= active_tip_height &&
+               active_chain[height] && active_chain[height]->GetBlockHash() == hash;
+    };
 
-            if (can_incremental) {
-                full_rebuild = false;
-                start_height = synced_height + 1;
-                LogPrintf("[ModelDB] Incremental sync from height=%d to tip=%d\n", synced_height, chain.Height());
-            } else {
-                const CBlockIndex* tip = chain.Tip();
-                const CBlockIndex* synced_index_for_fork = chainman.m_blockman.LookupBlockIndex(synced_hash);
-                const CBlockIndex* fork = (synced_index_for_fork && tip) ? LastCommonAncestor(synced_index_for_fork, tip) : nullptr;
-                LogPrintf("[ModelDB] Reorg or stale tip detected (stored=%s@%d, fork_height=%d); switching to full rebuild\n",
-                          synced_hash.ToString(), synced_height, fork ? fork->nHeight : -1);
+    // Crash-consistent recovery via the per-block undo journal. The on-disk ModelDB
+    // advances one block at a time; each commit atomically bundles that block's
+    // writes, an undo record, and the applied-tip marker (CModelDB::CommitBlock).
+    // After an unclean shutdown the applied tip can be AHEAD of the reloaded
+    // (last-flushed) chain tip or sit on an orphaned branch. Rewind it block-by-block
+    // using the undo journal — which needs no historical block bodies, so it is safe
+    // even on a pruned datadir — until it lands on a block that is on the active
+    // chain (or genesis). Then replay forward only the shallow remainder. This
+    // replaces the old "tip off active chain -> full rebuild from block 1" path that
+    // turned every unclean restart on a pruned node into a fatal error.
+    if (has_synced_tip) {
+        full_rebuild = false;
+        while (synced_height > 0 && !block_on_active_chain(synced_height, synced_hash)) {
+            CModelBlockUndo undo;
+            // Require an undo record whose own (height,hash) matches the marker we are
+            // about to rewind — never apply a stale/corrupt same-height record to the
+            // wrong block. A miss here means a pre-undo-journal ModelDB, divergence
+            // older than the retention window, or corruption: fall back to a full
+            // rebuild, which the guard below refuses (fatal) on a pruned datadir.
+            if (!g_modeldb->ReadBlockUndo(synced_height, undo) ||
+                undo.height != synced_height || undo.hash != synced_hash) {
+                LogPrintf("[ModelDB] Applied tip %s@%d is off the active chain and has no matching "
+                          "undo record; falling back to full rebuild\n", synced_hash.ToString(), synced_height);
+                full_rebuild = true;
+                break;
             }
-        } else {
-            LogPrintf("[ModelDB] No synced tip marker found; switching to full rebuild\n");
+            LogPrintf("[ModelDB] Rewinding applied tip %s@%d (off active chain) via undo journal\n",
+                      synced_hash.ToString(), synced_height);
+            if (!g_modeldb->ApplyUndoAndRewindTip(undo)) {
+                error = Untranslated(strprintf(
+                    "ModelDB recovery failed while rewinding block %d via undo journal.", synced_height));
+                return false;
+            }
+            synced_height = undo.parent_height;
+            synced_hash = undo.parent_hash;
         }
+        if (!full_rebuild) {
+            start_height = synced_height + 1;
+            LogPrintf("[ModelDB] Incremental sync from height=%d to tip=%d\n", synced_height, active_tip_height);
+        }
+    } else {
+        LogPrintf("[ModelDB] No synced tip marker found; switching to full rebuild\n");
+        full_rebuild = true;
     }
 
     if (full_rebuild) {
@@ -1616,6 +1645,13 @@ static bool RebuildModelDbFromActiveChain(ChainstateManager& chainman, const Con
             return false;
         }
         g_modeldb->WriteBlockModelIndex(pindex->GetBlockHash(), static_cast<uint32_t>(pindex->nHeight), block.pow.GetModelHash());
+
+        // Replay this block's ModelDB mutations through the journaled batch so the
+        // undo journal + applied-tip advance atomically per block, exactly as live
+        // block connection does — making a subsequent unclean restart recoverable too.
+        g_modeldb->BeginBlock(pindex->nHeight, pindex->GetBlockHash(),
+                              pindex->nHeight - 1,
+                              pindex->pprev ? pindex->pprev->GetBlockHash() : uint256::ZERO);
 
         for (const auto& tx_ref : block.vtx) {
             const CTransaction& tx = *tx_ref;
@@ -1815,7 +1851,11 @@ static bool RebuildModelDbFromActiveChain(ChainstateManager& chainman, const Con
             challenge_schedule.erase(ch_it);
         }
 
-        g_modeldb->WriteSyncedTip(pindex->nHeight, pindex->GetBlockHash());
+        if (!g_modeldb->CommitBlock()) {
+            error = Untranslated(strprintf(
+                "ModelDB recovery failed to commit replayed block at height %d.", pindex->nHeight));
+            return false;
+        }
     }
 
     // If node restarts after a model verification event height has already passed,
@@ -1833,66 +1873,104 @@ static bool RebuildModelDbFromActiveChain(ChainstateManager& chainman, const Con
             candidate_models.push_back(model_hash);
         });
 
-        for (const uint256& model_hash : candidate_models) {
-            ModelRecord record;
-            if (!g_modeldb->ReadModel(model_hash, record)) continue;
-            if (record.status != ModelRegistrationStatus::PendingDeposit &&
-                record.status != ModelRegistrationStatus::PendingVerification) {
-                continue;
-            }
+        // Journal the finalization writes below into the tip block's undo record so
+        // they are reversible on a later reorg/restart (candidates were gathered above
+        // against committed state, before opening the block).
+        const CBlockIndex* tip_index = active_chain.back();
+        const CBlockIndex* tip_parent =
+            (tip_index->nHeight >= 1 && tip_index->nHeight - 1 < static_cast<int>(active_chain.size()))
+                ? active_chain[tip_index->nHeight - 1]
+                : nullptr;
+        // Journal the repair writes into the tip block's undo record IF that block has
+        // one (always true for blocks this binary connected/replayed). On an upgraded
+        // node whose tip predates the journal, ResumeBlock returns false and we DEFER the
+        // repair entirely (skip the mutations, only advance the marker) — the next
+        // journaled block re-applies any overdue finalization. See the commit branch below.
+        const bool repair_journaled = g_modeldb->ResumeBlock(
+            tip_index->nHeight, tip_index->GetBlockHash(),
+            tip_index->nHeight - 1,
+            tip_parent ? tip_parent->GetBlockHash() : uint256::ZERO);
 
-            // Repair missing event height for pending records.
-            if (record.verification_event_height <= 0 && record.deposit_block_height > 0 &&
-                consensus.ModelVerificationBlockCount > 0) {
-                record.verification_event_height =
-                    record.deposit_block_height + static_cast<int>(consensus.ModelVerificationBlockCount);
-                g_modeldb->WriteModel(model_hash, record, /*overwrite=*/true);
-                if (record.verification_event_height > tip_height) {
-                    CModelDB::VerificationValue sched;
-                    g_modeldb->WriteVerificationSchedule(
-                        static_cast<uint32_t>(record.verification_event_height), model_hash, sched);
+        if (repair_journaled) {
+            // The repair mutations are staged into the tip block's undo record (via
+            // ResumeBlock), so they are reversible on a later reorg/rewind.
+            for (const uint256& model_hash : candidate_models) {
+                ModelRecord record;
+                if (!g_modeldb->ReadModel(model_hash, record)) continue;
+                if (record.status != ModelRegistrationStatus::PendingDeposit &&
+                    record.status != ModelRegistrationStatus::PendingVerification) {
+                    continue;
                 }
-                LogPrintf("[ModelDB] Repaired missing verification_event_height for %s: event_height=%d (tip=%d)\n",
-                          model_hash.ToString(), record.verification_event_height, tip_height);
-            }
 
-            if (record.verification_event_height <= 0 || record.verification_event_height > tip_height) continue;
+                // Repair missing event height for pending records.
+                if (record.verification_event_height <= 0 && record.deposit_block_height > 0 &&
+                    consensus.ModelVerificationBlockCount > 0) {
+                    record.verification_event_height =
+                        record.deposit_block_height + static_cast<int>(consensus.ModelVerificationBlockCount);
+                    g_modeldb->WriteModel(model_hash, record, /*overwrite=*/true);
+                    if (record.verification_event_height > tip_height) {
+                        CModelDB::VerificationValue sched;
+                        g_modeldb->WriteVerificationSchedule(
+                            static_cast<uint32_t>(record.verification_event_height), model_hash, sched);
+                    }
+                    LogPrintf("[ModelDB] Repaired missing verification_event_height for %s: event_height=%d (tip=%d)\n",
+                              model_hash.ToString(), record.verification_event_height, tip_height);
+                }
 
-            const int event_height = record.verification_event_height;
-            const bool meets_threshold = record.successful_commit_count >= consensus.ModelSuccessfulCommitsThreshold;
-            if (meets_threshold) {
-                record.status = ModelRegistrationStatus::Registered;
-            } else {
-                record.status = ModelRegistrationStatus::Locked;
-                record.commit_txid.SetNull();
-                record.commit_block_height = event_height;
-                if (event_height >= 0 && event_height < static_cast<int>(active_chain.size()) && active_chain[event_height]) {
-                    record.commit_block_hash = active_chain[event_height]->GetBlockHash();
+                if (record.verification_event_height <= 0 || record.verification_event_height > tip_height) continue;
+
+                const int event_height = record.verification_event_height;
+                const bool meets_threshold = record.successful_commit_count >= consensus.ModelSuccessfulCommitsThreshold;
+                if (meets_threshold) {
+                    record.status = ModelRegistrationStatus::Registered;
                 } else {
-                    record.commit_block_hash.SetNull();
+                    record.status = ModelRegistrationStatus::Locked;
+                    record.commit_txid.SetNull();
+                    record.commit_block_height = event_height;
+                    if (event_height >= 0 && event_height < static_cast<int>(active_chain.size()) && active_chain[event_height]) {
+                        record.commit_block_hash = active_chain[event_height]->GetBlockHash();
+                    } else {
+                        record.commit_block_hash.SetNull();
+                    }
+                    record.burn_txid = record.deposit_txid;
+                    record.burn_vout = record.deposit_vout;
+                    record.burn_block_height = 0;
+                    const COutPoint deposit_out(Txid::FromUint256(record.deposit_txid), record.deposit_vout);
+                    g_modeldb->EraseDepositIndex(deposit_out);
+                    g_modeldb->WriteBurnIndex(deposit_out, model_hash);
                 }
-                record.burn_txid = record.deposit_txid;
-                record.burn_vout = record.deposit_vout;
-                record.burn_block_height = 0;
-                const COutPoint deposit_out(Txid::FromUint256(record.deposit_txid), record.deposit_vout);
-                g_modeldb->EraseDepositIndex(deposit_out);
-                g_modeldb->WriteBurnIndex(deposit_out, model_hash);
+
+                record.verification_event_height = 0;
+                g_modeldb->WriteModel(model_hash, record, /*overwrite=*/true);
+                g_modeldb->EraseVerificationSchedule(static_cast<uint32_t>(event_height), model_hash);
+                LogPrintf("[ModelDB] Finalized overdue model verification for %s at event_height=%d (tip=%d), new_status=%u\n",
+                          model_hash.ToString(), event_height, tip_height, static_cast<unsigned>(record.status));
             }
 
-            record.verification_event_height = 0;
-            g_modeldb->WriteModel(model_hash, record, /*overwrite=*/true);
-            g_modeldb->EraseVerificationSchedule(static_cast<uint32_t>(event_height), model_hash);
-            LogPrintf("[ModelDB] Finalized overdue model verification for %s at event_height=%d (tip=%d), new_status=%u\n",
-                      model_hash.ToString(), event_height, tip_height, static_cast<unsigned>(record.status));
+            // Atomically commit the repair writes + advance the applied-tip marker
+            // (merged into the tip block's undo record).
+            if (!g_modeldb->CommitBlock()) {
+                error = Untranslated("ModelDB recovery failed to commit post-replay repair writes.");
+                return false;
+            }
+        } else {
+            // Pre-journal tip (no undo record for the tip). Performing the overdue
+            // finalization writes here would be UN-journaled and NOT reversible by
+            // body-based DisconnectBlock — they are catch-up effects, not effects of the
+            // tip block's body — which is a soundness hole on a later reorg/rewind. So
+            // skip them entirely: the next connected block's runtime catch-up (in
+            // ConnectTip) re-applies any overdue finalization, journaled under that
+            // block. Only advance the marker here.
+            if (!candidate_models.empty()) {
+                LogPrintf("[ModelDB] Pre-journal tip at height=%d with %d pending model(s); deferring "
+                          "finalization to the next connected block's journaled catch-up\n",
+                          tip_height, static_cast<int>(candidate_models.size()));
+            }
+            if (!g_modeldb->WriteSyncedTip(tip_index->nHeight, tip_index->GetBlockHash())) {
+                error = Untranslated("ModelDB recovery failed to persist the synced tip on the pre-journal fallback path.");
+                return false;
+            }
         }
-    }
-
-    // Advance the synced marker. Any blocks skipped above were not-yet-downloaded
-    // (IBD / assumeutxo — normal validation (re)registers their models when they
-    // arrive); a full rebuild that would skip *pruned* blocks was already refused
-    // before the wipe, so the genuinely-unrecoverable case never reaches here.
-    if (!active_chain.empty() && active_chain.back()) {
-        g_modeldb->WriteSyncedTip(active_chain.back()->nHeight, active_chain.back()->GetBlockHash());
     }
 
     LogPrintf("[ModelDB] Sync complete.\n");
