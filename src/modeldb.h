@@ -182,11 +182,57 @@ struct ModelRecord {
     }
 };
 
+// One reversible entry of a connected block's ModelDB mutations: the raw
+// (deobfuscated) leveldb key and the value that key held *before* the block was
+// applied. `had_value=false` means the key did not exist pre-block, so undoing
+// the block must erase it. Keys/values are stored opaquely so a single uniform
+// apply path reverts every column family (model record, deposit/burn/challenge
+// indexes, verification/challenge schedules) without needing the block body.
+struct CModelUndoEntry {
+    std::vector<unsigned char> key;
+    bool had_value{false};
+    std::vector<unsigned char> value;
+
+    SERIALIZE_METHODS(CModelUndoEntry, obj)
+    {
+        READWRITE(obj.key, obj.had_value, obj.value);
+    }
+};
+
+// Per-block undo journal record. Persisted atomically with the block's forward
+// ModelDB writes and the applied-tip marker (see CModelDB::CommitBlock), so the
+// on-disk ModelDB can always be rewound to match whatever chain height survives
+// an unclean shutdown — no historical block bodies required, which is what makes
+// recovery safe on a pruned datadir. `parent_*` links to the predecessor so a
+// rewind can walk the journal backwards.
+struct CModelBlockUndo {
+    int32_t height{0};
+    uint256 hash{uint256::ZERO};
+    int32_t parent_height{0};
+    uint256 parent_hash{uint256::ZERO};
+    std::vector<CModelUndoEntry> entries;
+
+    SERIALIZE_METHODS(CModelBlockUndo, obj)
+    {
+        READWRITE(obj.height, obj.hash, obj.parent_height, obj.parent_hash, obj.entries);
+    }
+};
+
+// In-flight state for the block currently being connected (defined in modeldb.cpp).
+struct CModelActiveBlock;
+
 class CModelDB {
 private:
     std::unique_ptr<CDBWrapper> db;
+    // Non-null only between BeginBlock() and CommitBlock()/AbortBlock(). While set,
+    // every mutator buffers its write into a single atomic batch (capturing undo),
+    // and every point reader is served from the buffered overlay so intra-block
+    // read-after-write keeps the exact pre-existing consensus semantics.
+    std::unique_ptr<CModelActiveBlock> m_active;
 
 public:
+    ~CModelDB();
+
     struct VerificationValue {
         uint8_t state{0};
         bool has_snapshot{false};
@@ -288,6 +334,43 @@ public:
     bool WriteSyncedTip(int height, const uint256& block_hash);
     bool ReadSyncedTip(int& height, uint256& block_hash) const;
     bool EraseSyncedTip();
+
+    // --- Per-block journaled batch (crash-consistent ModelDB) ---
+    // Begin buffering the mutations of the block at (height, hash); parent_* is its
+    // predecessor (height-1). Until CommitBlock(), nothing is written to leveldb:
+    // mutators stage into an in-memory batch + overlay and record undo entries.
+    void BeginBlock(int32_t height, const uint256& hash, int32_t parent_height, const uint256& parent_hash);
+    // Reopen an already-committed block to EXTEND its undo record (so later writes that
+    // logically belong to it stay journaled/reversible). Returns true and activates the
+    // block ONLY if an existing undo record matches (height AND hash); returns false
+    // and activates nothing when none matches (e.g. a ModelDB from a pre-journal binary
+    // whose tip has no undo record). It never manufactures a fresh/partial undo for an
+    // already-applied block, which a later rewind would wrongly trust. When it returns
+    // false the caller must NOT manufacture a partial undo: it should DEFER any
+    // irreversible catch-up repairs (the next journaled block re-applies them) and only
+    // persist the synced-tip marker itself.
+    [[nodiscard]] bool ResumeBlock(int32_t height, const uint256& hash, int32_t parent_height, const uint256& parent_hash);
+    // Begin a DISCONNECT batch: staged writes are a rollback (no undo captured); the
+    // matching CommitBlock erases the disconnected block's undo record and moves the
+    // applied-tip marker to the new tip — all atomically. Lets the body-based
+    // DisconnectBlock reversal commit all-or-nothing (its block-index side effects
+    // still run immediately), so a crash mid-disconnect cannot leave ModelDB half
+    // rolled back.
+    void BeginDisconnect(int32_t disconnected_height, bool has_new_tip,
+                         int32_t new_tip_height, const uint256& new_tip_hash);
+    // Atomically persist (fsync) the buffered forward writes + the block's undo
+    // record + the applied-tip marker as one leveldb batch. Returns false on IO error.
+    bool CommitBlock();
+    // Discard the buffered block without writing anything (used on a mid-block
+    // validation failure — fixes the legacy partial-write-on-rejected-block hole).
+    void AbortBlock();
+    bool HasActiveBlock() const;
+
+    // --- Undo-journal recovery primitives (used by startup recovery + reorg) ---
+    bool ReadBlockUndo(int32_t height, CModelBlockUndo& undo) const;
+    // Revert one block: apply every undo entry, move the applied-tip marker to the
+    // record's parent, and erase the consumed undo record — atomically (fsync).
+    bool ApplyUndoAndRewindTip(const CModelBlockUndo& undo);
 };
 
 extern std::unique_ptr<CModelDB> g_modeldb;

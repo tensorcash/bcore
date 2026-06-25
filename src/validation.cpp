@@ -6164,14 +6164,37 @@ bool Chainstate::DisconnectTip(BlockValidationState& state, DisconnectedBlockTra
         LogError("DisconnectTip(): Failed to read block\n");
         return false;
     }
+    // Discards the staged (uncommitted) ModelDB rollback on ANY early return below —
+    // a failed DisconnectBlock, a FlushStateToDisk failure, etc. — so a left-over
+    // active block can never expose an uncommitted rollback overlay to later reads.
+    struct ModelDisconnectGuard {
+        bool committed{false};
+        ~ModelDisconnectGuard() { if (g_modeldb && !committed) g_modeldb->AbortBlock(); }
+    } model_disconnect_guard;
+
     // Apply the block atomically to the chain state.
     const auto time_start{SteadyClock::now()};
     {
         CCoinsViewCache view(&CoinsTip());
         assert(view.GetBestBlock() == pindexDelete->GetBlockHash());
+        // Buffer DisconnectBlock's ModelDB key reversals into an atomic disconnect
+        // batch so they commit all-or-nothing with the journal bookkeeping below
+        // (CommitBlock erases this block's undo record + moves the applied-tip marker
+        // to the new tip). DisconnectBlock still runs in full so its block-index side
+        // effects (e.g. clearing model-challenge zero-work) are applied immediately;
+        // only its ModelDB writes are staged. This closes the window where a crash
+        // mid-reversal could leave ModelDB half-rolled-back while the marker still
+        // matched the (unflushed) old tip.
+        const CBlockIndex* const new_tip = pindexDelete->pprev;
+        if (g_modeldb) {
+            g_modeldb->BeginDisconnect(pindexDelete->nHeight,
+                                       /*has_new_tip=*/new_tip != nullptr,
+                                       new_tip ? new_tip->nHeight : 0,
+                                       new_tip ? new_tip->GetBlockHash() : uint256::ZERO);
+        }
         if (DisconnectBlock(block, pindexDelete, view) != DISCONNECT_OK) {
             LogError("DisconnectTip(): DisconnectBlock %s failed\n", pindexDelete->GetBlockHash().ToString());
-            return false;
+            return false; // guard aborts the staged ModelDB rollback
         }
         bool flushed = view.Flush();
         assert(flushed);
@@ -6207,14 +6230,17 @@ bool Chainstate::DisconnectTip(BlockValidationState& state, DisconnectedBlockTra
 
     UpdateTip(pindexDelete->pprev);
     if (g_modeldb) {
-        const CBlockIndex* const new_tip = m_chain.Tip();
-        const bool marker_written = new_tip != nullptr
-            ? g_modeldb->WriteSyncedTip(new_tip->nHeight, new_tip->GetBlockHash())
-            : g_modeldb->EraseSyncedTip();
-        if (!marker_written) {
-            LogError("%s: failed to persist ModelDB synced tip marker at height=%d\n",
-                     __func__, new_tip ? new_tip->nHeight : -1);
+        // Atomically commit the staged ModelDB reversal + erase this block's undo
+        // record + move the applied-tip marker to the new tip (one fsync'd batch). A
+        // crash before this leaves ModelDB untouched at the old tip (recovery re-runs
+        // the disconnect); a crash after leaves it at the new tip — never in between.
+        // The chain tip has already moved, so a commit failure would diverge ModelDB
+        // from the chainstate in-process: treat it as fatal (restart reconciles).
+        if (!g_modeldb->CommitBlock()) {
+            return FatalError(m_chainman.GetNotifications(), state,
+                              _("Failed to commit ModelDB state on block disconnect."));
         }
+        model_disconnect_guard.committed = true;
     }
     // Let wallets know transactions went from 1-confirmed to
     // 0-confirmed or conflicted:
@@ -6337,6 +6363,22 @@ bool Chainstate::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew,
              Ticks<MillisecondsDouble>(m_chainman.time_chainstate) / m_chainman.num_blocks_total);
     const Consensus::Params& consensusParams = m_chainman.GetConsensus();
     const bool do_write{g_modeldb != nullptr};
+    // Buffer all of this block's ModelDB mutations into one atomic, crash-consistent
+    // batch (forward writes + undo journal + applied-tip marker). The guard rolls the
+    // buffer back on any early return below (a mid-block validation failure), so a
+    // rejected block never leaves partial ModelDB state persisted; a clean commit at
+    // the end of this function replaces the old per-connect synced-tip write.
+    struct ModelBlockCommitGuard {
+        bool committed{false};
+        ~ModelBlockCommitGuard() { if (g_modeldb && !committed) g_modeldb->AbortBlock(); }
+    } model_block_guard;
+    if (do_write) {
+        // pprev is null for the genesis block, which this fork routes through
+        // ConnectTip during init — guard the parent-hash deref.
+        g_modeldb->BeginBlock(pindexNew->nHeight, pindexNew->GetBlockHash(),
+                              pindexNew->nHeight - 1,
+                              pindexNew->pprev ? pindexNew->pprev->GetBlockHash() : uint256::ZERO);
+    }
     std::map<COutPoint, std::pair<ModelDepositPayload, ModelRecord>> block_deposits;
     std::map<uint256, ModelRecord> block_model_records;
     std::map<COutPoint, uint256> block_burn_outputs;
@@ -7176,9 +7218,17 @@ bool Chainstate::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew,
         m_chainman.RecalculateBlockIndexWorkForFullValidation(pindexNew);
     }
     UpdateTip(pindexNew);
-    if (g_modeldb && !g_modeldb->WriteSyncedTip(pindexNew->nHeight, pindexNew->GetBlockHash())) {
-        LogError("%s: failed to persist ModelDB synced tip marker at height=%d hash=%s\n",
-                 __func__, pindexNew->nHeight, pindexNew->GetBlockHash().ToString());
+    if (do_write) {
+        // Atomically persist this block's staged ModelDB writes + undo record +
+        // applied-tip marker. The chain tip has already advanced (SetTip/UpdateTip
+        // above), so a commit failure would leave ModelDB behind the chainstate with
+        // no journal record for this block: that is unrecoverable in-process, so treat
+        // it as fatal (a restart then forward-replays the gap from the marker).
+        if (!g_modeldb->CommitBlock()) {
+            return FatalError(m_chainman.GetNotifications(), state,
+                              _("Failed to commit ModelDB state for the connected block."));
+        }
+        model_block_guard.committed = true;
     }
 
     const auto time_6{SteadyClock::now()};

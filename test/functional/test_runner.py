@@ -164,6 +164,7 @@ BASE_SCRIPTS = [
     'feature_model_reorg.py',
     'feature_model_registration.py',
     'feature_model_reindex.py',
+    'feature_model_crash_recovery.py',
     'feature_model_deposit_lock.py',
     'feature_model_verification_window.py',
     'feature_model_challenge.py',
