@@ -27,6 +27,8 @@ add_library(bitcoin_wallet STATIC EXCLUDE_FROM_ALL
   rpc/contracts.cpp
   rpc/difficulty.cpp
   rpc/option_series.cpp
+  rpc/scalar.cpp
+  rpc/scalar_cfd.cpp
   rpc/backup.cpp
   rpc/coins.cpp
   rpc/compliance_root.cpp
@@ -45,6 +47,8 @@ add_library(bitcoin_wallet STATIC EXCLUDE_FROM_ALL
   pricing/vol_surface.cpp
   pricing/correlation_matrix.cpp
   pricing/difficulty_curve.cpp
+  pricing/scalar_forward_curve.cpp
+  pricing/scalar_cfd_pricer.cpp
   pricing/difficulty_vol_surface.cpp
   pricing/pricing_context.cpp
   pricing/leg_valuator.cpp

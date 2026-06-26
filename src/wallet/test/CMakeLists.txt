@@ -28,8 +28,14 @@ target_sources(test_bitcoin
     vault_tests.cpp
     difficulty_contract_tests.cpp
     difficulty_pricer_tests.cpp
+    scalar_forward_curve_tests.cpp
+    scalar_cfd_pricer_tests.cpp
     option_series_tests.cpp
     option_series_wallet_tests.cpp
+    scalar_note_pair_tests.cpp
+    scalar_note_pair_wallet_tests.cpp
+    scalar_cfd_contract_tests.cpp
+    scalar_cfd_contract_wallet_tests.cpp
     wallet_crypto_tests.cpp
     wallet_tests.cpp
     wallet_transaction_tests.cpp

@@ -65,6 +65,8 @@ const std::string REPO_OFFER{"repooffer"};
 const std::string FORWARD_CONTRACT{"forwardcontract"};
 const std::string DIFFICULTY_CONTRACT{"diffcontract"};
 const std::string OPTION_SERIES{"optseries"};
+const std::string SCALAR_NOTE_PAIR{"scalarnotepair"};
+const std::string SCALAR_CFD_CONTRACT{"scalarcfdcontract"};
 const std::string SPOT_OFFER{"spotoffer"};
 const std::string CROSS_CHAIN_RECORD{"xchainrecord"};
 const std::string SETTLEMENT_PROFILE{"settlprofile"};
@@ -470,6 +472,26 @@ bool WalletBatch::WriteOptionSeries(const OptionSeriesRecord& record)
 bool WalletBatch::EraseOptionSeries(const uint256& series_id)
 {
     return EraseIC(std::make_pair(DBKeys::OPTION_SERIES, series_id));
+}
+
+bool WalletBatch::WriteScalarNotePair(const ScalarNotePairRecord& record)
+{
+    return WriteIC(std::make_pair(DBKeys::SCALAR_NOTE_PAIR, record.pair_id), record);
+}
+
+bool WalletBatch::EraseScalarNotePair(const uint256& pair_id)
+{
+    return EraseIC(std::make_pair(DBKeys::SCALAR_NOTE_PAIR, pair_id));
+}
+
+bool WalletBatch::WriteScalarCfdContract(const ScalarCfdContractRecord& record)
+{
+    return WriteIC(std::make_pair(DBKeys::SCALAR_CFD_CONTRACT, record.contract_id), record);
+}
+
+bool WalletBatch::EraseScalarCfdContract(const uint256& contract_id)
+{
+    return EraseIC(std::make_pair(DBKeys::SCALAR_CFD_CONTRACT, contract_id));
 }
 
 bool WalletBatch::WriteCrossChainRecord(const CrossChainRecord& record)
@@ -1519,6 +1541,71 @@ static DBErrors LoadOptionSeriesRecords(CWallet* pwallet, DatabaseBatch& batch) 
     return opt_res.m_result;
 }
 
+static DBErrors LoadScalarNotePairRecords(CWallet* pwallet, DatabaseBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet)
+{
+    AssertLockHeld(pwallet->cs_wallet);
+    LoadResult res = LoadRecords(pwallet, batch, DBKeys::SCALAR_NOTE_PAIR,
+        [] (CWallet* wallet, DataStream& key, DataStream& value, std::string& err) EXCLUSIVE_LOCKS_REQUIRED(wallet->cs_wallet) {
+            try {
+                uint256 pair_id;
+                key >> pair_id;
+
+                ScalarNotePairRecord record;
+                value >> record;
+
+                // Backfill a null stored id to the DERIVED id (never the raw DB key), then enforce
+                // pair_id == ComputeScalarNotePairId(terms) == the DB key, plus a well-formed vault set.
+                if (record.pair_id.IsNull()) record.pair_id = ComputeScalarNotePairId(record.terms);
+                std::string verr;
+                if (!ValidateScalarNotePairRecord(record, &pair_id, verr)) {
+                    err = strprintf("scalar note pair %s integrity check failed: %s", pair_id.GetHex(), verr);
+                    return DBErrors::CORRUPT;
+                }
+
+                wallet->LoadScalarNotePair(record);
+                return DBErrors::LOAD_OK;
+            } catch (const std::exception& e) {
+                err = e.what();
+                return DBErrors::CORRUPT;
+            }
+        });
+
+    return res.m_result;
+}
+
+static DBErrors LoadScalarCfdContractRecords(CWallet* pwallet, DatabaseBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet)
+{
+    AssertLockHeld(pwallet->cs_wallet);
+    LoadResult res = LoadRecords(pwallet, batch, DBKeys::SCALAR_CFD_CONTRACT,
+        [] (CWallet* wallet, DataStream& key, DataStream& value, std::string& err) EXCLUSIVE_LOCKS_REQUIRED(wallet->cs_wallet) {
+            try {
+                uint256 contract_id;
+                key >> contract_id;
+
+                ScalarCfdContractRecord record;
+                value >> record;
+
+                // contract_id is a pure function of (terms, salt): backfill a null stored id, then run the
+                // FULL record integrity gate (DB key == recomputed id, valid terms, NUMS vault internals,
+                // valid coop internals, complete Fair-Sign state) — not just id + terms.
+                if (record.contract_id.IsNull()) record.contract_id = ComputeScalarCfdContractId(record.terms, record.salt);
+                std::string verr;
+                if (!ValidateScalarCfdContractRecord(record, &contract_id, verr)) {
+                    err = strprintf("scalar CFD contract %s integrity check failed: %s", contract_id.GetHex(), verr);
+                    return DBErrors::CORRUPT;
+                }
+
+                wallet->LoadScalarCfdContract(record);
+                return DBErrors::LOAD_OK;
+            } catch (const std::exception& e) {
+                err = e.what();
+                return DBErrors::CORRUPT;
+            }
+        });
+
+    return res.m_result;
+}
+
 static DBErrors LoadCrossChainRecords(CWallet* pwallet, DatabaseBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet)
 {
     AssertLockHeld(pwallet->cs_wallet);
@@ -1876,6 +1963,8 @@ DBErrors WalletBatch::LoadWallet(CWallet* pwallet)
         result = std::max(LoadForwardContractRecords(pwallet, *m_batch), result);
         result = std::max(LoadDifficultyContractRecords(pwallet, *m_batch), result);
         result = std::max(LoadOptionSeriesRecords(pwallet, *m_batch), result);
+        result = std::max(LoadScalarNotePairRecords(pwallet, *m_batch), result);
+        result = std::max(LoadScalarCfdContractRecords(pwallet, *m_batch), result);
 
         // Load cross-chain records and settlement profiles
         result = std::max(LoadCrossChainRecords(pwallet, *m_batch), result);

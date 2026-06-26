@@ -1079,6 +1079,23 @@ RPCHelpMan optionseries_list();
 RPCHelpMan optionseries_build_settlement();
 RPCHelpMan optionseries_build_redeem();
 RPCHelpMan optionseries_build_buyback();
+RPCHelpMan scalar_build_register();
+RPCHelpMan scalar_build_issue();
+RPCHelpMan scalar_record_issue();
+RPCHelpMan scalar_list();
+RPCHelpMan scalar_build_redeem();
+RPCHelpMan scalar_build_unwind();
+RPCHelpMan scalar_build_settlement();
+RPCHelpMan scalarcfd_propose();
+RPCHelpMan scalarcfd_accept();
+RPCHelpMan scalarcfd_import_acceptance();
+RPCHelpMan scalarcfd_build_open();
+RPCHelpMan scalarcfd_record_open();
+RPCHelpMan scalarcfd_build_settlement();
+RPCHelpMan scalarcfd_finalize_settlement();
+RPCHelpMan scalarcfd_build_coop_close();
+RPCHelpMan scalarcfd_sign_coop();
+RPCHelpMan scalarcfd_price();
 
 // cross-chain settlement
 RPCHelpMan settlement_profile_add();
@@ -1284,6 +1301,23 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &optionseries_build_settlement},
         {"wallet", &optionseries_build_redeem},
         {"wallet", &optionseries_build_buyback},
+        {"wallet", &scalar_build_register},
+        {"wallet", &scalar_build_issue},
+        {"wallet", &scalar_record_issue},
+        {"wallet", &scalar_list},
+        {"wallet", &scalar_build_redeem},
+        {"wallet", &scalar_build_unwind},
+        {"wallet", &scalar_build_settlement},
+        {"wallet", &scalarcfd_propose},
+        {"wallet", &scalarcfd_accept},
+        {"wallet", &scalarcfd_import_acceptance},
+        {"wallet", &scalarcfd_build_open},
+        {"wallet", &scalarcfd_record_open},
+        {"wallet", &scalarcfd_build_settlement},
+        {"wallet", &scalarcfd_finalize_settlement},
+        {"wallet", &scalarcfd_build_coop_close},
+        {"wallet", &scalarcfd_sign_coop},
+        {"wallet", &scalarcfd_price},
         {"wallet", &settlement_profile_add},
         {"wallet", &settlement_profile_remove},
         {"wallet", &settlement_profile_list},

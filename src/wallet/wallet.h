@@ -33,6 +33,8 @@
 #include <wallet/contract.h>
 #include <wallet/difficulty_contract.h>
 #include <wallet/option_series.h>
+#include <wallet/scalar_note_pair.h>
+#include <wallet/scalar_cfd_contract.h>
 #include <wallet/crypter.h>
 #include <wallet/db.h>
 #include <wallet/scriptpubkeyman.h>
@@ -554,6 +556,8 @@ private:
     std::map<uint256, ForwardContractRecord> m_forward_contracts GUARDED_BY(cs_wallet);
     std::map<uint256, DifficultyContractRecord> m_difficulty_contracts GUARDED_BY(cs_wallet);
     std::map<uint256, OptionSeriesRecord> m_option_series GUARDED_BY(cs_wallet);
+    std::map<uint256, ScalarNotePairRecord> m_scalar_note_pairs GUARDED_BY(cs_wallet);
+    std::map<uint256, ScalarCfdContractRecord> m_scalar_cfd_contracts GUARDED_BY(cs_wallet);
 
     // Cross-chain settlement registries.
     std::map<std::string, CrossChainRecord> m_cross_chain_records GUARDED_BY(cs_wallet);
@@ -1159,6 +1163,18 @@ public:
     bool LoadOptionSeries(const OptionSeriesRecord& record) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     std::optional<OptionSeriesRecord> FindOptionSeries(const uint256& series_id) const;
     std::vector<OptionSeriesRecord> ListOptionSeries() const;
+
+    // Scalar note pairs (see wallet/scalar_note_pair.h). Persisted under DBKeys::SCALAR_NOTE_PAIR.
+    ScalarNotePairRecord RegisterScalarNotePair(ScalarNotePairRecord record);
+    bool LoadScalarNotePair(const ScalarNotePairRecord& record) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    std::optional<ScalarNotePairRecord> FindScalarNotePair(const uint256& pair_id) const;
+    std::vector<ScalarNotePairRecord> ListScalarNotePairs() const;
+
+    // Bilateral scalar CFD contracts (see wallet/scalar_cfd_contract.h). Persisted under DBKeys::SCALAR_CFD_CONTRACT.
+    ScalarCfdContractRecord RegisterScalarCfdContract(ScalarCfdContractRecord record);
+    bool LoadScalarCfdContract(const ScalarCfdContractRecord& record) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    std::optional<ScalarCfdContractRecord> FindScalarCfdContract(const uint256& contract_id) const;
+    std::vector<ScalarCfdContractRecord> ListScalarCfdContracts() const;
     bool MarkForwardContractAccepted(const uint256& contract_id,
                                      const std::string& acceptance_commitment,
                                      const uint256& acceptance_salt,

@@ -271,6 +271,144 @@ private:
     QLineEdit* optRedeemPotEdit{nullptr};
     QPushButton* optRedeemButton{nullptr};
 
+    // ===== CFD ASSET SERIES TAB (scalar note pair — securitised two-sided CFD) =====
+    // CFD_GENERALISATION.md §6/§7: the issuer's create/issue/record wizard for a tokenised scalar note pair
+    // (long token L + short token S over per-lot OP_SCALAR_CFD_SETTLE vaults), settled on an issuer-published
+    // scalar feed (or the committed fallback). Distinct from the difficulty Option Series tab: two-sided, asset
+    // or native collateral, and a permissionless complete-set unwind. The lifecycle steps are gated by the
+    // prior step's on-chain confirmation, which the scalar.* RPCs enforce.
+    QWidget* cfdSeriesTab{nullptr};
+    // Scalar feed publisher (top group): publish + read the issuer oracle the notes settle against.
+    QComboBox* cfdFeedAssetCombo{nullptr};      // U — a wallet-controlled feed-issuer asset
+    QLineEdit* cfdFeedIdEdit{nullptr};          // feed id (full uint32 — a line edit, not a spin, to span the domain)
+    QLineEdit* cfdFeedIcuEdit{nullptr};         // current ICU outpoint "txid:vout" (auto-filled by Lookup)
+    QLineEdit* cfdFeedNewIcuAddrEdit{nullptr};  // successor ICU destination
+    QPushButton* cfdFeedNewIcuAddrButton{nullptr};
+    QLineEdit* cfdFeedNewIcuAmtEdit{nullptr};   // successor ICU bond (TSC)
+    QLineEdit* cfdFeedEpochEdit{nullptr};       // scalar_epoch to publish (head+1)
+    QLineEdit* cfdFeedScalarEdit{nullptr};      // scalar value, 64-hex
+    QSpinBox*  cfdFeedFormatSpin{nullptr};      // scalar_format_id
+    QLineEdit* cfdFeedRateEdit{nullptr};        // publication fee rate (sat/vB)
+    QPushButton* cfdFeedLookupButton{nullptr};
+    QPushButton* cfdFeedPublishButton{nullptr};
+    QLineEdit* cfdFeedReadEpochEdit{nullptr};   // epoch to read back (blank = latest)
+    QPushButton* cfdFeedReadButton{nullptr};
+    QLabel* cfdFeedReadLabel{nullptr};
+    QTextEdit* cfdFeedStatusText{nullptr};
+    // Note-pair terms (middle group).
+    QComboBox* cfdParentCombo{nullptr};         // sponsoring root (shares the asset scan with optParentCombo)
+    QLineEdit* cfdLongSuffixEdit{nullptr};
+    QLineEdit* cfdShortSuffixEdit{nullptr};
+    QComboBox* cfdPayoffModeCombo{nullptr};     // STRIKE / REALIZED
+    QComboBox* cfdLossDirCombo{nullptr};        // owner long / short
+    QLineEdit* cfdUnderlyingEdit{nullptr};      // U asset id (defaults from the feed asset combo)
+    QLineEdit* cfdSeriesFeedIdEdit{nullptr};    // feed id (full uint32)
+    QLineEdit* cfdFixingRefEdit{nullptr};       // scalar_epoch the contract settles against
+    QLineEdit* cfdDeadlineHeightEdit{nullptr};  // publication_deadline_height
+    QLineEdit* cfdSettleLockEdit{nullptr};      // settle_lock_height (CLTV)
+    QSpinBox*  cfdFormatSpin{nullptr};          // scalar_format_id (must match the published feed)
+    QLineEdit* cfdStrikeEdit{nullptr};          // K, 64-hex
+    QLineEdit* cfdFallbackEdit{nullptr};        // fallback_scalar, 64-hex
+    QLineEdit* cfdLeverageEdit{nullptr};        // leverage x -> lambda_q (Q16)
+    QComboBox* cfdCollateralCombo{nullptr};     // C: Native TSC | collateral-safe wallet assets | Custom hex (§5.1 filter)
+    QLineEdit* cfdCollateralEdit{nullptr};      // C asset id, 64-hex (only shown for the Custom combo entry)
+    QLineEdit* cfdVaultImEdit{nullptr};         // per-lot IM in C units (sats if native)
+    QSpinBox*  cfdLotCountSpin{nullptr};        // N
+    QLineEdit* cfdSaltEdit{nullptr};
+    QPushButton* cfdSaltGenButton{nullptr};
+    QLineEdit* cfdBondEdit{nullptr};            // per-child ICU bond (TSC)
+    QLineEdit* cfdVaultNativeEdit{nullptr};     // native carrier per asset-collateral vault (TSC)
+    QLineEdit* cfdFeeRateEdit{nullptr};
+    QLabel* cfdPairIdLabel{nullptr};
+    QPushButton* cfdRegisterButton{nullptr};
+    QPushButton* cfdIssueButton{nullptr};
+    QPushButton* cfdRecordButton{nullptr};
+    QPushButton* cfdResetButton{nullptr};
+    QPushButton* cfdResumeButton{nullptr};      // restore a saved in-progress pair (terms + register/issue txids)
+    QTextEdit* cfdStatusText{nullptr};
+    QString m_cfdIssueTxid;                     // mint txid carried from build_issue -> record_issue
+    QString m_cfdRegisterTxid;                  // register txid (passed to record_issue for vault re-derivation)
+    // Recorded pairs list + lifecycle actions (bottom group).
+    QTableWidget* cfdPairTable{nullptr};
+    QPushButton* cfdRefreshListButton{nullptr};
+    QSpinBox* cfdLotIndexSpin{nullptr};
+    QLineEdit* cfdVaultOutpointEdit{nullptr};   // the lot vault "txid:vout" for settle/unwind (auto-filled from lot_vaults)
+    QPushButton* cfdSettleButton{nullptr};
+    QPushButton* cfdUnwindButton{nullptr};
+    QComboBox* cfdRedeemSideCombo{nullptr};     // L (long) / S (short)
+    QLineEdit* cfdRedeemPotEdit{nullptr};
+    QPushButton* cfdRedeemButton{nullptr};
+    // Settlement → redeem hand-off: the pots the last settle produced, so 'Redeem' auto-fills (mirrors option
+    // series). Scoped to the exact pair+lot that was settled so a stale outpoint can never linger once the
+    // selection moves away.
+    QString m_cfdSettledPairId, m_cfdSettledLongPot, m_cfdSettledShortPot;
+    int m_cfdSettledLot{-1};
+
+    // ===== BILATERAL CFD TAB (two-party scalar CFD on an FX cross rate; scalarcfd.*) =====
+    // CFD_GENERALISATION.md §7. Distinct from the CFD Asset Series tab above (that securitises into tradeable
+    // L/S tokens); this is the difficulty-style two-party contract — propose/accept/import handshake, atomic
+    // co-signed open, unilateral settlement, 2-of-2 cooperative close, and a mark-to-market price view.
+    QWidget* scfdTab{nullptr};
+    // Propose term sheet (economics + this party's side + payout addresses).
+    QComboBox* scfdPayoffModeCombo{nullptr};   // STRIKE / REALIZED
+    QComboBox* scfdRoleCombo{nullptr};         // proposer side: long / short
+    QLineEdit* scfdUnderlyingEdit{nullptr};    // U (64-hex)
+    QLineEdit* scfdFeedIdEdit{nullptr};
+    QLineEdit* scfdFixingRefEdit{nullptr};
+    QLineEdit* scfdDeadlineEdit{nullptr};
+    QLineEdit* scfdSettleLockEdit{nullptr};
+    QSpinBox*  scfdFormatSpin{nullptr};
+    QLineEdit* scfdStrikeEdit{nullptr};        // K, 64-hex
+    QLineEdit* scfdFallbackEdit{nullptr};      // 64-hex
+    QLineEdit* scfdCollateralEdit{nullptr};    // C 64-hex (blank = native)
+    QLineEdit* scfdLongImEdit{nullptr};        // collateral units (sats if native)
+    QLineEdit* scfdLongLevEdit{nullptr};       // leverage x -> lambda_q (Q16)
+    QLineEdit* scfdShortImEdit{nullptr};
+    QLineEdit* scfdShortLevEdit{nullptr};
+    QLineEdit* scfdProposeOwnerEdit{nullptr};
+    QLineEdit* scfdProposeCpEdit{nullptr};
+    QPushButton* scfdProposeOwnerBtn{nullptr};
+    QPushButton* scfdProposeCpBtn{nullptr};
+    QPushButton* scfdProposeButton{nullptr};
+    QTextEdit* scfdOfferOut{nullptr};          // generated offer JSON (hand to the counterparty)
+    // Accept (paste an offer; supply this party's addresses).
+    QTextEdit* scfdAcceptOfferIn{nullptr};
+    QLineEdit* scfdAcceptOwnerEdit{nullptr};
+    QLineEdit* scfdAcceptCpEdit{nullptr};
+    QPushButton* scfdAcceptOwnerBtn{nullptr};
+    QPushButton* scfdAcceptCpBtn{nullptr};
+    QCheckBox* scfdAcceptConfirm{nullptr};
+    QPushButton* scfdAcceptButton{nullptr};
+    QTextEdit* scfdAcceptanceOut{nullptr};     // acceptance JSON (hand back to the proposer)
+    // Import acceptance (proposer; paste own offer + the acceptance).
+    QTextEdit* scfdImportOfferIn{nullptr};
+    QTextEdit* scfdImportAcceptanceIn{nullptr};
+    QPushButton* scfdImportButton{nullptr};
+    // Lifecycle (contract_id-scoped): open / record / settle / coop / price.
+    QLineEdit* scfdContractIdEdit{nullptr};
+    QComboBox* scfdLegCombo{nullptr};          // long / short
+    QLineEdit* scfdFeeRateEdit{nullptr};
+    QTextEdit* scfdOpenPsbtIn{nullptr};        // counterparty partial PSBT to augment (2nd party)
+    QPushButton* scfdBuildOpenButton{nullptr};
+    QTextEdit* scfdOpenPsbtOut{nullptr};
+    QLineEdit* scfdRecordTxidEdit{nullptr};
+    QPushButton* scfdRecordOpenButton{nullptr};
+    QPushButton* scfdBuildSettleButton{nullptr};
+    QTextEdit* scfdSettlePsbtOut{nullptr};
+    QTextEdit* scfdFinalizeIn{nullptr};
+    QPushButton* scfdFinalizeButton{nullptr};
+    QLineEdit* scfdCoopAddr1Edit{nullptr};
+    QLineEdit* scfdCoopAmt1Edit{nullptr};      // BTC amount
+    QLineEdit* scfdCoopAddr2Edit{nullptr};
+    QLineEdit* scfdCoopAmt2Edit{nullptr};
+    QPushButton* scfdBuildCoopButton{nullptr};
+    QTextEdit* scfdCoopPsbtIO{nullptr};        // coop PSBT in/out for sign_coop round-trips
+    QPushButton* scfdSignCoopButton{nullptr};
+    QLineEdit* scfdPriceSigmaEdit{nullptr};
+    QPushButton* scfdPriceButton{nullptr};
+    QLabel* scfdPriceLabel{nullptr};
+    QTextEdit* scfdStatusText{nullptr};
+
     // ===== VERIFY OPTION TAB (pre-purchase fraud check; holder + issuer) =====
     QWidget* verifyOptionTab{nullptr};
     QLineEdit* verifyOptIdEdit{nullptr};
@@ -536,6 +674,48 @@ private Q_SLOTS:
     void onOptSettle();               // settle the selected lot (keeper flow)
     void onOptBuyback();              // buy back the selected lot (writer unwind)
     void onOptRedeem();               // redeem the entered pot for the selected lot
+
+    // ── CFD asset series (scalar note pair) ─────────────────────────────────────────────────────────────
+    void setupCfdSeriesTab();
+    bool collectCfdSeriesTerms(WalletModel::ScalarNotePairTermsInput& out); // form -> RPC terms (validated)
+    void saveCfdDraft(int stage);     // persist the in-progress pair (1=registered, 2=issued) to QSettings
+    void clearCfdDraft();
+    void onCfdGenSalt();              // fill the series salt with random bytes
+    void onCfdPairPreview();          // echo ticker previews (ROOT.SUFFIX)
+    void onCfdCollateralChanged();    // show the custom-hex field only for the "Custom" collateral entry
+    void onCfdRegister();             // step 1: scalar.build_register (mint-less L+S child shells)
+    void onCfdIssue();                // step 2: scalar.build_issue (mint N L + N S, fund N vaults)
+    void onCfdRecord();               // step 3: scalar.record_issue (persist the pair + lot vaults)
+    void onCfdReset();                // clear the form for a new pair
+    void onCfdResume();               // restore a saved in-progress pair draft (terms + step state)
+    void onCfdRefreshList();          // reload scalar.list into the recorded-pairs table
+    void onCfdPairSelectionChanged(); // gate the lifecycle panel to the selected pair + autofill the lot vault
+    void onCfdLotIndexChanged();      // autofill the vault outpoint for the chosen lot from lot_vaults
+    void onCfdSettle();               // keeper settle the selected lot vault (scalar.build_settlement)
+    void onCfdRedeemSideChanged();    // swap the auto-filled redeem pot between the settled long/short pots
+    void onCfdRedeem();               // redeem one side's token against a pot (scalar.build_redeem)
+    void onCfdUnwind();               // permissionless complete-set unwind (scalar.build_unwind)
+    // Feed publisher (issuer oracle the notes settle against).
+    void onCfdFeedLookup();           // fill the current ICU outpoint + next epoch for the chosen feed asset
+    void onCfdFeedNewAddr();          // fill the successor ICU address with a fresh wallet address
+    void onCfdFeedPublish();          // scalarpublish_raw (autofund + broadcast)
+    void onCfdFeedRead();             // scalargetfeed for the chosen (asset, feed, epoch)
+    // Bilateral scalar CFD (scalarcfd.*) tab.
+    void setupBilateralCfdTab();
+    void onScfdProposeOwnerAddr();
+    void onScfdProposeCpAddr();
+    void onScfdAcceptOwnerAddr();
+    void onScfdAcceptCpAddr();
+    void onScfdPropose();             // scalarcfd.propose -> offer JSON
+    void onScfdAccept();              // scalarcfd.accept -> contract_id + acceptance JSON
+    void onScfdImport();              // scalarcfd.import_acceptance (proposer)
+    void onScfdBuildOpen();           // scalarcfd.build_open (atomic co-signed open)
+    void onScfdRecordOpen();          // scalarcfd.record_open
+    void onScfdBuildSettlement();     // scalarcfd.build_settlement
+    void onScfdFinalize();            // scalarcfd.finalize_settlement -> broadcastable hex
+    void onScfdBuildCoop();           // scalarcfd.build_coop_close
+    void onScfdSignCoop();            // scalarcfd.sign_coop (2-of-2)
+    void onScfdPrice();               // scalarcfd.price -> MTM
     void onVerifyOptionById();        // pre-purchase fraud check by ticker / asset id (holder + issuer)
     void onVerifyOptionRedeem();      // holder redeem a pot using terms recovered from verify (no record)
     void onRegChildPreviewUpdate();   // refresh the ROOT.SUFFIX preview label
