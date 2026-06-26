@@ -131,11 +131,20 @@ bool ComputeScalarCfdPayout(const arith_uint256& strike,
                             ScalarCfdPayout& out);
 
 //! Decode a 32-byte scalar blob under `scalar_format_id` into the integer the payout math uses
-//! (CFD_GENERALISATION.md §4.2). v1 knows only `SCALAR_FORMAT_RAW_U256_LE` — a raw 256-bit
-//! little-endian integer, so every 32-byte value is valid AND canonical and the decode is the
-//! identity into arith_uint256. Returns false for an unknown format (the opcode then fails closed),
-//! and is where a stricter future Q-format would reject a non-canonical encoding. Applied to BOTH
-//! the committed strike and the resolved scalar, which share the leaf's format by construction.
+//! (CFD_GENERALISATION.md §4.2/§6, Slice 6). The catalogue covers byte order (RAW_U256_LE/BE) and
+//! canonical fixed-width unsigned ints (U64/U128 LE/BE) whose unused high bytes MUST be zero. It
+//! carries NO economic scale: the payoff ratio λ·|X−K|/denom is scale-invariant (X and K share the
+//! format), so a Q-scale would cancel — it lives in the wallet display layer, not here. Returns false
+//! for an unknown format OR a value that overflows a fixed-width format's range (non-canonical), so
+//! the opcode fails CLOSED rather than settle on an ambiguous encoding. Applied to BOTH the committed
+//! strike and the resolved scalar, which share the leaf's format by construction.
 bool DecodeScalarValue(uint16_t scalar_format_id, const uint256& raw, arith_uint256& out);
+
+//! Inverse of DecodeScalarValue (Slice 6): encode a plain numeric value (e.g. uint256::FromHex of the
+//! user's display hex) into the format's canonical WIRE bytes — identity for LE, byte-reversed for BE.
+//! Returns false if the value exceeds the format's width. RPC/Qt ingress uses this so users keep ONE
+//! numeric "display hex" convention across LE/BE while the on-chain bytes (leaf strike/fallback, the
+//! published carrier) honour the format; settlement reads them back with DecodeScalarValue.
+bool EncodeScalarToWire(uint16_t scalar_format_id, const uint256& numeric_value, uint256& wire_out);
 
 #endif // BITCOIN_CONSENSUS_SCALAR_CFD_H

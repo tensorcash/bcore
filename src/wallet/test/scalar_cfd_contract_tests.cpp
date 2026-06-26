@@ -112,6 +112,16 @@ BOOST_AUTO_TEST_CASE(validate_accept_and_reject)
       t.source_type = static_cast<uint8_t>(ScalarCfdSourceType::CHAIN_INTRINSIC);
       BOOST_CHECK(rej(t)); }
     { ScalarCfdContractTerms t = ExampleRecord().terms; t.scalar_format_id = 0xFFFF; BOOST_CHECK(rej(t)); }
+    // Non-canonical committed literals for a FIXED-WIDTH format are rejected here (the integrity gate), so a
+    // persisted/derived record can't carry a strike/fallback the opcode would reject at settlement (Slice 6).
+    { ScalarCfdContractTerms t = ExampleRecord().terms; t.scalar_format_id = assets::SCALAR_FORMAT_U64_BE;
+      t.strike = *uint256::FromHex(std::string(64, 'f')); BOOST_CHECK(rej(t)); }            // strike overflows u64
+    { ScalarCfdContractTerms t = ExampleRecord().terms; t.scalar_format_id = assets::SCALAR_FORMAT_U64_BE;
+      t.strike = uint256{}; t.fallback_scalar = *uint256::FromHex(std::string(64, 'f')); BOOST_CHECK(rej(t)); } // fallback overflows u64
+    // The SAME wide value is canonical under RAW_U256 (no width bound) -> accepted (check is format-specific).
+    { ScalarCfdContractTerms t = ExampleRecord().terms; t.scalar_format_id = assets::SCALAR_FORMAT_RAW_U256_BE;
+      t.strike = *uint256::FromHex(std::string(64, 'f')); t.fallback_scalar = t.strike;
+      std::string e; BOOST_CHECK(t.Validate(e)); }
 }
 
 BOOST_AUTO_TEST_CASE(offer_commitment_binding)

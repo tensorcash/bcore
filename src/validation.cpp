@@ -1529,7 +1529,7 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
                         || tip.ReadAssetScalar(pub->underlying_asset_id, pub->feed_id, pub->scalar_epoch, existing);
                     const bool carrier_unspendable = out.scriptPubKey.IsUnspendable();
                     const auto st = assets::CheckScalarPublication(
-                        pub->scalar_format_id, pub->scalar_epoch, carrier_unspendable,
+                        pub->scalar_format_id, pub->scalar, pub->scalar_epoch, carrier_unspendable,
                         registered, icu_auth, head_exists, head_last, epoch_exists);
                     if (st != assets::ScalarPubStatus::Ok) {
                         return state.Invalid(TxValidationResult::TX_CONSENSUS, assets::ScalarPubStatusString(st),
@@ -4933,7 +4933,7 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                 const bool carrier_unspendable = tx.vout[o].scriptPubKey.IsUnspendable();
 
                 const auto st = assets::CheckScalarPublication(
-                    pub->scalar_format_id, pub->scalar_epoch, carrier_unspendable,
+                    pub->scalar_format_id, pub->scalar, pub->scalar_epoch, carrier_unspendable,
                     registered, icu_auth, head_exists, head_last, epoch_exists);
                 if (st != assets::ScalarPubStatus::Ok) {
                     state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, assets::ScalarPubStatusString(st),

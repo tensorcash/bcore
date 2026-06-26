@@ -5,7 +5,9 @@
 #include <wallet/scalar_note_pair.h>
 
 #include <addresstype.h>          // WitnessV1Taproot, GetScriptForDestination
+#include <arith_uint256.h>        // DecodeScalarValue out-param
 #include <assets/asset.h>         // IsKnownScalarFormat
+#include <consensus/scalar_cfd.h> // DecodeScalarValue (literal canonicality)
 #include <assets/icu_payload.h>   // CanonicalizeIcuBandJson (TSC-ICU-META-1 container)
 #include <consensus/amount.h>     // MoneyRange, MAX_MONEY
 #include <consensus/difficulty_cfd.h> // MIN_SETTLE_OUTPUT
@@ -305,6 +307,10 @@ bool ValidateScalarNotePairTerms(const ScalarNotePairTerms& t, std::string& err)
         t.payoff_mode != static_cast<uint8_t>(ScalarCfdPayoffMode::REALIZED)) { err = "invalid payoff_mode"; return false; }
     if (t.loss_direction != 0x00 && t.loss_direction != 0x01) { err = "invalid loss_direction"; return false; }
     if (!assets::IsKnownScalarFormat(t.scalar_format_id)) { err = "unknown scalar_format_id"; return false; }
+    // Both committed literals must decode canonically under the format (as the opcode reads them at
+    // settlement) — a non-canonical strike/fallback would brick the lot, so reject it at the integrity gate.
+    { arith_uint256 tmp; if (!DecodeScalarValue(t.scalar_format_id, t.strike, tmp)) { err = "strike not canonical for scalar_format_id"; return false; } }
+    { arith_uint256 tmp; if (!DecodeScalarValue(t.scalar_format_id, t.fallback_scalar, tmp)) { err = "fallback_scalar not canonical for scalar_format_id"; return false; } }
 
     if (t.lot_count == 0) { err = "lot_count must be > 0"; return false; }
     if (t.lambda_q == 0) { err = "lambda_q must be non-zero"; return false; }

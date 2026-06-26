@@ -365,19 +365,35 @@ struct IssuerScalar {
 // Wire size of the fixed-width ISSUER_SCALAR TLV body.
 static constexpr size_t ISSUER_SCALAR_BODY_SIZE = 32 + 4 + 8 + 2 + 32; // = 78
 
-// Known scalar formats (ENCODINGS, not payoff modes). Slice 1 ships exactly ONE
-// canonical encoding; the economic Q-format catalogue (CFD_GENERALISATION.md §4)
-// extends this set behind a later slice. A publication whose scalar_format_id is
-// not known here is rejected at ConnectBlock.
-//   RAW_U256_LE: the scalar is a raw little-endian 256-bit unsigned integer. Every
-//   32-byte value is canonical (there is no padding or Q-scale to round-trip), so
-//   this encoding carries no economic-convexity decision — how the integer is read
-//   (denominator/payoff mode) is a contract-leaf concern, deferred to the
-//   settlement opcode (Slice 3, §4).
+// Known scalar formats (ENCODINGS, not payoff modes). The catalogue (CFD_GENERALISATION.md §4/§6,
+// Slice 6) blesses byte-order + canonical fixed-width unsigned integers. It deliberately carries NO
+// economic scale: the payoff is a ratio λ·|X−K|/denom in which X and K share the SAME format, so any
+// implied Q-scale cancels — display scale is a wallet concern (format_id → render), never consensus.
+// A publication whose scalar_format_id is not known here is rejected at ConnectBlock; a stored value
+// that does not DECODE canonically (see DecodeScalarValue) fails the opcode CLOSED at settlement.
+//   *_LE / *_BE  : the stored 32 bytes are read little-endian / big-endian.
+//   RAW_U256_*   : full-width 256-bit unsigned; every 32-byte value is canonical (no padding).
+//   U64_* / U128_*: fixed-width unsigned, zero-extended to 32 bytes; the unused (high) bytes MUST be
+//                   zero (DecodeScalarValue rejects a non-canonical width), bounding the value range.
 static constexpr uint16_t SCALAR_FORMAT_RAW_U256_LE = 0x0001;
+static constexpr uint16_t SCALAR_FORMAT_RAW_U256_BE = 0x0002;
+static constexpr uint16_t SCALAR_FORMAT_U64_LE      = 0x0010;
+static constexpr uint16_t SCALAR_FORMAT_U64_BE      = 0x0011;
+static constexpr uint16_t SCALAR_FORMAT_U128_LE     = 0x0012;
+static constexpr uint16_t SCALAR_FORMAT_U128_BE     = 0x0013;
 inline bool IsKnownScalarFormat(uint16_t scalar_format_id)
 {
-    return scalar_format_id == SCALAR_FORMAT_RAW_U256_LE;
+    switch (scalar_format_id) {
+    case SCALAR_FORMAT_RAW_U256_LE:
+    case SCALAR_FORMAT_RAW_U256_BE:
+    case SCALAR_FORMAT_U64_LE:
+    case SCALAR_FORMAT_U64_BE:
+    case SCALAR_FORMAT_U128_LE:
+    case SCALAR_FORMAT_U128_BE:
+        return true;
+    default:
+        return false;
+    }
 }
 
 // Parse / build the single-TLV ISSUER_SCALAR container. The parser is purely
@@ -392,6 +408,7 @@ std::vector<unsigned char> BuildIssuerScalarTlv(const IssuerScalar& s);
 enum class ScalarPubStatus {
     Ok,
     BadFormat,        // unknown scalar_format_id
+    NonCanonical,     // value not canonical for the format (e.g. a fixed-width format with non-zero padding)
     CarrierSpendable, // carrier output scriptPubKey is not provably unspendable (would bloat UTXO set)
     UnknownAsset,     // underlying_asset_id is not a registered asset
     NoIcuAuth,        // tx did not spend the underlying's CURRENT ICU (issuer auth)
@@ -407,8 +424,14 @@ enum class ScalarPubStatus {
 // FIRST failure wins. `carrier_unspendable` is scriptPubKey.IsUnspendable() of the
 // carrier output; `icu_authenticated` is "this tx spent the underlying's current
 // ICU" computed against PRE-tx state (the spent ICU, not a staged successor).
+// `scalar` is rejected (NonCanonical) if it does not DECODE canonically under
+// `scalar_format_id` — i.e. exactly the bytes the settlement opcode can later read.
+// Publishing a non-canonical value would otherwise stage a "real" fixing that the
+// opcode rejects at settlement, bricking the contract (fallback never fires because
+// an in-time real fixing pre-empts it).
 ScalarPubStatus CheckScalarPublication(
     uint16_t scalar_format_id,
+    const uint256& scalar,
     uint64_t scalar_epoch,
     bool carrier_unspendable,
     bool underlying_registered,

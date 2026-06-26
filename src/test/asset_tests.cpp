@@ -607,8 +607,12 @@ BOOST_AUTO_TEST_CASE(issuer_scalar_tlv_rejects_malformed)
         BOOST_CHECK(!assets::ParseIssuerScalar(bad).has_value());
     }
 
-    // Format catalogue: only RAW_U256_LE known in Slice 1.
+    // Format catalogue (Slice 6): RAW_U256_LE/BE + canonical U64/U128 (LE/BE). The decode/canonicality
+    // behaviour of each is covered in scalar_cfd_payout_tests; here we just confirm membership.
     BOOST_CHECK(assets::IsKnownScalarFormat(assets::SCALAR_FORMAT_RAW_U256_LE));
+    BOOST_CHECK(assets::IsKnownScalarFormat(assets::SCALAR_FORMAT_RAW_U256_BE));
+    BOOST_CHECK(assets::IsKnownScalarFormat(assets::SCALAR_FORMAT_U64_LE));
+    BOOST_CHECK(assets::IsKnownScalarFormat(assets::SCALAR_FORMAT_U128_BE));
     BOOST_CHECK(!assets::IsKnownScalarFormat(0x0000));
     BOOST_CHECK(!assets::IsKnownScalarFormat(0xFFFF));
 }
@@ -620,28 +624,35 @@ BOOST_AUTO_TEST_CASE(check_scalar_publication_rules)
     using assets::CheckScalarPublication;
     using S = assets::ScalarPubStatus;
     const uint16_t FMT = assets::SCALAR_FORMAT_RAW_U256_LE;
+    const uint256 V{};                       // canonical under every format (0 decodes for all)
+    uint256 nc{}; nc.begin()[8] = 1;         // bit 64 set -> NON-canonical for U64_*, canonical for RAW/U128
+    const uint16_t U64 = assets::SCALAR_FORMAT_U64_LE;
 
     // Happy paths: first publication (no head) must be epoch 1; next epoch after a head.
-    BOOST_CHECK(CheckScalarPublication(FMT, 1, /*carrier_unspendable=*/true, /*registered=*/true,
+    BOOST_CHECK(CheckScalarPublication(FMT, V, 1, /*carrier_unspendable=*/true, /*registered=*/true,
         /*icu_auth=*/true, /*head_exists=*/false, /*head_last=*/0, /*epoch_exists=*/false) == S::Ok);
-    BOOST_CHECK(CheckScalarPublication(FMT, 6, true, true, true, /*head_exists=*/true, 5, false) == S::Ok);
+    BOOST_CHECK(CheckScalarPublication(FMT, V, 6, true, true, true, /*head_exists=*/true, 5, false) == S::Ok);
 
     // Each failure mode in isolation.
-    BOOST_CHECK(CheckScalarPublication(0x0000, 1, true, true, true, false, 0, false) == S::BadFormat);
-    BOOST_CHECK(CheckScalarPublication(FMT, 1, /*unspendable=*/false, true, true, false, 0, false) == S::CarrierSpendable);
-    BOOST_CHECK(CheckScalarPublication(FMT, 1, true, /*registered=*/false, true, false, 0, false) == S::UnknownAsset);
-    BOOST_CHECK(CheckScalarPublication(FMT, 1, true, true, /*icu_auth=*/false, false, 0, false) == S::NoIcuAuth);
-    BOOST_CHECK(CheckScalarPublication(FMT, 0, true, true, true, false, 0, false) == S::ZeroEpoch);
-    BOOST_CHECK(CheckScalarPublication(FMT, 1, true, true, true, /*head_exists=*/true,
+    BOOST_CHECK(CheckScalarPublication(0x0000, V, 1, true, true, true, false, 0, false) == S::BadFormat);
+    BOOST_CHECK(CheckScalarPublication(U64, nc, 1, true, true, true, false, 0, false) == S::NonCanonical); // overflows u64
+    BOOST_CHECK(CheckScalarPublication(FMT, V, 1, /*unspendable=*/false, true, true, false, 0, false) == S::CarrierSpendable);
+    BOOST_CHECK(CheckScalarPublication(FMT, V, 1, true, /*registered=*/false, true, false, 0, false) == S::UnknownAsset);
+    BOOST_CHECK(CheckScalarPublication(FMT, V, 1, true, true, /*icu_auth=*/false, false, 0, false) == S::NoIcuAuth);
+    BOOST_CHECK(CheckScalarPublication(FMT, V, 0, true, true, true, false, 0, false) == S::ZeroEpoch);
+    BOOST_CHECK(CheckScalarPublication(FMT, V, 1, true, true, true, /*head_exists=*/true,
         std::numeric_limits<uint64_t>::max(), false) == S::EpochOverflow);
-    BOOST_CHECK(CheckScalarPublication(FMT, 7, true, true, true, true, 5, false) == S::NonMonotonic); // gap
-    BOOST_CHECK(CheckScalarPublication(FMT, 5, true, true, true, true, 5, false) == S::NonMonotonic); // stale/replay
-    BOOST_CHECK(CheckScalarPublication(FMT, 2, true, true, true, false, 0, false) == S::NonMonotonic); // first must be 1
-    BOOST_CHECK(CheckScalarPublication(FMT, 6, true, true, true, true, 5, /*epoch_exists=*/true) == S::DuplicateEpoch);
+    BOOST_CHECK(CheckScalarPublication(FMT, V, 7, true, true, true, true, 5, false) == S::NonMonotonic); // gap
+    BOOST_CHECK(CheckScalarPublication(FMT, V, 5, true, true, true, true, 5, false) == S::NonMonotonic); // stale/replay
+    BOOST_CHECK(CheckScalarPublication(FMT, V, 2, true, true, true, false, 0, false) == S::NonMonotonic); // first must be 1
+    BOOST_CHECK(CheckScalarPublication(FMT, V, 6, true, true, true, true, 5, /*epoch_exists=*/true) == S::DuplicateEpoch);
+    // The same non-canonical value IS accepted under a wider format (RAW/U128 have room for bit 64).
+    BOOST_CHECK(CheckScalarPublication(FMT, nc, 1, true, true, true, false, 0, false) == S::Ok);
 
-    // Deterministic ordering: when several inputs are bad, the earliest check wins.
-    BOOST_CHECK(CheckScalarPublication(0x0000, 0, false, false, false, false, 0, false) == S::BadFormat);
-    BOOST_CHECK(CheckScalarPublication(FMT, 0, false, false, false, false, 0, false) == S::CarrierSpendable);
+    // Deterministic ordering: BadFormat precedes canonicality; canonicality precedes carrier/registration.
+    BOOST_CHECK(CheckScalarPublication(0x0000, nc, 0, false, false, false, false, 0, false) == S::BadFormat);
+    BOOST_CHECK(CheckScalarPublication(U64, nc, 0, /*unspendable=*/false, false, false, false, 0, false) == S::NonCanonical);
+    BOOST_CHECK(CheckScalarPublication(FMT, V, 0, false, false, false, false, 0, false) == S::CarrierSpendable);
 
     // Reject-reason tokens are stable (consensus-visible strings).
     BOOST_CHECK_EQUAL(std::string(assets::ScalarPubStatusString(S::Ok)), "scalar-ok");

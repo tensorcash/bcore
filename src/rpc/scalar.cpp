@@ -28,7 +28,9 @@
 #include <util/strencodings.h>
 #include <validation.h>
 
+#include <arith_uint256.h>          // DecodeScalarValue out-param
 #include <assets/asset.h>
+#include <consensus/scalar_cfd.h>   // EncodeScalarToWire / DecodeScalarValue (format byte order)
 #include <assets/registry.h>
 #include <coins.h>
 #include <txdb.h>
@@ -73,7 +75,8 @@ RPCHelpMan scalargetfeed()
                 {RPCResult::Type::NUM, "feed_id", "Feed id"},
                 {RPCResult::Type::NUM, "epoch", "Epoch returned"},
                 {RPCResult::Type::NUM, "last_epoch", "Latest published epoch for this feed (head)"},
-                {RPCResult::Type::STR_HEX, "scalar", "Scalar value (32-byte display hex)"},
+                {RPCResult::Type::STR_HEX, "scalar", "Scalar NUMERIC value (decoded from the format's wire bytes; 32-byte display hex)"},
+                {RPCResult::Type::STR_HEX, "scalar_wire", "Raw on-chain wire bytes of the scalar (byte order per scalar_format_id)"},
                 {RPCResult::Type::NUM, "scalar_format_id", "Scalar encoding id"},
                 {RPCResult::Type::NUM, "publication_height", "Block height the publication was confirmed at"},
                 {RPCResult::Type::NUM, "confirmations", "Confirmations of the publication"},
@@ -110,7 +113,16 @@ RPCHelpMan scalargetfeed()
             r.pushKV("feed_id", (uint64_t)feed_id);
             r.pushKV("epoch", epoch);
             r.pushKV("last_epoch", last_epoch);
-            r.pushKV("scalar", rec.scalar.GetHex());
+            // Display the NUMERIC value (decode the format's wire bytes); also surface the raw wire for
+            // debugging. A non-canonical stored value (should be impossible post-publication-check) shows
+            // its raw bytes only.
+            arith_uint256 numeric;
+            if (DecodeScalarValue(rec.scalar_format_id, rec.scalar, numeric)) {
+                r.pushKV("scalar", ArithToUint256(numeric).GetHex());
+            } else {
+                r.pushKV("scalar", rec.scalar.GetHex());
+            }
+            r.pushKV("scalar_wire", rec.scalar.GetHex());
             r.pushKV("scalar_format_id", (int)rec.scalar_format_id);
             r.pushKV("publication_height", rec.publication_height);
             int conf = tip_height - rec.publication_height + 1;
@@ -191,8 +203,8 @@ RPCHelpMan scalarpublish_raw()
             {"new_icu_amount", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "Successor ICU bond amount"},
             {"feed_id", RPCArg::Type::NUM, RPCArg::Optional::NO, "Feed id (u32)"},
             {"scalar_epoch", RPCArg::Type::NUM, RPCArg::Optional::NO, "Scalar epoch (u64); must equal current head+1 (or 1 if none)"},
-            {"scalar_hex", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Scalar value as 64 hex chars (uint256 display hex)"},
-            {"scalar_format_id", RPCArg::Type::NUM, RPCArg::Default{assets::SCALAR_FORMAT_RAW_U256_LE}, "Scalar encoding id"},
+            {"scalar_hex", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Scalar NUMERIC value, 64 hex chars (uint256 display hex). Stored as the format's wire bytes (LE/BE per scalar_format_id); must fit the format width."},
+            {"scalar_format_id", RPCArg::Type::NUM, RPCArg::Default{assets::SCALAR_FORMAT_RAW_U256_LE}, "Scalar encoding id (RAW_U256 / U64 / U128, LE or BE)"},
             {"options", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "Options",
                 {
                     {"autofund", RPCArg::Type::BOOL, RPCArg::Default{false}, "Fund using the loaded wallet"},
@@ -229,6 +241,13 @@ RPCHelpMan scalarpublish_raw()
                 : request.params[8].getInt<uint16_t>(); // getInt<uint16_t> rejects >65535 (no silent truncation)
             if (!assets::IsKnownScalarFormat(scalar_format_id)) {
                 throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("unknown scalar_format_id %u", scalar_format_id));
+            }
+            // scalar_hex is a NUMERIC display value; store the format's wire bytes (identity for LE,
+            // byte-reversed for BE) so settlement reads back the intended number. Also rejects a value
+            // that exceeds the format width, which would otherwise be a non-canonical (unsettleable) feed.
+            uint256 wire_scalar;
+            if (!EncodeScalarToWire(scalar_format_id, *scalar, wire_scalar)) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("scalar exceeds scalar_format_id %u width", scalar_format_id));
             }
 
             const COutPoint icu_op(icu_tx, icu_vout);
@@ -284,7 +303,7 @@ RPCHelpMan scalarpublish_raw()
             pub.feed_id = feed_id;
             pub.scalar_epoch = scalar_epoch;
             pub.scalar_format_id = scalar_format_id;
-            pub.scalar = *scalar;
+            pub.scalar = wire_scalar; // format-encoded (LE/BE) wire bytes
             const std::vector<unsigned char> carrier_tlv = assets::BuildIssuerScalarTlv(pub);
             const CScript icu_script = GetScriptForDestination(icu_dest);
 

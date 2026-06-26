@@ -5,6 +5,7 @@
 #include <consensus/scalar_cfd.h>
 
 #include <arith_uint256.h>
+#include <assets/asset.h>             // SCALAR_FORMAT_* catalogue + IsKnownScalarFormat
 #include <consensus/difficulty_cfd.h> // MIN_SETTLE_OUTPUT + ComputeDiffCfdPayout (parity)
 #include <test/util/setup_common.h>
 
@@ -214,6 +215,124 @@ BOOST_AUTO_TEST_CASE(large_scalar_no_overflow)
     const auto p = Payout(k, x, D::REALIZED, Q16(1), vault, /*short_leg=*/true);
     BOOST_CHECK_EQUAL(p.payout_cp, vault / 2);
     BOOST_CHECK_EQUAL(p.payout_owner, vault - vault / 2);
+}
+
+// ---- Scalar format catalogue (DecodeScalarValue, Slice 6) -----------------------------------
+namespace {
+//! 32-byte little-endian blob whose RAW_U256_LE value is `v` (low 8 bytes = v, rest zero).
+uint256 LeBlob(uint64_t v) { return ArithToUint256(arith_uint256(v)); }
+//! Byte-reverse a blob: the BE reading of Reversed(b) equals the LE reading of b.
+uint256 Reversed(const uint256& in) { uint256 o; for (int i = 0; i < 32; ++i) o.begin()[i] = in.begin()[31 - i]; return o; }
+//! 32-byte blob with exactly bit `n` set (used to overflow a fixed-width format).
+uint256 BitBlob(unsigned n) { return ArithToUint256(arith_uint256(1) << static_cast<int>(n)); }
+arith_uint256 Dec(uint16_t fmt, const uint256& raw) { arith_uint256 o; BOOST_REQUIRE(DecodeScalarValue(fmt, raw, o)); return o; }
+bool DecOk(uint16_t fmt, const uint256& raw) { arith_uint256 o; return DecodeScalarValue(fmt, raw, o); }
+} // namespace
+
+BOOST_AUTO_TEST_CASE(format_catalogue_membership)
+{
+    for (uint16_t f : {assets::SCALAR_FORMAT_RAW_U256_LE, assets::SCALAR_FORMAT_RAW_U256_BE,
+                       assets::SCALAR_FORMAT_U64_LE, assets::SCALAR_FORMAT_U64_BE,
+                       assets::SCALAR_FORMAT_U128_LE, assets::SCALAR_FORMAT_U128_BE}) {
+        BOOST_CHECK(assets::IsKnownScalarFormat(f));
+    }
+    BOOST_CHECK(!assets::IsKnownScalarFormat(0x0000));
+    BOOST_CHECK(!assets::IsKnownScalarFormat(0x0003)); // gap between RAW_BE and the U64 block
+    BOOST_CHECK(!assets::IsKnownScalarFormat(0xFFFF));
+}
+
+BOOST_AUTO_TEST_CASE(format_raw_le_is_identity)
+{
+    BOOST_CHECK(Dec(assets::SCALAR_FORMAT_RAW_U256_LE, LeBlob(123456789)) == A(123456789));
+    // Full-width LE: a high-bit value is still canonical (no padding constraint).
+    BOOST_CHECK(Dec(assets::SCALAR_FORMAT_RAW_U256_LE, BitBlob(255)) == (arith_uint256(1) << 255));
+}
+
+BOOST_AUTO_TEST_CASE(format_be_reads_big_endian)
+{
+    // The BE reading of Reversed(LeBlob(v)) equals v, and matches the LE reading of the original.
+    const uint256 le = LeBlob(0xABCDEF12);
+    BOOST_CHECK(Dec(assets::SCALAR_FORMAT_RAW_U256_BE, Reversed(le)) == A(0xABCDEF12));
+    BOOST_CHECK(Dec(assets::SCALAR_FORMAT_RAW_U256_BE, Reversed(le)) ==
+                Dec(assets::SCALAR_FORMAT_RAW_U256_LE, le));
+    // Every 256-bit BE value is canonical (a top-bit value decodes, no rejection).
+    BOOST_CHECK(DecOk(assets::SCALAR_FORMAT_RAW_U256_BE, BitBlob(255)));
+}
+
+BOOST_AUTO_TEST_CASE(format_u64_canonical_width)
+{
+    BOOST_CHECK(Dec(assets::SCALAR_FORMAT_U64_LE, LeBlob(1000)) == A(1000));
+    BOOST_CHECK(Dec(assets::SCALAR_FORMAT_U64_BE, Reversed(LeBlob(1000))) == A(1000));
+    // Max u64 fits; bit 64 (LE byte[8] set) overflows -> non-canonical -> reject.
+    BOOST_CHECK(DecOk(assets::SCALAR_FORMAT_U64_LE, LeBlob(0xFFFFFFFFFFFFFFFFULL)));
+    BOOST_CHECK(!DecOk(assets::SCALAR_FORMAT_U64_LE, BitBlob(64)));
+    BOOST_CHECK(!DecOk(assets::SCALAR_FORMAT_U64_BE, Reversed(BitBlob(64))));
+}
+
+BOOST_AUTO_TEST_CASE(format_u128_canonical_width)
+{
+    BOOST_CHECK(Dec(assets::SCALAR_FORMAT_U128_LE, LeBlob(7)) == A(7));
+    // A value at bit 100 fits u128; bit 128 overflows -> reject (both byte orders).
+    BOOST_CHECK(DecOk(assets::SCALAR_FORMAT_U128_LE, BitBlob(100)));
+    BOOST_CHECK(DecOk(assets::SCALAR_FORMAT_U128_BE, Reversed(BitBlob(100))));
+    BOOST_CHECK(!DecOk(assets::SCALAR_FORMAT_U128_LE, BitBlob(128)));
+    BOOST_CHECK(!DecOk(assets::SCALAR_FORMAT_U128_BE, Reversed(BitBlob(128))));
+}
+
+BOOST_AUTO_TEST_CASE(format_unknown_fails_closed)
+{
+    BOOST_CHECK(!DecOk(0x0000, LeBlob(1)));
+    BOOST_CHECK(!DecOk(0x0099, LeBlob(1)));
+}
+
+BOOST_AUTO_TEST_CASE(encode_to_wire_round_trips_decode)
+{
+    // EncodeScalarToWire is the RPC/Qt ingress inverse of DecodeScalarValue: a numeric value -> canonical
+    // wire that decodes back to the same value, for every format and both byte orders.
+    for (uint16_t f : {assets::SCALAR_FORMAT_RAW_U256_LE, assets::SCALAR_FORMAT_RAW_U256_BE,
+                       assets::SCALAR_FORMAT_U64_LE, assets::SCALAR_FORMAT_U64_BE,
+                       assets::SCALAR_FORMAT_U128_LE, assets::SCALAR_FORMAT_U128_BE}) {
+        for (uint64_t v : {uint64_t{0}, uint64_t{1}, uint64_t{100}, uint64_t{0xABCDEF12}, uint64_t{0xFFFFFFFFFFFFFFFFULL}}) {
+            uint256 wire; arith_uint256 back;
+            BOOST_REQUIRE(EncodeScalarToWire(f, LeBlob(v), wire));
+            BOOST_REQUIRE(DecodeScalarValue(f, wire, back));
+            BOOST_CHECK_MESSAGE(back == A(v), "round-trip fmt=" << f << " v=" << v);
+        }
+    }
+    // LE encode is identity; BE encode is the byte-reverse (so a BE wire decodes via the big-endian read).
+    uint256 w;
+    BOOST_REQUIRE(EncodeScalarToWire(assets::SCALAR_FORMAT_RAW_U256_LE, LeBlob(0x64), w));
+    BOOST_CHECK(w == LeBlob(0x64));
+    BOOST_REQUIRE(EncodeScalarToWire(assets::SCALAR_FORMAT_U64_BE, LeBlob(0x64), w));
+    BOOST_CHECK(w == Reversed(LeBlob(0x64)));
+}
+
+BOOST_AUTO_TEST_CASE(encode_to_wire_rejects_overflow_and_unknown)
+{
+    uint256 w;
+    // A value that doesn't fit the fixed width is rejected (would otherwise be a non-canonical feed).
+    BOOST_CHECK(!EncodeScalarToWire(assets::SCALAR_FORMAT_U64_LE, BitBlob(64), w));
+    BOOST_CHECK(!EncodeScalarToWire(assets::SCALAR_FORMAT_U64_BE, BitBlob(64), w));
+    BOOST_CHECK(!EncodeScalarToWire(assets::SCALAR_FORMAT_U128_LE, BitBlob(128), w));
+    // Full width accepts a top-bit value; unknown format is rejected.
+    BOOST_CHECK(EncodeScalarToWire(assets::SCALAR_FORMAT_RAW_U256_BE, BitBlob(255), w));
+    BOOST_CHECK(!EncodeScalarToWire(0x0099, LeBlob(1), w));
+}
+
+BOOST_AUTO_TEST_CASE(format_scale_invariance_same_payout)
+{
+    // The catalogue carries no scale: decoding K,X under any (consistent) format and running the
+    // payout gives the SAME split, because the ratio cancels the encoding. Here K=100, X=90, long,
+    // mode 0 -> cp = 10% of vault, identical across LE/BE and across widths.
+    auto cp_for = [&](uint16_t fmt, const uint256& k_raw, const uint256& x_raw) {
+        const arith_uint256 K = Dec(fmt, k_raw), X = Dec(fmt, x_raw);
+        return Payout(K, X, D::STRIKE, Q16(1), IM, /*short_leg=*/false).payout_cp;
+    };
+    const uint64_t want = cp_for(assets::SCALAR_FORMAT_RAW_U256_LE, LeBlob(100), LeBlob(90));
+    BOOST_CHECK_EQUAL(want, IM / 10);
+    BOOST_CHECK_EQUAL(cp_for(assets::SCALAR_FORMAT_U64_LE, LeBlob(100), LeBlob(90)), want);
+    BOOST_CHECK_EQUAL(cp_for(assets::SCALAR_FORMAT_RAW_U256_BE, Reversed(LeBlob(100)), Reversed(LeBlob(90))), want);
+    BOOST_CHECK_EQUAL(cp_for(assets::SCALAR_FORMAT_U128_BE, Reversed(LeBlob(100)), Reversed(LeBlob(90))), want);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

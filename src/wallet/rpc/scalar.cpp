@@ -117,6 +117,19 @@ ScalarNotePairTerms ParseScalarNotePairTermsFromJson(const UniValue& t)
     s.scalar_format_id = ReqU16(t, "scalar_format_id");
     s.strike        = OptHash(t, "strike");
     s.fallback_scalar = OptHash(t, "fallback_scalar");
+    // strike/fallback are supplied as NUMERIC display hex; store the format's wire bytes (identity for LE,
+    // byte-reversed for BE) BEFORE deriving token ids / validating, so the leaf + settlement read the
+    // intended number. Every note-pair RPC re-parses the user's numeric terms, so this is deterministic;
+    // ScalarNotePairTermsToJson decodes back to numeric so a round-tripped terms object re-encodes cleanly.
+    {
+        uint256 w;
+        if (!EncodeScalarToWire(s.scalar_format_id, s.strike, w))
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "strike exceeds the scalar_format_id width");
+        s.strike = w;
+        if (!EncodeScalarToWire(s.scalar_format_id, s.fallback_scalar, w))
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "fallback_scalar exceeds the scalar_format_id width");
+        s.fallback_scalar = w;
+    }
     s.lambda_q      = ReqU32(t, "lambda_q");
     s.collateral_asset_id = OptHash(t, "collateral_asset_id");
     s.vault_im      = ReqU64(t, "vault_im");
@@ -144,8 +157,10 @@ UniValue ScalarNotePairTermsToJson(const ScalarNotePairTerms& s)
     o.pushKV("publication_deadline_height", static_cast<int64_t>(s.publication_deadline_height));
     o.pushKV("settle_lock_height", static_cast<int64_t>(s.settle_lock_height));
     o.pushKV("scalar_format_id", static_cast<int64_t>(s.scalar_format_id));
-    o.pushKV("strike", s.strike.GetHex());
-    o.pushKV("fallback_scalar", s.fallback_scalar.GetHex());
+    // Decode wire -> NUMERIC for display so a round-tripped terms object re-encodes to the same wire.
+    arith_uint256 kdec, fdec;
+    o.pushKV("strike", DecodeScalarValue(s.scalar_format_id, s.strike, kdec) ? ArithToUint256(kdec).GetHex() : s.strike.GetHex());
+    o.pushKV("fallback_scalar", DecodeScalarValue(s.scalar_format_id, s.fallback_scalar, fdec) ? ArithToUint256(fdec).GetHex() : s.fallback_scalar.GetHex());
     o.pushKV("lambda_q", static_cast<int64_t>(s.lambda_q));
     o.pushKV("collateral_asset_id", s.collateral_asset_id.GetHex());
     o.pushKV("vault_im", s.vault_im);
