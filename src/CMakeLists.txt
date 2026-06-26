@@ -175,6 +175,8 @@ add_library(bitcoin_common STATIC EXCLUDE_FROM_ALL
   # optionseries.derive/verify RPCs can link it without the wallet library.
   wallet/difficulty_contract.cpp
   wallet/option_series.cpp
+  wallet/scalar_note_pair.cpp
+  wallet/scalar_cfd_contract.cpp
   init/common.cpp
   kernel/chainparams.cpp
   key.cpp

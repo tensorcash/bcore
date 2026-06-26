@@ -6701,6 +6701,633 @@ WalletModel::OptionSeriesActionResult WalletModel::optionSeriesRedeem(const QStr
 }
 
 // ============================================================================
+// Scalar note-pair (securitised CFD asset series) + scalar feed RPC wrappers
+// ============================================================================
+
+// Map the GUI terms input to the `terms` object the scalar.* RPCs parse (ParseScalarNotePairTermsFromJson).
+// The L/S token ids are DERIVED by the RPC from these economics and are never supplied; keeping series_salt
+// constant across the register → issue → record steps keeps the descriptor (and thus the vault addresses)
+// stable, exactly like the option-series wizard re-collects the same terms each step.
+static UniValue ScalarNotePairTermsToUni(const WalletModel::ScalarNotePairTermsInput& t)
+{
+    UniValue terms(UniValue::VOBJ);
+    terms.pushKV("source_type", static_cast<int64_t>(t.source_type));
+    terms.pushKV("payoff_mode", static_cast<int64_t>(t.payoff_mode));
+    terms.pushKV("loss_direction", static_cast<int64_t>(t.loss_direction));
+    if (!t.underlying_asset_id.isEmpty()) terms.pushKV("underlying_asset_id", t.underlying_asset_id.toStdString());
+    terms.pushKV("feed_id", static_cast<int64_t>(t.feed_id));
+    terms.pushKV("fixing_ref", static_cast<uint64_t>(t.fixing_ref));
+    terms.pushKV("publication_deadline_height", static_cast<int64_t>(t.publication_deadline_height));
+    terms.pushKV("settle_lock_height", static_cast<int64_t>(t.settle_lock_height));
+    terms.pushKV("scalar_format_id", static_cast<int64_t>(t.scalar_format_id));
+    if (!t.strike.isEmpty()) terms.pushKV("strike", t.strike.toStdString());
+    if (!t.fallback_scalar.isEmpty()) terms.pushKV("fallback_scalar", t.fallback_scalar.toStdString());
+    terms.pushKV("lambda_q", static_cast<int64_t>(t.lambda_q));
+    if (!t.collateral_asset_id.isEmpty()) terms.pushKV("collateral_asset_id", t.collateral_asset_id.toStdString());
+    terms.pushKV("vault_im", static_cast<uint64_t>(t.vault_im));
+    terms.pushKV("lot_count", static_cast<int64_t>(t.lot_count));
+    if (!t.series_salt.isEmpty()) terms.pushKV("series_salt", t.series_salt.toStdString());
+    return terms;
+}
+
+WalletModel::ScalarNotePairRegisterResult WalletModel::scalarNotePairBuildRegister(const ScalarNotePairTermsInput& termsIn,
+                                                                                   const QString& root, const QString& long_suffix,
+                                                                                   const QString& short_suffix, qint64 child_bond_sats,
+                                                                                   double fee_rate, bool broadcast)
+{
+    ScalarNotePairRegisterResult result;
+    if (!m_client_model) { result.error = tr("Client model not available"); return result; }
+    try {
+        UniValue options(UniValue::VOBJ);
+        options.pushKV("broadcast", broadcast);
+        if (fee_rate > 0.0) options.pushKV("fee_rate", UniValue(fee_rate));
+        if (child_bond_sats > 0) options.pushKV("child_bond_sats", static_cast<int64_t>(child_bond_sats));
+
+        UniValue params(UniValue::VARR);
+        params.push_back(ScalarNotePairTermsToUni(termsIn));
+        params.push_back(root.toStdString());
+        params.push_back(long_suffix.toStdString());
+        params.push_back(short_suffix.toStdString());
+        params.push_back(options);
+
+        UniValue r = m_client_model->node().executeRpc("scalar.build_register", params, getWalletName().toStdString());
+        result.success = true;
+        if (r.exists("pair_id")) result.pair_id = QString::fromStdString(r["pair_id"].get_str());
+        if (r.exists("long_token_id")) result.long_token_id = QString::fromStdString(r["long_token_id"].get_str());
+        if (r.exists("short_token_id")) result.short_token_id = QString::fromStdString(r["short_token_id"].get_str());
+        if (r.exists("long_ticker")) result.long_ticker = QString::fromStdString(r["long_ticker"].get_str());
+        if (r.exists("short_ticker")) result.short_ticker = QString::fromStdString(r["short_ticker"].get_str());
+        result.txid = r.exists("txid") ? QString::fromStdString(r["txid"].get_str()) : tr("(pending)");
+    } catch (const UniValue& e) {
+        result.error = QString::fromStdString(e.isObject() && e.exists("message") ? e["message"].get_str() : e.write());
+    } catch (const std::exception& e) {
+        result.error = QString::fromStdString(e.what());
+    } catch (...) {
+        result.error = tr("Unknown error occurred");
+    }
+    return result;
+}
+
+WalletModel::ScalarNotePairIssueResult WalletModel::scalarNotePairBuildIssue(const ScalarNotePairTermsInput& termsIn,
+                                                                             qint64 vault_native_sats, double fee_rate, bool broadcast)
+{
+    ScalarNotePairIssueResult result;
+    if (!m_client_model) { result.error = tr("Client model not available"); return result; }
+    try {
+        UniValue options(UniValue::VOBJ);
+        options.pushKV("broadcast", broadcast);
+        if (fee_rate > 0.0) options.pushKV("fee_rate", UniValue(fee_rate));
+        if (vault_native_sats > 0) options.pushKV("vault_native_sats", static_cast<int64_t>(vault_native_sats));
+
+        UniValue params(UniValue::VARR);
+        params.push_back(ScalarNotePairTermsToUni(termsIn));
+        params.push_back(options);
+
+        UniValue r = m_client_model->node().executeRpc("scalar.build_issue", params, getWalletName().toStdString());
+        result.success = true;
+        if (r.exists("pair_id")) result.pair_id = QString::fromStdString(r["pair_id"].get_str());
+        if (r.exists("lot_count")) result.lot_count = r["lot_count"].getInt<int>();
+        if (r.exists("txid")) result.txid = QString::fromStdString(r["txid"].get_str());
+    } catch (const UniValue& e) {
+        result.error = QString::fromStdString(e.isObject() && e.exists("message") ? e["message"].get_str() : e.write());
+    } catch (const std::exception& e) {
+        result.error = QString::fromStdString(e.what());
+    } catch (...) {
+        result.error = tr("Unknown error occurred");
+    }
+    return result;
+}
+
+WalletModel::ScalarNotePairRecordResult WalletModel::scalarNotePairRecordIssue(const ScalarNotePairTermsInput& termsIn,
+                                                                               const QString& issue_txid, const QString& register_txid)
+{
+    ScalarNotePairRecordResult result;
+    if (!m_client_model) { result.error = tr("Client model not available"); return result; }
+    try {
+        UniValue params(UniValue::VARR);
+        params.push_back(ScalarNotePairTermsToUni(termsIn));
+        params.push_back(issue_txid.toStdString());
+        if (!register_txid.isEmpty()) params.push_back(register_txid.toStdString());
+
+        UniValue r = m_client_model->node().executeRpc("scalar.record_issue", params, getWalletName().toStdString());
+        result.success = true;
+        if (r.exists("pair_id")) result.pair_id = QString::fromStdString(r["pair_id"].get_str());
+        if (r.exists("lot_count")) result.lot_count = r["lot_count"].getInt<int>();
+        if (r.exists("persisted")) result.persisted = r["persisted"].get_bool();
+    } catch (const UniValue& e) {
+        result.error = QString::fromStdString(e.isObject() && e.exists("message") ? e["message"].get_str() : e.write());
+    } catch (const std::exception& e) {
+        result.error = QString::fromStdString(e.what());
+    } catch (...) {
+        result.error = tr("Unknown error occurred");
+    }
+    return result;
+}
+
+WalletModel::ScalarNotePairListResult WalletModel::scalarNotePairList()
+{
+    ScalarNotePairListResult result;
+    if (!m_client_model) { result.error = tr("Client model not available"); return result; }
+    try {
+        UniValue params(UniValue::VARR);
+        UniValue r = m_client_model->node().executeRpc("scalar.list", params, getWalletName().toStdString());
+        result.success = true;
+        if (r.isArray()) {
+            for (size_t i = 0; i < r.size(); ++i) {
+                const UniValue& o = r[i];
+                ScalarNotePairListEntry e;
+                if (o.exists("pair_id")) e.pair_id = QString::fromStdString(o["pair_id"].get_str());
+                if (o.exists("lot_count")) e.lot_count = o["lot_count"].getInt<int>();
+                if (o.exists("issue_txid")) e.issue_txid = QString::fromStdString(o["issue_txid"].get_str());
+                if (o.exists("long_icu_outpoint")) e.long_icu_outpoint = QString::fromStdString(o["long_icu_outpoint"].get_str());
+                if (o.exists("short_icu_outpoint")) e.short_icu_outpoint = QString::fromStdString(o["short_icu_outpoint"].get_str());
+                if (o.exists("lot_vaults") && o["lot_vaults"].isArray()) {
+                    const UniValue& lv = o["lot_vaults"];
+                    for (size_t j = 0; j < lv.size(); ++j) e.lot_vaults.append(QString::fromStdString(lv[j].get_str()));
+                }
+                if (o.exists("terms") && o["terms"].isObject()) e.terms_json = QString::fromStdString(o["terms"].write());
+                result.pairs.append(e);
+            }
+        }
+    } catch (const UniValue& e) {
+        result.error = QString::fromStdString(e.isObject() && e.exists("message") ? e["message"].get_str() : e.write());
+    } catch (const std::exception& e) {
+        result.error = QString::fromStdString(e.what());
+    } catch (...) {
+        result.error = tr("Unknown error occurred");
+    }
+    return result;
+}
+
+WalletModel::ScalarNotePairActionResult WalletModel::scalarNotePairSettle(const QString& terms_json, int lot_index,
+                                                                          const QString& vault_outpoint, double fee_rate)
+{
+    ScalarNotePairActionResult result;
+    if (!m_client_model) { result.error = tr("Client model not available"); return result; }
+    try {
+        UniValue terms;
+        if (!terms.read(terms_json.toStdString())) { result.error = tr("Invalid note-pair terms"); return result; }
+        UniValue opts(UniValue::VOBJ);
+        opts.pushKV("broadcast", true);
+        if (fee_rate > 0.0) opts.pushKV("fee_rate", UniValue(fee_rate));
+        UniValue params(UniValue::VARR);
+        params.push_back(terms);
+        params.push_back(static_cast<int64_t>(lot_index));
+        params.push_back(vault_outpoint.toStdString());
+        params.push_back(opts);
+        UniValue r = m_client_model->node().executeRpc("scalar.build_settlement", params, getWalletName().toStdString());
+        result.success = true;
+        if (r.exists("txid")) result.txid = QString::fromStdString(r["txid"].get_str());
+        if (r.exists("long_pot")) result.long_pot = QString::fromStdString(r["long_pot"].get_str());
+        if (r.exists("short_pot")) result.short_pot = QString::fromStdString(r["short_pot"].get_str());
+        const QString owner = r.exists("payout_owner") ? QString::fromStdString(r["payout_owner"].get_str()) : QStringLiteral("0");
+        const QString cp = r.exists("payout_cp") ? QString::fromStdString(r["payout_cp"].get_str()) : QStringLiteral("0");
+        const bool fb = r.exists("is_fallback") && r["is_fallback"].get_bool();
+        result.detail = tr("settled lot %1 — owner %2 / cp %3%4").arg(lot_index).arg(owner).arg(cp)
+                            .arg(fb ? tr(" (fallback fixing)") : QString());
+    } catch (const UniValue& e) {
+        result.error = QString::fromStdString(e.isObject() && e.exists("message") ? e["message"].get_str() : e.write());
+    } catch (const std::exception& e) {
+        result.error = QString::fromStdString(e.what());
+    } catch (...) {
+        result.error = tr("Unknown error occurred");
+    }
+    return result;
+}
+
+WalletModel::ScalarNotePairActionResult WalletModel::scalarNotePairRedeem(const QString& terms_json, bool redeem_long, int lot_index,
+                                                                          const QString& pot_outpoint, const QString& holder_address,
+                                                                          double fee_rate)
+{
+    ScalarNotePairActionResult result;
+    if (!m_client_model) { result.error = tr("Client model not available"); return result; }
+    try {
+        UniValue terms;
+        if (!terms.read(terms_json.toStdString())) { result.error = tr("Invalid note-pair terms"); return result; }
+        UniValue pot(UniValue::VOBJ);
+        pot.pushKV("lot_index", static_cast<int64_t>(lot_index));
+        pot.pushKV("pot", pot_outpoint.toStdString());
+        UniValue pots(UniValue::VARR);
+        pots.push_back(pot);
+        UniValue opts(UniValue::VOBJ);
+        opts.pushKV("broadcast", true);
+        if (fee_rate > 0.0) opts.pushKV("fee_rate", UniValue(fee_rate));
+        if (!holder_address.isEmpty()) opts.pushKV("holder_address", holder_address.toStdString());
+        UniValue params(UniValue::VARR);
+        params.push_back(terms);
+        params.push_back(redeem_long);
+        params.push_back(pots);
+        params.push_back(opts);
+        UniValue r = m_client_model->node().executeRpc("scalar.build_redeem", params, getWalletName().toStdString());
+        result.success = true;
+        if (r.exists("txid")) result.txid = QString::fromStdString(r["txid"].get_str());
+        const int retired = r.exists("units_retired") ? r["units_retired"].getInt<int>() : 0;
+        const int change = r.exists("token_change_units") ? r["token_change_units"].getInt<int>() : 0;
+        result.detail = tr("redeemed %1 token, lot %2 — retired %3 units, change %4")
+                            .arg(redeem_long ? tr("long (L)") : tr("short (S)")).arg(lot_index).arg(retired).arg(change);
+    } catch (const UniValue& e) {
+        result.error = QString::fromStdString(e.isObject() && e.exists("message") ? e["message"].get_str() : e.write());
+    } catch (const std::exception& e) {
+        result.error = QString::fromStdString(e.what());
+    } catch (...) {
+        result.error = tr("Unknown error occurred");
+    }
+    return result;
+}
+
+WalletModel::ScalarNotePairActionResult WalletModel::scalarNotePairUnwind(const QString& terms_json, int lot_index,
+                                                                          const QString& vault_outpoint, const QString& holder_address,
+                                                                          double fee_rate)
+{
+    ScalarNotePairActionResult result;
+    if (!m_client_model) { result.error = tr("Client model not available"); return result; }
+    try {
+        UniValue terms;
+        if (!terms.read(terms_json.toStdString())) { result.error = tr("Invalid note-pair terms"); return result; }
+        UniValue opts(UniValue::VOBJ);
+        opts.pushKV("broadcast", true);
+        if (fee_rate > 0.0) opts.pushKV("fee_rate", UniValue(fee_rate));
+        if (!holder_address.isEmpty()) opts.pushKV("holder_address", holder_address.toStdString());
+        UniValue params(UniValue::VARR);
+        params.push_back(terms);
+        params.push_back(static_cast<int64_t>(lot_index));
+        params.push_back(vault_outpoint.toStdString());
+        params.push_back(opts);
+        UniValue r = m_client_model->node().executeRpc("scalar.build_unwind", params, getWalletName().toStdString());
+        result.success = true;
+        if (r.exists("txid")) result.txid = QString::fromStdString(r["txid"].get_str());
+        result.detail = tr("unwound lot %1 — retired 1 L + 1 S, reclaimed full collateral").arg(lot_index);
+    } catch (const UniValue& e) {
+        result.error = QString::fromStdString(e.isObject() && e.exists("message") ? e["message"].get_str() : e.write());
+    } catch (const std::exception& e) {
+        result.error = QString::fromStdString(e.what());
+    } catch (...) {
+        result.error = tr("Unknown error occurred");
+    }
+    return result;
+}
+
+WalletModel::ScalarFeedPublishResult WalletModel::scalarPublish(const QString& asset_id, const QString& icu_txid, int icu_vout,
+                                                                const QString& new_icu_address, qint64 new_icu_amount_sats,
+                                                                quint32 feed_id, quint64 scalar_epoch, const QString& scalar_hex,
+                                                                int scalar_format_id, double fee_rate)
+{
+    ScalarFeedPublishResult result;
+    if (!m_client_model) { result.error = tr("Client model not available"); return result; }
+    try {
+        UniValue options(UniValue::VOBJ);
+        options.pushKV("autofund", true);
+        options.pushKV("broadcast", true);
+        if (fee_rate > 0.0) options.pushKV("fee_rate", UniValue(fee_rate));
+
+        UniValue params(UniValue::VARR);
+        params.push_back(icu_txid.toStdString());
+        params.push_back(static_cast<int64_t>(icu_vout));
+        params.push_back(asset_id.toStdString());
+        params.push_back(new_icu_address.toStdString());
+        params.push_back(SatsToAmountStr(new_icu_amount_sats));
+        params.push_back(static_cast<int64_t>(feed_id));
+        params.push_back(static_cast<uint64_t>(scalar_epoch));
+        params.push_back(scalar_hex.toStdString());
+        params.push_back(static_cast<int64_t>(scalar_format_id));
+        params.push_back(options);
+
+        UniValue r = m_client_model->node().executeRpc("scalarpublish_raw", params, getWalletName().toStdString());
+        result.success = true;
+        if (r.exists("hex")) result.hex = QString::fromStdString(r["hex"].get_str());
+        if (r.exists("txid")) result.txid = QString::fromStdString(r["txid"].get_str());
+    } catch (const UniValue& e) {
+        result.error = QString::fromStdString(e.isObject() && e.exists("message") ? e["message"].get_str() : e.write());
+    } catch (const std::exception& e) {
+        result.error = QString::fromStdString(e.what());
+    } catch (...) {
+        result.error = tr("Unknown error occurred");
+    }
+    return result;
+}
+
+WalletModel::ScalarFeedListResult WalletModel::scalarListFeeds(const QString& asset_id)
+{
+    ScalarFeedListResult result;
+    if (!m_client_model) { result.error = tr("Client model not available"); return result; }
+    try {
+        UniValue params(UniValue::VARR);
+        params.push_back(asset_id.toStdString());
+        UniValue r = m_client_model->node().executeRpc("scalarlistfeeds", params, getWalletName().toStdString());
+        result.success = true;
+        if (r.isArray()) {
+            for (size_t i = 0; i < r.size(); ++i) {
+                const UniValue& o = r[i];
+                ScalarFeedEntry e;
+                if (o.exists("feed_id")) e.feed_id = static_cast<quint32>(o["feed_id"].getInt<int64_t>());
+                if (o.exists("last_epoch")) e.last_epoch = static_cast<quint64>(o["last_epoch"].getInt<int64_t>());
+                result.feeds.append(e);
+            }
+        }
+    } catch (const UniValue& e) {
+        result.error = QString::fromStdString(e.isObject() && e.exists("message") ? e["message"].get_str() : e.write());
+    } catch (const std::exception& e) {
+        result.error = QString::fromStdString(e.what());
+    } catch (...) {
+        result.error = tr("Unknown error occurred");
+    }
+    return result;
+}
+
+WalletModel::ScalarFeedGetResult WalletModel::scalarGetFeed(const QString& asset_id, quint32 feed_id, qint64 epoch)
+{
+    ScalarFeedGetResult result;
+    if (!m_client_model) { result.error = tr("Client model not available"); return result; }
+    try {
+        UniValue params(UniValue::VARR);
+        params.push_back(asset_id.toStdString());
+        params.push_back(static_cast<int64_t>(feed_id));
+        if (epoch >= 0) params.push_back(static_cast<uint64_t>(epoch));
+        UniValue r = m_client_model->node().executeRpc("scalargetfeed", params, getWalletName().toStdString());
+        result.success = true;
+        if (r.exists("epoch")) result.epoch = static_cast<quint64>(r["epoch"].getInt<int64_t>());
+        if (r.exists("last_epoch")) result.last_epoch = static_cast<quint64>(r["last_epoch"].getInt<int64_t>());
+        if (r.exists("scalar")) result.scalar = QString::fromStdString(r["scalar"].get_str());
+        if (r.exists("scalar_format_id")) result.scalar_format_id = r["scalar_format_id"].getInt<int>();
+        if (r.exists("publication_height")) result.publication_height = r["publication_height"].getInt<int64_t>();
+        if (r.exists("buried")) result.buried = r["buried"].get_bool();
+    } catch (const UniValue& e) {
+        result.error = QString::fromStdString(e.isObject() && e.exists("message") ? e["message"].get_str() : e.write());
+    } catch (const std::exception& e) {
+        result.error = QString::fromStdString(e.what());
+    } catch (...) {
+        result.error = tr("Unknown error occurred");
+    }
+    return result;
+}
+
+// ============================================================================
+// Bilateral scalar CFD (scalarcfd.*) RPC wrappers
+// ============================================================================
+
+namespace {
+//! ECONOMICS-only terms object (no payout keys — those come from the addresses), matching
+//! ParseScalarCfdEconomics: source/payoff + the shared scalar fixing + each leg's IM (decimal string,
+//! collateral units) and leverage. collateral_asset_id omitted == native.
+UniValue ScalarCfdTermsToUni(const WalletModel::ScalarCfdTermsInput& t)
+{
+    UniValue u(UniValue::VOBJ);
+    u.pushKV("source_type", static_cast<int64_t>(t.source_type));
+    u.pushKV("payoff_mode", static_cast<int64_t>(t.payoff_mode));
+    u.pushKV("underlying_asset_id", t.underlying_asset_id.toStdString());
+    u.pushKV("feed_id", static_cast<int64_t>(t.feed_id));
+    u.pushKV("fixing_ref", static_cast<uint64_t>(t.fixing_ref));
+    u.pushKV("publication_deadline_height", static_cast<int64_t>(t.publication_deadline_height));
+    u.pushKV("settle_lock_height", static_cast<int64_t>(t.settle_lock_height));
+    u.pushKV("scalar_format_id", static_cast<int64_t>(t.scalar_format_id));
+    u.pushKV("strike", t.strike.toStdString());
+    u.pushKV("fallback_scalar", t.fallback_scalar.toStdString());
+    if (!t.collateral_asset_id.isEmpty()) u.pushKV("collateral_asset_id", t.collateral_asset_id.toStdString());
+    UniValue lj(UniValue::VOBJ), sj(UniValue::VOBJ);
+    // im is a DECIMAL INTEGER string in collateral units (uint64; sats when native) — ParseUnits, NOT a BTC amount.
+    lj.pushKV("im", QString::number(static_cast<qulonglong>(t.long_leg.im_sats)).toStdString());
+    lj.pushKV("lambda_q", static_cast<int64_t>(t.long_leg.lambda_q));
+    sj.pushKV("im", QString::number(static_cast<qulonglong>(t.short_leg.im_sats)).toStdString());
+    sj.pushKV("lambda_q", static_cast<int64_t>(t.short_leg.lambda_q));
+    u.pushKV("long", lj);
+    u.pushKV("short", sj);
+    return u;
+}
+QString UniErr(const UniValue& e) { return QString::fromStdString(e.isObject() && e.exists("message") ? e["message"].get_str() : e.write()); }
+} // namespace
+
+WalletModel::ScalarCfdProposeResult WalletModel::scalarCfdPropose(const ScalarCfdTermsInput& terms, bool proposerIsShort,
+                                                                 const QString& ownerAddr, const QString& cpAddr)
+{
+    ScalarCfdProposeResult result;
+    if (!m_client_model) { result.error = tr("Client model not available"); return result; }
+    try {
+        UniValue params(UniValue::VARR);
+        params.push_back(ScalarCfdTermsToUni(terms));
+        params.push_back(std::string(proposerIsShort ? "short" : "long"));
+        params.push_back(ownerAddr.toStdString());
+        params.push_back(cpAddr.toStdString());
+        UniValue r = m_client_model->node().executeRpc("scalarcfd.propose", params, getWalletName().toStdString());
+        result.success = true;
+        if (r.exists("offer")) result.offer_json = QString::fromStdString(r["offer"].write());
+    } catch (const UniValue& e) { result.error = UniErr(e); }
+    catch (const std::exception& e) { result.error = QString::fromStdString(e.what()); }
+    catch (...) { result.error = tr("Unknown error occurred"); }
+    return result;
+}
+
+WalletModel::ScalarCfdAcceptResult WalletModel::scalarCfdAccept(const QString& offer_json, const QString& ownerAddr,
+                                                               const QString& cpAddr, bool confirmed)
+{
+    ScalarCfdAcceptResult result;
+    if (!m_client_model) { result.error = tr("Client model not available"); return result; }
+    try {
+        UniValue offer; if (!offer.read(offer_json.toStdString())) { result.error = tr("Invalid offer JSON"); return result; }
+        UniValue opts(UniValue::VOBJ); opts.pushKV("confirmed", confirmed);
+        UniValue params(UniValue::VARR);
+        params.push_back(offer); params.push_back(ownerAddr.toStdString()); params.push_back(cpAddr.toStdString()); params.push_back(opts);
+        UniValue r = m_client_model->node().executeRpc("scalarcfd.accept", params, getWalletName().toStdString());
+        result.success = true;
+        if (r.exists("contract_id")) result.contract_id = QString::fromStdString(r["contract_id"].get_str());
+        if (r.exists("acceptance")) result.acceptance_json = QString::fromStdString(r["acceptance"].write());
+        if (r.exists("action_required")) result.action_required = QString::fromStdString(r["action_required"].get_str());
+    } catch (const UniValue& e) { result.error = UniErr(e); }
+    catch (const std::exception& e) { result.error = QString::fromStdString(e.what()); }
+    catch (...) { result.error = tr("Unknown error occurred"); }
+    return result;
+}
+
+WalletModel::ScalarCfdImportResult WalletModel::scalarCfdImportAcceptance(const QString& offer_json, const QString& acceptance_json)
+{
+    ScalarCfdImportResult result;
+    if (!m_client_model) { result.error = tr("Client model not available"); return result; }
+    try {
+        UniValue offer, acc;
+        if (!offer.read(offer_json.toStdString()) || !acc.read(acceptance_json.toStdString())) { result.error = tr("Invalid offer/acceptance JSON"); return result; }
+        UniValue params(UniValue::VARR); params.push_back(offer); params.push_back(acc);
+        UniValue r = m_client_model->node().executeRpc("scalarcfd.import_acceptance", params, getWalletName().toStdString());
+        result.success = true;
+        if (r.exists("contract_id")) result.contract_id = QString::fromStdString(r["contract_id"].get_str());
+        if (r.exists("state")) result.state = QString::fromStdString(r["state"].get_str());
+    } catch (const UniValue& e) { result.error = UniErr(e); }
+    catch (const std::exception& e) { result.error = QString::fromStdString(e.what()); }
+    catch (...) { result.error = tr("Unknown error occurred"); }
+    return result;
+}
+
+WalletModel::ScalarCfdOpenResult WalletModel::scalarCfdBuildOpen(const QString& contract_id, bool isShort,
+                                                               const QString& priorPsbt, double fee_rate)
+{
+    ScalarCfdOpenResult result;
+    if (!m_client_model) { result.error = tr("Client model not available"); return result; }
+    try {
+        UniValue opts(UniValue::VOBJ);
+        if (!priorPsbt.isEmpty()) opts.pushKV("psbt", priorPsbt.toStdString());
+        if (fee_rate > 0.0) opts.pushKV("fee_rate", UniValue(fee_rate));
+        UniValue params(UniValue::VARR);
+        params.push_back(contract_id.toStdString());
+        params.push_back(std::string(isShort ? "short" : "long"));
+        if (!opts.getKeys().empty()) params.push_back(opts);
+        UniValue r = m_client_model->node().executeRpc("scalarcfd.build_open", params, getWalletName().toStdString());
+        result.success = true;
+        if (r.exists("psbt")) result.psbt = QString::fromStdString(r["psbt"].get_str());
+        if (r.exists("fee")) result.fee = QString::fromStdString(r["fee"].getValStr());
+        if (r.exists("leg")) result.leg = QString::fromStdString(r["leg"].get_str());
+        if (r.exists("vault_index")) result.vault_index = r["vault_index"].getInt<int>();
+    } catch (const UniValue& e) { result.error = UniErr(e); }
+    catch (const std::exception& e) { result.error = QString::fromStdString(e.what()); }
+    catch (...) { result.error = tr("Unknown error occurred"); }
+    return result;
+}
+
+WalletModel::ScalarCfdRecordOpenResult WalletModel::scalarCfdRecordOpen(const QString& contract_id, const QString& txid)
+{
+    ScalarCfdRecordOpenResult result;
+    if (!m_client_model) { result.error = tr("Client model not available"); return result; }
+    try {
+        UniValue params(UniValue::VARR); params.push_back(contract_id.toStdString()); params.push_back(txid.toStdString());
+        UniValue r = m_client_model->node().executeRpc("scalarcfd.record_open", params, getWalletName().toStdString());
+        result.success = true;
+        if (r.exists("long_vault")) result.long_vault = QString::fromStdString(r["long_vault"].get_str());
+        if (r.exists("short_vault")) result.short_vault = QString::fromStdString(r["short_vault"].get_str());
+    } catch (const UniValue& e) { result.error = UniErr(e); }
+    catch (const std::exception& e) { result.error = QString::fromStdString(e.what()); }
+    catch (...) { result.error = tr("Unknown error occurred"); }
+    return result;
+}
+
+WalletModel::ScalarCfdSettlementResult WalletModel::scalarCfdBuildSettlement(const QString& contract_id, bool isShort, double fee_rate)
+{
+    ScalarCfdSettlementResult result;
+    if (!m_client_model) { result.error = tr("Client model not available"); return result; }
+    try {
+        UniValue params(UniValue::VARR);
+        params.push_back(contract_id.toStdString());
+        params.push_back(std::string(isShort ? "short" : "long"));
+        if (fee_rate > 0.0) { UniValue opts(UniValue::VOBJ); opts.pushKV("fee_rate", UniValue(fee_rate)); params.push_back(opts); }
+        UniValue r = m_client_model->node().executeRpc("scalarcfd.build_settlement", params, getWalletName().toStdString());
+        result.success = true;
+        if (r.exists("psbt")) result.psbt = QString::fromStdString(r["psbt"].get_str());
+        if (r.exists("fee")) result.fee = QString::fromStdString(r["fee"].getValStr());
+        if (r.exists("payout_owner")) result.payout_owner = QString::fromStdString(r["payout_owner"].getValStr());
+        if (r.exists("payout_cp")) result.payout_cp = QString::fromStdString(r["payout_cp"].getValStr());
+        if (r.exists("is_fallback")) result.is_fallback = r["is_fallback"].get_bool();
+        if (r.exists("vault_input_index")) result.vault_input_index = r["vault_input_index"].getInt<int>();
+    } catch (const UniValue& e) { result.error = UniErr(e); }
+    catch (const std::exception& e) { result.error = QString::fromStdString(e.what()); }
+    catch (...) { result.error = tr("Unknown error occurred"); }
+    return result;
+}
+
+WalletModel::ScalarCfdFinalizeResult WalletModel::scalarCfdFinalizeSettlement(const QString& psbt)
+{
+    ScalarCfdFinalizeResult result;
+    if (!m_client_model) { result.error = tr("Client model not available"); return result; }
+    try {
+        UniValue params(UniValue::VARR); params.push_back(psbt.toStdString());
+        UniValue r = m_client_model->node().executeRpc("scalarcfd.finalize_settlement", params, getWalletName().toStdString());
+        result.success = true;
+        if (r.exists("hex")) result.hex = QString::fromStdString(r["hex"].get_str());
+    } catch (const UniValue& e) { result.error = UniErr(e); }
+    catch (const std::exception& e) { result.error = QString::fromStdString(e.what()); }
+    catch (...) { result.error = tr("Unknown error occurred"); }
+    return result;
+}
+
+WalletModel::ScalarCfdCoopCloseResult WalletModel::scalarCfdBuildCoopClose(const QString& contract_id, bool isShort,
+                                                                          const QList<QPair<QString, qint64>>& outputs)
+{
+    ScalarCfdCoopCloseResult result;
+    if (!m_client_model) { result.error = tr("Client model not available"); return result; }
+    try {
+        UniValue outs(UniValue::VARR);
+        for (const auto& o : outputs) {
+            UniValue obj(UniValue::VOBJ);
+            obj.pushKV("address", o.first.toStdString());
+            obj.pushKV("amount", SatsToAmountStr(o.second));
+            outs.push_back(obj);
+        }
+        UniValue params(UniValue::VARR);
+        params.push_back(contract_id.toStdString());
+        params.push_back(std::string(isShort ? "short" : "long"));
+        params.push_back(outs);
+        UniValue r = m_client_model->node().executeRpc("scalarcfd.build_coop_close", params, getWalletName().toStdString());
+        result.success = true;
+        if (r.exists("psbt")) result.psbt = QString::fromStdString(r["psbt"].get_str());
+        if (r.exists("fee")) result.fee = QString::fromStdString(r["fee"].getValStr());
+    } catch (const UniValue& e) { result.error = UniErr(e); }
+    catch (const std::exception& e) { result.error = QString::fromStdString(e.what()); }
+    catch (...) { result.error = tr("Unknown error occurred"); }
+    return result;
+}
+
+WalletModel::ScalarCfdSignCoopResult WalletModel::scalarCfdSignCoop(const QString& contract_id, bool isShort, const QString& psbt)
+{
+    ScalarCfdSignCoopResult result;
+    if (!m_client_model) { result.error = tr("Client model not available"); return result; }
+    try {
+        UniValue params(UniValue::VARR);
+        params.push_back(contract_id.toStdString());
+        params.push_back(std::string(isShort ? "short" : "long"));
+        params.push_back(psbt.toStdString());
+        UniValue r = m_client_model->node().executeRpc("scalarcfd.sign_coop", params, getWalletName().toStdString());
+        result.success = true;
+        if (r.exists("complete")) result.complete = r["complete"].get_bool();
+        if (r.exists("psbt")) result.psbt = QString::fromStdString(r["psbt"].get_str());
+        if (r.exists("hex")) result.hex = QString::fromStdString(r["hex"].get_str());
+    } catch (const UniValue& e) { result.error = UniErr(e); }
+    catch (const std::exception& e) { result.error = QString::fromStdString(e.what()); }
+    catch (...) { result.error = tr("Unknown error occurred"); }
+    return result;
+}
+
+WalletModel::ScalarCfdPriceResult WalletModel::scalarCfdPrice(const QString& contract_id, double sigma,
+                                                             double forward_cross_rate, double discount_factor)
+{
+    ScalarCfdPriceResult result;
+    if (!m_client_model) { result.error = tr("Client model not available"); return result; }
+    try {
+        UniValue params(UniValue::VARR);
+        params.push_back(contract_id.toStdString());
+        UniValue opts(UniValue::VOBJ);
+        if (sigma >= 0.0) opts.pushKV("sigma", UniValue(sigma));
+        if (forward_cross_rate >= 0.0) opts.pushKV("forward_cross_rate", UniValue(forward_cross_rate));
+        if (discount_factor >= 0.0) opts.pushKV("discount_factor", UniValue(discount_factor));
+        if (!opts.getKeys().empty()) params.push_back(opts);
+        UniValue r = m_client_model->node().executeRpc("scalarcfd.price", params, getWalletName().toStdString());
+        result.success = true;
+        auto num = [&](const char* k) { return r.exists(k) ? r[k].get_real() : 0.0; };
+        result.current_ratio = num("current_ratio");
+        result.forecast_ratio = num("forecast_ratio");
+        result.intrinsic_long_mtm = num("intrinsic_long_mtm");
+        result.intrinsic_short_mtm = num("intrinsic_short_mtm");
+        result.expected_long_mtm = num("expected_long_mtm");
+        result.expected_short_mtm = num("expected_short_mtm");
+        result.sigma = num("sigma");
+        result.tau_years = num("tau_years");
+        result.discount_factor = num("discount_factor");
+        result.long_delta_to_cross_rate = num("long_delta_to_cross_rate");
+        result.long_vega = num("long_vega");
+        result.long_theta = num("long_theta");
+        result.short_delta_to_cross_rate = num("short_delta_to_cross_rate");
+        result.short_vega = num("short_vega");
+        result.short_theta = num("short_theta");
+        if (r.exists("contract_id")) result.contract_id = QString::fromStdString(r["contract_id"].get_str());
+        if (r.exists("collateral_is_native")) result.collateral_is_native = r["collateral_is_native"].get_bool();
+        if (r.exists("forward_provenance")) result.forward_provenance = QString::fromStdString(r["forward_provenance"].get_str());
+        if (r.exists("fixing_reached")) result.fixing_reached = r["fixing_reached"].get_bool();
+        if (r.exists("is_fallback")) result.is_fallback = r["is_fallback"].get_bool();
+        if (r.exists("model_unreliable")) result.model_unreliable = r["model_unreliable"].get_bool();
+        if (r.exists("warnings") && r["warnings"].isArray()) {
+            for (size_t i = 0; i < r["warnings"].size(); ++i) result.warnings << QString::fromStdString(r["warnings"][i].get_str());
+        }
+    } catch (const UniValue& e) { result.error = UniErr(e); }
+    catch (const std::exception& e) { result.error = QString::fromStdString(e.what()); }
+    catch (...) { result.error = tr("Unknown error occurred"); }
+    return result;
+}
+
+// ============================================================================
 // Forward Settlement RPC Wrappers
 // ============================================================================
 

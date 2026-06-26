@@ -5522,6 +5522,115 @@ std::vector<OptionSeriesRecord> CWallet::ListOptionSeries() const
     return out;
 }
 
+bool CWallet::LoadScalarNotePair(const ScalarNotePairRecord& record)
+{
+    AssertLockHeld(cs_wallet);
+    m_scalar_note_pairs[record.pair_id] = record;
+    return true;
+}
+
+ScalarNotePairRecord CWallet::RegisterScalarNotePair(ScalarNotePairRecord record)
+{
+    LOCK(cs_wallet);
+    // Never persist a record whose id does not derive from its terms, or whose vault set is malformed.
+    std::string verr;
+    if (!ValidateScalarNotePairRecord(record, /*expected_key=*/nullptr, verr)) {
+        throw std::runtime_error(strprintf("Refusing to persist invalid scalar note pair: %s", verr));
+    }
+    const uint256 pair_id = record.pair_id;
+
+    const auto prev_it = m_scalar_note_pairs.find(pair_id);
+    const bool had_prev = prev_it != m_scalar_note_pairs.end();
+    ScalarNotePairRecord prev = had_prev ? prev_it->second : ScalarNotePairRecord{};
+
+    m_scalar_note_pairs.insert_or_assign(pair_id, record);
+
+    WalletBatch batch(GetDatabase());
+    if (!batch.WriteScalarNotePair(record)) {
+        if (had_prev) m_scalar_note_pairs[pair_id] = std::move(prev);
+        else m_scalar_note_pairs.erase(pair_id);
+        throw std::runtime_error(strprintf("Failed to persist scalar note pair %s to the wallet database", pair_id.GetHex()));
+    }
+
+    return record;
+}
+
+std::optional<ScalarNotePairRecord> CWallet::FindScalarNotePair(const uint256& pair_id) const
+{
+    LOCK(cs_wallet);
+    auto it = m_scalar_note_pairs.find(pair_id);
+    if (it == m_scalar_note_pairs.end()) {
+        return std::nullopt;
+    }
+    return it->second;
+}
+
+std::vector<ScalarNotePairRecord> CWallet::ListScalarNotePairs() const
+{
+    LOCK(cs_wallet);
+    std::vector<ScalarNotePairRecord> out;
+    out.reserve(m_scalar_note_pairs.size());
+    for (const auto& entry : m_scalar_note_pairs) {
+        out.push_back(entry.second);
+    }
+    return out;
+}
+
+bool CWallet::LoadScalarCfdContract(const ScalarCfdContractRecord& record)
+{
+    AssertLockHeld(cs_wallet);
+    m_scalar_cfd_contracts[record.contract_id] = record;
+    return true;
+}
+
+ScalarCfdContractRecord CWallet::RegisterScalarCfdContract(ScalarCfdContractRecord record)
+{
+    LOCK(cs_wallet);
+    // Never persist a record that fails the full integrity gate (id == H(terms,salt), valid terms, NUMS
+    // vault internals, valid coop internals, complete Fair-Sign state).
+    std::string verr;
+    if (!ValidateScalarCfdContractRecord(record, /*expected_key=*/nullptr, verr)) {
+        throw std::runtime_error(strprintf("Refusing to persist invalid scalar CFD contract: %s", verr));
+    }
+    const uint256 contract_id = record.contract_id;
+
+    const auto prev_it = m_scalar_cfd_contracts.find(contract_id);
+    const bool had_prev = prev_it != m_scalar_cfd_contracts.end();
+    ScalarCfdContractRecord prev = had_prev ? prev_it->second : ScalarCfdContractRecord{};
+
+    m_scalar_cfd_contracts.insert_or_assign(contract_id, record);
+
+    WalletBatch batch(GetDatabase());
+    if (!batch.WriteScalarCfdContract(record)) {
+        if (had_prev) m_scalar_cfd_contracts[contract_id] = std::move(prev);
+        else m_scalar_cfd_contracts.erase(contract_id);
+        throw std::runtime_error(strprintf("Failed to persist scalar CFD contract %s to the wallet database", contract_id.GetHex()));
+    }
+
+    return record;
+}
+
+std::optional<ScalarCfdContractRecord> CWallet::FindScalarCfdContract(const uint256& contract_id) const
+{
+    LOCK(cs_wallet);
+    auto it = m_scalar_cfd_contracts.find(contract_id);
+    if (it == m_scalar_cfd_contracts.end()) {
+        return std::nullopt;
+    }
+    return it->second;
+}
+
+std::vector<ScalarCfdContractRecord> CWallet::ListScalarCfdContracts() const
+{
+    LOCK(cs_wallet);
+    std::vector<ScalarCfdContractRecord> out;
+    out.reserve(m_scalar_cfd_contracts.size());
+    for (const auto& entry : m_scalar_cfd_contracts) {
+        out.push_back(entry.second);
+    }
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // Cross-chain settlement
 // ---------------------------------------------------------------------------

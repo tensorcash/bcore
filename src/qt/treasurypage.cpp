@@ -20,6 +20,7 @@
 #include <univalue.h>
 #include <util/strencodings.h>
 #include <assets/asset.h>
+#include <consensus/scalar_cfd_leaf.h>  // ScalarCfdSourceType / ScalarCfdPayoffMode (CFD asset series tab)
 #include <assets/icu_payload.h>
 #include <wallet/difficulty_contract.h>  // DifficultyTokensPerSecToNBits / DifficultyNBitsToTokensPerSec / format
 #include <rpc/protocol.h>
@@ -270,6 +271,8 @@ TreasuryPage::TreasuryPage(const PlatformStyle* platformStyle, QWidget* parent)
     // Create individual tabs
     setupRegistrationTab();
     setupOptionSeriesTab();
+    setupCfdSeriesTab();
+    setupBilateralCfdTab();
     setupVerifyOptionTab();
     setupMintTab();
     setupBurnTab();
@@ -303,6 +306,8 @@ TreasuryPage::TreasuryPage(const PlatformStyle* platformStyle, QWidget* parent)
     if (isIssuerMode) {
         tabWidget->addTab(registrationTab, tr("Register Asset"));
         tabWidget->addTab(optionSeriesTab, tr("Option Series"));
+        tabWidget->addTab(cfdSeriesTab, tr("CFD Asset Series"));
+        tabWidget->addTab(scfdTab, tr("Bilateral CFD"));
         tabWidget->addTab(verifyOptionTab, tr("Verify Option"));
         tabWidget->addTab(mintTab, tr("Mint"));
         tabWidget->addTab(burnTab, tr("Burn"));
@@ -320,6 +325,9 @@ TreasuryPage::TreasuryPage(const PlatformStyle* platformStyle, QWidget* parent)
     } else {
         tabWidget->addTab(dashboardTab, tr("My Assets"));
         tabWidget->addTab(verifyOptionTab, tr("Verify Option"));
+        // The bilateral CFD is a two-party lifecycle — the acceptor/counterparty (a non-issuer) needs
+        // accept/import/open/sign/settle/price too, so the tab is available in holder mode as well.
+        tabWidget->addTab(scfdTab, tr("Bilateral CFD"));
         tabWidget->addTab(zkComplianceTab, tr("Compliance"));
         tabWidget->addTab(governanceTab, tr("Governance"));
 
@@ -3922,6 +3930,1389 @@ void TreasuryPage::onOptRedeem()
     if (row >= 0) optSeriesTable->setItem(row, 3, new QTableWidgetItem(tr("(stale — re-verify)")));
 }
 
+// ============================================================================
+// CFD Asset Series (scalar note pair) — issuer create/issue/record + keeper
+// lifecycle, plus the scalar feed publisher the notes settle against.
+// (CFD_GENERALISATION.md §6/§7. Mirrors the Option Series tab, two-sided.)
+// ============================================================================
+
+namespace {
+//! A canonical 64-char lowercase-hex check for the uint256 leaf operands (strike / fallback / ids / salt).
+bool IsHex64(const QString& s)
+{
+    if (s.size() != 64) return false;
+    for (const QChar& c : s) {
+        const char ch = c.toLatin1();
+        if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F'))) return false;
+    }
+    return true;
+}
+
+//! Parse a full uint32 from a line edit (the RPC feed_id domain is uint32; a QSpinBox only spans int).
+bool ParseU32(const QString& s, quint32& out)
+{
+    bool ok = false;
+    const qulonglong v = s.trimmed().toULongLong(&ok);
+    if (!ok || v > 0xFFFFFFFFULL) return false;
+    out = static_cast<quint32>(v);
+    return true;
+}
+} // namespace
+
+void TreasuryPage::setupCfdSeriesTab()
+{
+    cfdSeriesTab = new QWidget();
+    QVBoxLayout* tabLayout = new QVBoxLayout(cfdSeriesTab);
+    QScrollArea* scroll = new QScrollArea();
+    scroll->setWidgetResizable(true);
+    QWidget* content = new QWidget();
+    QVBoxLayout* outer = new QVBoxLayout(content);
+
+    QLabel* intro = new QLabel(tr(
+        "<b>CFD asset series (scalar note pair).</b> A securitised two-sided CFD: register a long token <b>L</b> "
+        "and a short token <b>S</b> as sponsored children, then issue N units of each and fund N "
+        "<tt>OP_SCALAR_CFD_SETTLE</tt> vaults. Each lot settles on a scalar <i>you publish</i> as the asset issuer "
+        "(or the committed fallback if you never publish), and any holder of 1 L + 1 S can unwind a lot for the "
+        "full collateral at any time. This differs from a difficulty Option Series: two-sided, native or asset "
+        "collateral, and a permissionless complete-set unwind."));
+    intro->setWordWrap(true);
+    outer->addWidget(intro);
+
+    // ── Scalar feed publisher ───────────────────────────────────────────────────────────────────────────
+    QGroupBox* feedGroup = new QGroupBox(tr("Scalar feed publisher (issuer oracle)"));
+    QFormLayout* feedForm = new QFormLayout();
+
+    cfdFeedAssetCombo = new QComboBox();
+    cfdFeedAssetCombo->setToolTip(tr("A wallet-controlled asset whose ICU you spend to publish the feed value."));
+    feedForm->addRow(tr("Feed asset (U):"), cfdFeedAssetCombo);
+
+    cfdFeedIdEdit = new QLineEdit(QStringLiteral("0"));
+    cfdFeedIdEdit->setToolTip(tr("Which feed of this asset (uint32). One asset can publish many independent feeds."));
+    feedForm->addRow(tr("Feed id:"), cfdFeedIdEdit);
+
+    {
+        QWidget* w = new QWidget();
+        QHBoxLayout* h = new QHBoxLayout(w); h->setContentsMargins(0, 0, 0, 0);
+        cfdFeedIcuEdit = new QLineEdit();
+        cfdFeedIcuEdit->setPlaceholderText(tr("current ICU outpoint  txid:vout"));
+        cfdFeedIcuEdit->setToolTip(tr("The asset's current ICU. Click 'Lookup' to fill this and the next epoch."));
+        cfdFeedLookupButton = new QPushButton(tr("Lookup"));
+        h->addWidget(cfdFeedIcuEdit, 1); h->addWidget(cfdFeedLookupButton);
+        feedForm->addRow(tr("Current ICU:"), w);
+    }
+
+    {
+        QWidget* w = new QWidget();
+        QHBoxLayout* h = new QHBoxLayout(w); h->setContentsMargins(0, 0, 0, 0);
+        cfdFeedNewIcuAddrEdit = new QLineEdit();
+        cfdFeedNewIcuAddrEdit->setPlaceholderText(tr("successor ICU address (wallet bech32m)"));
+        cfdFeedNewIcuAddrButton = new QPushButton(tr("New address"));
+        h->addWidget(cfdFeedNewIcuAddrEdit, 1); h->addWidget(cfdFeedNewIcuAddrButton);
+        feedForm->addRow(tr("Successor ICU:"), w);
+    }
+
+    cfdFeedNewIcuAmtEdit = new QLineEdit();
+    cfdFeedNewIcuAmtEdit->setPlaceholderText(tr("successor bond, TSC (>= rotation floor)"));
+    cfdFeedNewIcuAmtEdit->setToolTip(tr("The successor ICU's bond. Must be >= the rotation floor (Lookup pre-fills it)."));
+    feedForm->addRow(tr("Successor bond (TSC):"), cfdFeedNewIcuAmtEdit);
+
+    cfdFeedEpochEdit = new QLineEdit();
+    cfdFeedEpochEdit->setPlaceholderText(tr("scalar_epoch — must equal head+1 (or 1)"));
+    cfdFeedEpochEdit->setToolTip(tr("Monotone, append-only per (asset, feed). Lookup fills head+1."));
+    feedForm->addRow(tr("Epoch:"), cfdFeedEpochEdit);
+
+    cfdFeedScalarEdit = new QLineEdit();
+    cfdFeedScalarEdit->setPlaceholderText(tr("scalar value — 64 hex (uint256 display hex)"));
+    cfdFeedScalarEdit->setToolTip(tr("The published value, interpreted per scalar_format_id. Contracts that committed "
+                                     "this (asset, feed, epoch) read it at settlement."));
+    feedForm->addRow(tr("Scalar (hex):"), cfdFeedScalarEdit);
+
+    cfdFeedFormatSpin = new QSpinBox();
+    cfdFeedFormatSpin->setRange(1, 65535);
+    cfdFeedFormatSpin->setValue(assets::SCALAR_FORMAT_RAW_U256_LE);
+    cfdFeedFormatSpin->setToolTip(tr("Scalar encoding id (default RAW_U256_LE). Must match the leaf's committed format."));
+    feedForm->addRow(tr("Format id:"), cfdFeedFormatSpin);
+
+    cfdFeedRateEdit = new QLineEdit(QStringLiteral("5"));
+    feedForm->addRow(tr("Fee rate (sat/vB):"), cfdFeedRateEdit);
+
+    feedGroup->setLayout(feedForm);
+    outer->addWidget(feedGroup);
+
+    QHBoxLayout* feedBtns = new QHBoxLayout();
+    cfdFeedPublishButton = new QPushButton(tr("Publish scalar"));
+    feedBtns->addWidget(cfdFeedPublishButton);
+    feedBtns->addStretch();
+    feedBtns->addWidget(new QLabel(tr("Read epoch:")));
+    cfdFeedReadEpochEdit = new QLineEdit();
+    cfdFeedReadEpochEdit->setPlaceholderText(tr("blank = latest"));
+    cfdFeedReadEpochEdit->setMaximumWidth(120);
+    feedBtns->addWidget(cfdFeedReadEpochEdit);
+    cfdFeedReadButton = new QPushButton(tr("Read feed"));
+    feedBtns->addWidget(cfdFeedReadButton);
+    outer->addLayout(feedBtns);
+
+    cfdFeedReadLabel = new QLabel();
+    cfdFeedReadLabel->setWordWrap(true);
+    cfdFeedReadLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    cfdFeedReadLabel->setStyleSheet("color:#9ad; font-family: monospace;");
+    outer->addWidget(cfdFeedReadLabel);
+
+    cfdFeedStatusText = new QTextEdit();
+    cfdFeedStatusText->setReadOnly(true);
+    cfdFeedStatusText->setMaximumHeight(90);
+    outer->addWidget(cfdFeedStatusText);
+
+    // ── Note-pair terms ─────────────────────────────────────────────────────────────────────────────────
+    QGroupBox* termsGroup = new QGroupBox(tr("Note-pair terms"));
+    QFormLayout* form = new QFormLayout();
+
+    cfdParentCombo = new QComboBox();
+    cfdParentCombo->setToolTip(tr("A wallet-controlled root namespace to sponsor the L and S children under."));
+    form->addRow(tr("Sponsoring root:"), cfdParentCombo);
+
+    {
+        QWidget* w = new QWidget();
+        QHBoxLayout* h = new QHBoxLayout(w); h->setContentsMargins(0, 0, 0, 0);
+        cfdLongSuffixEdit = new QLineEdit();
+        cfdLongSuffixEdit->setPlaceholderText(tr("L suffix (e.g. U6L)"));
+        cfdShortSuffixEdit = new QLineEdit();
+        cfdShortSuffixEdit->setPlaceholderText(tr("S suffix (e.g. U6S)"));
+        h->addWidget(cfdLongSuffixEdit); h->addWidget(cfdShortSuffixEdit);
+        form->addRow(tr("Long / Short suffix:"), w);
+    }
+    cfdPairIdLabel = new QLabel(tr("(register to preview the pair id)"));
+    cfdPairIdLabel->setStyleSheet("color:#888; font-family: monospace;");
+    cfdPairIdLabel->setWordWrap(true);
+    form->addRow(tr("Tickers:"), cfdPairIdLabel);
+
+    cfdPayoffModeCombo = new QComboBox();
+    cfdPayoffModeCombo->addItem(tr("STRIKE — |X-K|/K (percent move from strike)"), static_cast<int>(ScalarCfdPayoffMode::STRIKE));
+    cfdPayoffModeCombo->addItem(tr("REALIZED — |X-K|/X (difficulty semantics)"), static_cast<int>(ScalarCfdPayoffMode::REALIZED));
+    form->addRow(tr("Payoff mode:"), cfdPayoffModeCombo);
+
+    cfdLossDirCombo = new QComboBox();
+    cfdLossDirCombo->addItem(tr("Owner is LONG (token L tracks the owner leg)"), 0);
+    cfdLossDirCombo->addItem(tr("Owner is SHORT (token S tracks the owner leg)"), 1);
+    form->addRow(tr("Owner direction:"), cfdLossDirCombo);
+
+    cfdUnderlyingEdit = new QLineEdit();
+    cfdUnderlyingEdit->setPlaceholderText(tr("U — feed asset id, 64 hex (auto-fills from the feed asset above)"));
+    cfdUnderlyingEdit->setToolTip(tr("The asset whose published feed settles these notes. Trust = that asset's issuer."));
+    form->addRow(tr("Underlying (U):"), cfdUnderlyingEdit);
+
+    cfdSeriesFeedIdEdit = new QLineEdit(QStringLiteral("0"));
+    cfdSeriesFeedIdEdit->setToolTip(tr("Feed of U this note settles against (uint32) — must match the published feed."));
+    form->addRow(tr("Feed id:"), cfdSeriesFeedIdEdit);
+
+    cfdFixingRefEdit = new QLineEdit();
+    cfdFixingRefEdit->setPlaceholderText(tr("scalar_epoch this note settles against (u64)"));
+    cfdFixingRefEdit->setToolTip(tr("The future epoch the notes read at settlement. Publish that epoch before the deadline."));
+    form->addRow(tr("Fixing epoch:"), cfdFixingRefEdit);
+
+    cfdDeadlineHeightEdit = new QLineEdit();
+    cfdDeadlineHeightEdit->setPlaceholderText(tr("publication_deadline_height (u32)"));
+    cfdDeadlineHeightEdit->setToolTip(tr("Last height a real fixing counts. After deadline + grace, the fallback fires."));
+    form->addRow(tr("Deadline height:"), cfdDeadlineHeightEdit);
+
+    cfdSettleLockEdit = new QLineEdit();
+    cfdSettleLockEdit->setPlaceholderText(tr("settle_lock_height (CLTV, u32)"));
+    cfdSettleLockEdit->setToolTip(tr("Belt-and-suspenders CLTV before a lot may settle (>= activation, ideally + maturity)."));
+    form->addRow(tr("Settle-lock height:"), cfdSettleLockEdit);
+
+    cfdFormatSpin = new QSpinBox();
+    cfdFormatSpin->setRange(1, 65535);
+    cfdFormatSpin->setValue(assets::SCALAR_FORMAT_RAW_U256_LE);
+    cfdFormatSpin->setToolTip(tr("Scalar encoding id — MUST equal the published feed's scalar_format_id."));
+    form->addRow(tr("Scalar format id:"), cfdFormatSpin);
+
+    cfdStrikeEdit = new QLineEdit();
+    cfdStrikeEdit->setPlaceholderText(tr("strike K — 64 hex in the chosen format"));
+    form->addRow(tr("Strike (K, hex):"), cfdStrikeEdit);
+
+    cfdFallbackEdit = new QLineEdit();
+    cfdFallbackEdit->setPlaceholderText(tr("fallback_scalar — 64 hex (fires if no in-time fixing)"));
+    cfdFallbackEdit->setToolTip(tr("Used iff no usable real fixing by deadline + grace. A neutral value refunds at fair."));
+    form->addRow(tr("Fallback (hex):"), cfdFallbackEdit);
+
+    cfdLeverageEdit = new QLineEdit(QStringLiteral("1.0"));
+    cfdLeverageEdit->setToolTip(tr("Leverage ×. A move of m%% past strike pays leverage × m%% of the lot IM (capped at the IM)."));
+    form->addRow(tr("Leverage (×):"), cfdLeverageEdit);
+
+    // §5.1: only COLLATERAL_SAFE assets can back a long-dated note (else settlement can be griefed/trapped).
+    // The combo is filtered to native + wallet-controlled collateral-safe assets; "Custom…" reveals a raw-hex
+    // field for an externally-held safe asset. Populated by refreshAssetList (the policy bit is read for free
+    // from each asset's IssuerReg during the controlled-asset scan).
+    cfdCollateralCombo = new QComboBox();
+    cfdCollateralCombo->setToolTip(tr("Per-lot IM / payout asset. Only COLLATERAL_SAFE assets qualify (§5.1); "
+                                      "Native TSC always does. Pick 'Custom…' to enter a safe asset id by hand."));
+    cfdCollateralCombo->addItem(tr("Native (TSC)"), QString());            // empty data = native sentinel
+    cfdCollateralCombo->addItem(tr("Custom (enter id)…"), QStringLiteral("custom"));
+    form->addRow(tr("Collateral (C):"), cfdCollateralCombo);
+
+    cfdCollateralEdit = new QLineEdit();
+    cfdCollateralEdit->setPlaceholderText(tr("collateral-safe asset C — 64 hex"));
+    cfdCollateralEdit->setToolTip(tr("A non-native C must carry the COLLATERAL_SAFE bit or settlement is rejected (§5.1)."));
+    cfdCollateralEdit->setVisible(false);                                  // only for the Custom entry
+    form->addRow(QString(), cfdCollateralEdit);
+
+    cfdVaultImEdit = new QLineEdit();
+    cfdVaultImEdit->setPlaceholderText(tr("per-lot IM in C's units (sats if native)"));
+    cfdVaultImEdit->setToolTip(tr("Collateral backing each lot = the maximum total payout split between the two pots."));
+    form->addRow(tr("Lot IM (units):"), cfdVaultImEdit);
+
+    cfdLotCountSpin = new QSpinBox();
+    cfdLotCountSpin->setRange(1, 120);
+    cfdLotCountSpin->setValue(10);
+    cfdLotCountSpin->setToolTip(tr("N — the number of L and S units, and the number of backing vaults."));
+    form->addRow(tr("Lot count (N):"), cfdLotCountSpin);
+
+    {
+        QWidget* w = new QWidget();
+        QHBoxLayout* h = new QHBoxLayout(w); h->setContentsMargins(0, 0, 0, 0);
+        cfdSaltEdit = new QLineEdit();
+        cfdSaltEdit->setPlaceholderText(tr("64 hex (auto-generated if left blank)"));
+        cfdSaltGenButton = new QPushButton(tr("Generate"));
+        h->addWidget(cfdSaltEdit, 1); h->addWidget(cfdSaltGenButton);
+        form->addRow(tr("Series salt:"), w);
+    }
+
+    cfdBondEdit = new QLineEdit(QStringLiteral("0.0001"));
+    cfdBondEdit->setToolTip(tr("Per-child ICU bond (TSC). The low default is the consensus child floor."));
+    form->addRow(tr("Child bond (TSC):"), cfdBondEdit);
+
+    cfdVaultNativeEdit = new QLineEdit(QStringLiteral("0.00000546"));
+    cfdVaultNativeEdit->setToolTip(tr("Native carrier per asset-collateral vault (>= dust). Ignored for native collateral."));
+    form->addRow(tr("Vault native carrier (TSC):"), cfdVaultNativeEdit);
+
+    cfdFeeRateEdit = new QLineEdit(QStringLiteral("5"));
+    form->addRow(tr("Fee rate (sat/vB):"), cfdFeeRateEdit);
+
+    termsGroup->setLayout(form);
+    outer->addWidget(termsGroup);
+
+    QHBoxLayout* btns = new QHBoxLayout();
+    cfdRegisterButton = new QPushButton(tr("1. Register pair"));
+    cfdIssueButton = new QPushButton(tr("2. Issue pair"));
+    cfdRecordButton = new QPushButton(tr("3. Record issue"));
+    cfdResetButton = new QPushButton(tr("New pair"));
+    cfdResumeButton = new QPushButton(tr("Resume draft"));
+    cfdResumeButton->setToolTip(tr("Restore an in-progress pair (terms, salt and register/issue txids) saved on this machine."));
+    btns->addWidget(cfdRegisterButton);
+    btns->addWidget(cfdIssueButton);
+    btns->addWidget(cfdRecordButton);
+    btns->addWidget(cfdResetButton);
+    btns->addWidget(cfdResumeButton);
+    outer->addLayout(btns);
+
+    cfdStatusText = new QTextEdit();
+    cfdStatusText->setReadOnly(true);
+    cfdStatusText->setMaximumHeight(150);
+    outer->addWidget(cfdStatusText);
+
+    // ── Recorded pairs + lifecycle actions ──────────────────────────────────────────────────────────────
+    QGroupBox* listGroup = new QGroupBox(tr("Recorded note pairs"));
+    QVBoxLayout* listLayout = new QVBoxLayout();
+    QHBoxLayout* listBtns = new QHBoxLayout();
+    cfdRefreshListButton = new QPushButton(tr("Refresh list"));
+    listBtns->addWidget(cfdRefreshListButton);
+    listBtns->addStretch();
+    listLayout->addLayout(listBtns);
+
+    cfdPairTable = new QTableWidget(0, 4);
+    cfdPairTable->setHorizontalHeaderLabels({tr("Pair ID"), tr("Lots"), tr("Issue tx"), tr("Vaults")});
+    cfdPairTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    cfdPairTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+    cfdPairTable->setSelectionMode(QAbstractItemView::SingleSelection);
+    cfdPairTable->horizontalHeader()->setStretchLastSection(true);
+    cfdPairTable->setMinimumHeight(140);
+    listLayout->addWidget(cfdPairTable);
+
+    QHBoxLayout* lotRow = new QHBoxLayout();
+    lotRow->addWidget(new QLabel(tr("Lot:")));
+    cfdLotIndexSpin = new QSpinBox();
+    cfdLotIndexSpin->setRange(0, 0);
+    lotRow->addWidget(cfdLotIndexSpin);
+    lotRow->addWidget(new QLabel(tr("Vault:")));
+    cfdVaultOutpointEdit = new QLineEdit();
+    cfdVaultOutpointEdit->setPlaceholderText(tr("lot vault outpoint  txid:vout"));
+    lotRow->addWidget(cfdVaultOutpointEdit, 1);
+    cfdSettleButton = new QPushButton(tr("Settle lot"));
+    cfdSettleButton->setToolTip(tr("Keeper settlement once the fixing (or fallback) is usable and the CLTV is open."));
+    cfdUnwindButton = new QPushButton(tr("Unwind (1L+1S)"));
+    cfdUnwindButton->setToolTip(tr("Permissionless complete-set collapse: retire 1 L + 1 S, reclaim the full collateral."));
+    lotRow->addWidget(cfdSettleButton);
+    lotRow->addWidget(cfdUnwindButton);
+    listLayout->addLayout(lotRow);
+
+    QHBoxLayout* redeemRow = new QHBoxLayout();
+    redeemRow->addWidget(new QLabel(tr("Redeem:")));
+    cfdRedeemSideCombo = new QComboBox();
+    cfdRedeemSideCombo->addItem(tr("Long (L)"), true);
+    cfdRedeemSideCombo->addItem(tr("Short (S)"), false);
+    redeemRow->addWidget(cfdRedeemSideCombo);
+    redeemRow->addWidget(new QLabel(tr("Pot:")));
+    cfdRedeemPotEdit = new QLineEdit();
+    cfdRedeemPotEdit->setPlaceholderText(tr("settlement pot outpoint  txid:vout"));
+    redeemRow->addWidget(cfdRedeemPotEdit, 1);
+    cfdRedeemButton = new QPushButton(tr("Redeem pot"));
+    redeemRow->addWidget(cfdRedeemButton);
+    listLayout->addLayout(redeemRow);
+
+    cfdSettleButton->setEnabled(false);
+    cfdUnwindButton->setEnabled(false);
+    cfdRedeemButton->setEnabled(false);
+
+    listGroup->setLayout(listLayout);
+    outer->addWidget(listGroup);
+    outer->addStretch();
+
+    scroll->setWidget(content);
+    tabLayout->addWidget(scroll);
+
+    // Step gating: only register is available until a pair is registered + confirmed.
+    cfdIssueButton->setEnabled(false);
+    cfdRecordButton->setEnabled(false);
+
+    connect(cfdSaltGenButton, &QPushButton::clicked, this, &TreasuryPage::onCfdGenSalt);
+    connect(cfdLongSuffixEdit, &QLineEdit::textChanged, this, &TreasuryPage::onCfdPairPreview);
+    connect(cfdShortSuffixEdit, &QLineEdit::textChanged, this, &TreasuryPage::onCfdPairPreview);
+    connect(cfdParentCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &TreasuryPage::onCfdPairPreview);
+    connect(cfdRegisterButton, &QPushButton::clicked, this, &TreasuryPage::onCfdRegister);
+    connect(cfdIssueButton, &QPushButton::clicked, this, &TreasuryPage::onCfdIssue);
+    connect(cfdRecordButton, &QPushButton::clicked, this, &TreasuryPage::onCfdRecord);
+    connect(cfdResetButton, &QPushButton::clicked, this, &TreasuryPage::onCfdReset);
+    connect(cfdResumeButton, &QPushButton::clicked, this, &TreasuryPage::onCfdResume);
+    connect(cfdCollateralCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &TreasuryPage::onCfdCollateralChanged);
+    connect(cfdRefreshListButton, &QPushButton::clicked, this, &TreasuryPage::onCfdRefreshList);
+    connect(cfdPairTable, &QTableWidget::itemSelectionChanged, this, &TreasuryPage::onCfdPairSelectionChanged);
+    connect(cfdLotIndexSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, &TreasuryPage::onCfdLotIndexChanged);
+    connect(cfdSettleButton, &QPushButton::clicked, this, &TreasuryPage::onCfdSettle);
+    connect(cfdUnwindButton, &QPushButton::clicked, this, &TreasuryPage::onCfdUnwind);
+    connect(cfdRedeemSideCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &TreasuryPage::onCfdRedeemSideChanged);
+    connect(cfdRedeemButton, &QPushButton::clicked, this, &TreasuryPage::onCfdRedeem);
+    connect(cfdFeedLookupButton, &QPushButton::clicked, this, &TreasuryPage::onCfdFeedLookup);
+    connect(cfdFeedNewIcuAddrButton, &QPushButton::clicked, this, &TreasuryPage::onCfdFeedNewAddr);
+    connect(cfdFeedPublishButton, &QPushButton::clicked, this, &TreasuryPage::onCfdFeedPublish);
+    connect(cfdFeedReadButton, &QPushButton::clicked, this, &TreasuryPage::onCfdFeedRead);
+    // Default the contract's underlying U from the chosen feed asset (the common single-issuer case).
+    connect(cfdFeedAssetCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
+        if (cfdFeedAssetCombo && cfdUnderlyingEdit && cfdUnderlyingEdit->text().trimmed().isEmpty() && cfdFeedAssetCombo->count() > 0) {
+            cfdUnderlyingEdit->setText(cfdFeedAssetCombo->currentData().toString());
+        }
+    });
+    { QSettings s; cfdResumeButton->setEnabled(s.value(QStringLiteral("ScalarNotePairDraft/active"), false).toBool()); }
+}
+
+// ============================================================================
+// Bilateral CFD tab (two-party scalar CFD on an FX cross rate; scalarcfd.*).
+// Propose/accept/import handshake -> atomic co-signed open -> unilateral settle
+// (or 2-of-2 cooperative close) -> mark-to-market price. (CFD_GENERALISATION.md §7.)
+// ============================================================================
+
+void TreasuryPage::setupBilateralCfdTab()
+{
+    scfdTab = new QWidget();
+    QVBoxLayout* tabLayout = new QVBoxLayout(scfdTab);
+    QScrollArea* scroll = new QScrollArea();
+    scroll->setWidgetResizable(true);
+    QWidget* content = new QWidget();
+    QVBoxLayout* outer = new QVBoxLayout(content);
+
+    QLabel* intro = new QLabel(tr(
+        "<b>Bilateral scalar CFD.</b> A two-party contract on an issuer-published FX cross rate X = base/quote: "
+        "a long and a short leg, each its own <tt>OP_SCALAR_CFD_SETTLE</tt> vault, with an atomic co-signed open "
+        "and a 2-of-2 cooperative close. The proposer creates an offer; the counterparty accepts (returning an "
+        "acceptance); the proposer imports it; both then co-fund the open, and either party can settle a leg after "
+        "the fixing, or both can cooperatively close early. Offers/acceptances/PSBTs are exchanged out-of-band."));
+    intro->setWordWrap(true);
+    outer->addWidget(intro);
+
+    // ── 1. Propose ──────────────────────────────────────────────────────────────────────────────────────
+    QGroupBox* proposeGroup = new QGroupBox(tr("1. Propose (define economics + your side)"));
+    QFormLayout* pf = new QFormLayout();
+    scfdPayoffModeCombo = new QComboBox(); scfdPayoffModeCombo->addItem(tr("STRIKE (denom K)")); scfdPayoffModeCombo->addItem(tr("REALIZED (denom X)"));
+    pf->addRow(tr("Payoff mode:"), scfdPayoffModeCombo);
+    scfdRoleCombo = new QComboBox(); scfdRoleCombo->addItem(tr("long")); scfdRoleCombo->addItem(tr("short"));
+    pf->addRow(tr("Your side:"), scfdRoleCombo);
+    scfdUnderlyingEdit = new QLineEdit(); scfdUnderlyingEdit->setPlaceholderText(tr("underlying U asset id (64-hex)"));
+    pf->addRow(tr("Underlying (U):"), scfdUnderlyingEdit);
+    scfdFeedIdEdit = new QLineEdit(QStringLiteral("0")); pf->addRow(tr("Feed id:"), scfdFeedIdEdit);
+    scfdFixingRefEdit = new QLineEdit(QStringLiteral("1")); pf->addRow(tr("Fixing ref (epoch):"), scfdFixingRefEdit);
+    scfdDeadlineEdit = new QLineEdit(); scfdDeadlineEdit->setPlaceholderText(tr("publication_deadline_height")); pf->addRow(tr("Deadline height:"), scfdDeadlineEdit);
+    scfdSettleLockEdit = new QLineEdit(); scfdSettleLockEdit->setPlaceholderText(tr("settle_lock_height (CLTV)")); pf->addRow(tr("Settle lock height:"), scfdSettleLockEdit);
+    scfdFormatSpin = new QSpinBox(); scfdFormatSpin->setRange(0, 65535); scfdFormatSpin->setValue(1); pf->addRow(tr("Scalar format id:"), scfdFormatSpin);
+    scfdStrikeEdit = new QLineEdit(); scfdStrikeEdit->setPlaceholderText(tr("strike K (64-hex)")); pf->addRow(tr("Strike (K):"), scfdStrikeEdit);
+    scfdFallbackEdit = new QLineEdit(); scfdFallbackEdit->setPlaceholderText(tr("fallback_scalar (64-hex)")); pf->addRow(tr("Fallback:"), scfdFallbackEdit);
+    scfdCollateralEdit = new QLineEdit();
+    scfdCollateralEdit->setPlaceholderText(tr("native TSC only — asset-collateral open is not yet supported"));
+    scfdCollateralEdit->setEnabled(false); // build_open is native-only; don't let the UI persist an unopenable contract
+    pf->addRow(tr("Collateral (C):"), scfdCollateralEdit);
+    scfdLongImEdit = new QLineEdit(); scfdLongImEdit->setPlaceholderText(tr("collateral units (sats if native)")); pf->addRow(tr("Long IM:"), scfdLongImEdit);
+    scfdLongLevEdit = new QLineEdit(QStringLiteral("1")); pf->addRow(tr("Long leverage (x):"), scfdLongLevEdit);
+    scfdShortImEdit = new QLineEdit(); pf->addRow(tr("Short IM:"), scfdShortImEdit);
+    scfdShortLevEdit = new QLineEdit(QStringLiteral("1")); pf->addRow(tr("Short leverage (x):"), scfdShortLevEdit);
+    {
+        QWidget* w = new QWidget(); QHBoxLayout* h = new QHBoxLayout(w); h->setContentsMargins(0,0,0,0);
+        scfdProposeOwnerEdit = new QLineEdit(); scfdProposeOwnerEdit->setPlaceholderText(tr("your owner payout (P2TR)"));
+        scfdProposeOwnerBtn = new QPushButton(tr("New")); h->addWidget(scfdProposeOwnerEdit, 1); h->addWidget(scfdProposeOwnerBtn);
+        pf->addRow(tr("Owner addr:"), w);
+    }
+    {
+        QWidget* w = new QWidget(); QHBoxLayout* h = new QHBoxLayout(w); h->setContentsMargins(0,0,0,0);
+        scfdProposeCpEdit = new QLineEdit(); scfdProposeCpEdit->setPlaceholderText(tr("your cp payout (P2TR)"));
+        scfdProposeCpBtn = new QPushButton(tr("New")); h->addWidget(scfdProposeCpEdit, 1); h->addWidget(scfdProposeCpBtn);
+        pf->addRow(tr("CP addr:"), w);
+    }
+    scfdProposeButton = new QPushButton(tr("Propose → offer"));
+    pf->addRow(QString(), scfdProposeButton);
+    scfdOfferOut = new QTextEdit(); scfdOfferOut->setReadOnly(true); scfdOfferOut->setMaximumHeight(90); scfdOfferOut->setPlaceholderText(tr("offer JSON (hand to the counterparty)"));
+    pf->addRow(tr("Offer:"), scfdOfferOut);
+    proposeGroup->setLayout(pf); outer->addWidget(proposeGroup);
+
+    // ── 2. Accept ───────────────────────────────────────────────────────────────────────────────────────
+    QGroupBox* acceptGroup = new QGroupBox(tr("2. Accept (counterparty)"));
+    QFormLayout* af = new QFormLayout();
+    scfdAcceptOfferIn = new QTextEdit(); scfdAcceptOfferIn->setMaximumHeight(80); scfdAcceptOfferIn->setPlaceholderText(tr("paste the offer JSON")); af->addRow(tr("Offer:"), scfdAcceptOfferIn);
+    {
+        QWidget* w = new QWidget(); QHBoxLayout* h = new QHBoxLayout(w); h->setContentsMargins(0,0,0,0);
+        scfdAcceptOwnerEdit = new QLineEdit(); scfdAcceptOwnerEdit->setPlaceholderText(tr("your owner payout (P2TR)"));
+        scfdAcceptOwnerBtn = new QPushButton(tr("New")); h->addWidget(scfdAcceptOwnerEdit, 1); h->addWidget(scfdAcceptOwnerBtn); af->addRow(tr("Owner addr:"), w);
+    }
+    {
+        QWidget* w = new QWidget(); QHBoxLayout* h = new QHBoxLayout(w); h->setContentsMargins(0,0,0,0);
+        scfdAcceptCpEdit = new QLineEdit(); scfdAcceptCpEdit->setPlaceholderText(tr("your cp payout (P2TR)"));
+        scfdAcceptCpBtn = new QPushButton(tr("New")); h->addWidget(scfdAcceptCpEdit, 1); h->addWidget(scfdAcceptCpBtn); af->addRow(tr("CP addr:"), w);
+    }
+    scfdAcceptConfirm = new QCheckBox(tr("Confirm (persist + return acceptance)")); af->addRow(QString(), scfdAcceptConfirm);
+    scfdAcceptButton = new QPushButton(tr("Accept")); af->addRow(QString(), scfdAcceptButton);
+    scfdAcceptanceOut = new QTextEdit(); scfdAcceptanceOut->setReadOnly(true); scfdAcceptanceOut->setMaximumHeight(80); scfdAcceptanceOut->setPlaceholderText(tr("acceptance JSON (hand back to the proposer)")); af->addRow(tr("Acceptance:"), scfdAcceptanceOut);
+    acceptGroup->setLayout(af); outer->addWidget(acceptGroup);
+
+    // ── 3. Import acceptance (proposer) ──────────────────────────────────────────────────────────────────
+    QGroupBox* importGroup = new QGroupBox(tr("3. Import acceptance (proposer)"));
+    QFormLayout* imf = new QFormLayout();
+    scfdImportOfferIn = new QTextEdit(); scfdImportOfferIn->setMaximumHeight(70); scfdImportOfferIn->setPlaceholderText(tr("your offer JSON")); imf->addRow(tr("Offer:"), scfdImportOfferIn);
+    scfdImportAcceptanceIn = new QTextEdit(); scfdImportAcceptanceIn->setMaximumHeight(70); scfdImportAcceptanceIn->setPlaceholderText(tr("the acceptance JSON")); imf->addRow(tr("Acceptance:"), scfdImportAcceptanceIn);
+    scfdImportButton = new QPushButton(tr("Import acceptance")); imf->addRow(QString(), scfdImportButton);
+    importGroup->setLayout(imf); outer->addWidget(importGroup);
+
+    // ── 4. Lifecycle (open / record / settle / coop / price) ─────────────────────────────────────────────
+    QGroupBox* lifeGroup = new QGroupBox(tr("4. Lifecycle"));
+    QFormLayout* lf = new QFormLayout();
+    scfdContractIdEdit = new QLineEdit(); scfdContractIdEdit->setPlaceholderText(tr("contract id (64-hex)")); lf->addRow(tr("Contract id:"), scfdContractIdEdit);
+    scfdLegCombo = new QComboBox(); scfdLegCombo->addItem(tr("long")); scfdLegCombo->addItem(tr("short")); lf->addRow(tr("Leg:"), scfdLegCombo);
+    scfdFeeRateEdit = new QLineEdit(); scfdFeeRateEdit->setPlaceholderText(tr("fee rate sat/vB (optional)")); lf->addRow(tr("Fee rate:"), scfdFeeRateEdit);
+    scfdOpenPsbtIn = new QTextEdit(); scfdOpenPsbtIn->setMaximumHeight(60); scfdOpenPsbtIn->setPlaceholderText(tr("counterparty partial open PSBT (2nd party only)")); lf->addRow(tr("Open PSBT in:"), scfdOpenPsbtIn);
+    scfdBuildOpenButton = new QPushButton(tr("Build open")); lf->addRow(QString(), scfdBuildOpenButton);
+    scfdOpenPsbtOut = new QTextEdit(); scfdOpenPsbtOut->setReadOnly(true); scfdOpenPsbtOut->setMaximumHeight(60); lf->addRow(tr("Open PSBT out:"), scfdOpenPsbtOut);
+    {
+        QWidget* w = new QWidget(); QHBoxLayout* h = new QHBoxLayout(w); h->setContentsMargins(0,0,0,0);
+        scfdRecordTxidEdit = new QLineEdit(); scfdRecordTxidEdit->setPlaceholderText(tr("broadcast open txid"));
+        scfdRecordOpenButton = new QPushButton(tr("Record open")); h->addWidget(scfdRecordTxidEdit, 1); h->addWidget(scfdRecordOpenButton); lf->addRow(tr("Record open:"), w);
+    }
+    scfdBuildSettleButton = new QPushButton(tr("Build settlement")); lf->addRow(QString(), scfdBuildSettleButton);
+    scfdSettlePsbtOut = new QTextEdit(); scfdSettlePsbtOut->setReadOnly(true); scfdSettlePsbtOut->setMaximumHeight(60); lf->addRow(tr("Settle PSBT:"), scfdSettlePsbtOut);
+    scfdFinalizeIn = new QTextEdit(); scfdFinalizeIn->setMaximumHeight(60); scfdFinalizeIn->setPlaceholderText(tr("settlement PSBT (fee input signed) → finalize")); lf->addRow(tr("Finalize PSBT:"), scfdFinalizeIn);
+    scfdFinalizeButton = new QPushButton(tr("Finalize settlement → hex")); lf->addRow(QString(), scfdFinalizeButton);
+    {
+        QWidget* w = new QWidget(); QHBoxLayout* h = new QHBoxLayout(w); h->setContentsMargins(0,0,0,0);
+        scfdCoopAddr1Edit = new QLineEdit(); scfdCoopAddr1Edit->setPlaceholderText(tr("coop out 1 addr"));
+        scfdCoopAmt1Edit = new QLineEdit(); scfdCoopAmt1Edit->setPlaceholderText(tr("amt (BTC)")); scfdCoopAmt1Edit->setMaximumWidth(110);
+        h->addWidget(scfdCoopAddr1Edit, 1); h->addWidget(scfdCoopAmt1Edit); lf->addRow(tr("Coop out 1:"), w);
+    }
+    {
+        QWidget* w = new QWidget(); QHBoxLayout* h = new QHBoxLayout(w); h->setContentsMargins(0,0,0,0);
+        scfdCoopAddr2Edit = new QLineEdit(); scfdCoopAddr2Edit->setPlaceholderText(tr("coop out 2 addr (optional)"));
+        scfdCoopAmt2Edit = new QLineEdit(); scfdCoopAmt2Edit->setPlaceholderText(tr("amt (BTC)")); scfdCoopAmt2Edit->setMaximumWidth(110);
+        h->addWidget(scfdCoopAddr2Edit, 1); h->addWidget(scfdCoopAmt2Edit); lf->addRow(tr("Coop out 2:"), w);
+    }
+    scfdBuildCoopButton = new QPushButton(tr("Build coop close")); lf->addRow(QString(), scfdBuildCoopButton);
+    scfdCoopPsbtIO = new QTextEdit(); scfdCoopPsbtIO->setMaximumHeight(60); scfdCoopPsbtIO->setPlaceholderText(tr("coop PSBT (sign_coop round-trips here)")); lf->addRow(tr("Coop PSBT:"), scfdCoopPsbtIO);
+    scfdSignCoopButton = new QPushButton(tr("Sign coop")); lf->addRow(QString(), scfdSignCoopButton);
+    {
+        QWidget* w = new QWidget(); QHBoxLayout* h = new QHBoxLayout(w); h->setContentsMargins(0,0,0,0);
+        scfdPriceSigmaEdit = new QLineEdit(); scfdPriceSigmaEdit->setPlaceholderText(tr("sigma (optional)"));
+        scfdPriceButton = new QPushButton(tr("Price (MTM)")); h->addWidget(scfdPriceSigmaEdit, 1); h->addWidget(scfdPriceButton); lf->addRow(tr("Price:"), w);
+    }
+    scfdPriceLabel = new QLabel(tr("(not priced)")); scfdPriceLabel->setWordWrap(true); lf->addRow(tr("MTM:"), scfdPriceLabel);
+    lifeGroup->setLayout(lf); outer->addWidget(lifeGroup);
+
+    scfdStatusText = new QTextEdit(); scfdStatusText->setReadOnly(true); scfdStatusText->setMaximumHeight(110);
+    outer->addWidget(new QLabel(tr("Status:"))); outer->addWidget(scfdStatusText);
+    outer->addStretch(1);
+
+    scroll->setWidget(content);
+    tabLayout->addWidget(scroll);
+
+    connect(scfdProposeOwnerBtn, &QPushButton::clicked, this, &TreasuryPage::onScfdProposeOwnerAddr);
+    connect(scfdProposeCpBtn, &QPushButton::clicked, this, &TreasuryPage::onScfdProposeCpAddr);
+    connect(scfdAcceptOwnerBtn, &QPushButton::clicked, this, &TreasuryPage::onScfdAcceptOwnerAddr);
+    connect(scfdAcceptCpBtn, &QPushButton::clicked, this, &TreasuryPage::onScfdAcceptCpAddr);
+    connect(scfdProposeButton, &QPushButton::clicked, this, &TreasuryPage::onScfdPropose);
+    connect(scfdAcceptButton, &QPushButton::clicked, this, &TreasuryPage::onScfdAccept);
+    connect(scfdImportButton, &QPushButton::clicked, this, &TreasuryPage::onScfdImport);
+    connect(scfdBuildOpenButton, &QPushButton::clicked, this, &TreasuryPage::onScfdBuildOpen);
+    connect(scfdRecordOpenButton, &QPushButton::clicked, this, &TreasuryPage::onScfdRecordOpen);
+    connect(scfdBuildSettleButton, &QPushButton::clicked, this, &TreasuryPage::onScfdBuildSettlement);
+    connect(scfdFinalizeButton, &QPushButton::clicked, this, &TreasuryPage::onScfdFinalize);
+    connect(scfdBuildCoopButton, &QPushButton::clicked, this, &TreasuryPage::onScfdBuildCoop);
+    connect(scfdSignCoopButton, &QPushButton::clicked, this, &TreasuryPage::onScfdSignCoop);
+    connect(scfdPriceButton, &QPushButton::clicked, this, &TreasuryPage::onScfdPrice);
+}
+
+void TreasuryPage::onScfdProposeOwnerAddr() { if (clientModel && walletModel) { try { UniValue p(UniValue::VARR); p.push_back(""); p.push_back("bech32m"); scfdProposeOwnerEdit->setText(QString::fromStdString(clientModel->node().executeRpc("getnewaddress", p, walletModel->getWalletName().toStdString()).get_str())); } catch (...) { showError(tr("Address generation failed.")); } } }
+void TreasuryPage::onScfdProposeCpAddr() { if (clientModel && walletModel) { try { UniValue p(UniValue::VARR); p.push_back(""); p.push_back("bech32m"); scfdProposeCpEdit->setText(QString::fromStdString(clientModel->node().executeRpc("getnewaddress", p, walletModel->getWalletName().toStdString()).get_str())); } catch (...) { showError(tr("Address generation failed.")); } } }
+void TreasuryPage::onScfdAcceptOwnerAddr() { if (clientModel && walletModel) { try { UniValue p(UniValue::VARR); p.push_back(""); p.push_back("bech32m"); scfdAcceptOwnerEdit->setText(QString::fromStdString(clientModel->node().executeRpc("getnewaddress", p, walletModel->getWalletName().toStdString()).get_str())); } catch (...) { showError(tr("Address generation failed.")); } } }
+void TreasuryPage::onScfdAcceptCpAddr() { if (clientModel && walletModel) { try { UniValue p(UniValue::VARR); p.push_back(""); p.push_back("bech32m"); scfdAcceptCpEdit->setText(QString::fromStdString(clientModel->node().executeRpc("getnewaddress", p, walletModel->getWalletName().toStdString()).get_str())); } catch (...) { showError(tr("Address generation failed.")); } } }
+
+void TreasuryPage::onScfdPropose()
+{
+    if (!walletModel) { showError(tr("Wallet not ready")); return; }
+    WalletModel::ScalarCfdTermsInput t;
+    t.source_type = 0;
+    t.payoff_mode = scfdPayoffModeCombo->currentIndex();
+    t.underlying_asset_id = scfdUnderlyingEdit->text().trimmed();
+    quint32 v = 0;
+    if (!ParseU32(scfdFeedIdEdit->text(), v)) { showError(tr("Invalid feed id")); return; } t.feed_id = v;
+    bool okfr = false; t.fixing_ref = scfdFixingRefEdit->text().trimmed().toULongLong(&okfr);
+    if (!okfr) { showError(tr("Invalid fixing ref (epoch)")); return; }
+    if (!ParseU32(scfdDeadlineEdit->text(), v)) { showError(tr("Invalid deadline height")); return; } t.publication_deadline_height = v;
+    if (!ParseU32(scfdSettleLockEdit->text(), v)) { showError(tr("Invalid settle lock height")); return; } t.settle_lock_height = v;
+    t.scalar_format_id = scfdFormatSpin->value();
+    t.strike = scfdStrikeEdit->text().trimmed();
+    t.fallback_scalar = scfdFallbackEdit->text().trimmed();
+    t.collateral_asset_id = scfdCollateralEdit->text().trimmed();
+    if (!t.collateral_asset_id.isEmpty()) { showError(tr("Asset-collateral bilateral CFDs cannot be opened yet — leave Collateral blank (native TSC).")); return; }
+    // Validate the per-leg IM (non-negative integer collateral units) + leverage (positive, finite, and a
+    // lambda_q that fits uint32) IN THE GUI before the RPC — a negative/garbage entry must not silently
+    // become a huge uint64/quint32.
+    auto parseLeg = [&](QLineEdit* imE, QLineEdit* levE, WalletModel::ScalarCfdLegInput& leg, const QString& name) -> bool {
+        bool ok = false;
+        const qlonglong im = imE->text().trimmed().toLongLong(&ok);
+        if (!ok || im < 0) { showError(tr("%1 IM must be a non-negative integer (collateral units).").arg(name)); return false; }
+        bool okl = false;
+        const double lev = levE->text().trimmed().toDouble(&okl);
+        if (!okl || !std::isfinite(lev) || lev <= 0.0) { showError(tr("%1 leverage must be a positive number.").arg(name)); return false; }
+        const double lq = lev * 65536.0;
+        if (lq > 4294967295.0) { showError(tr("%1 leverage is too large.").arg(name)); return false; }
+        leg.im_sats = im;
+        leg.lambda_q = static_cast<quint32>(qRound64(lq));
+        return true;
+    };
+    if (!parseLeg(scfdLongImEdit, scfdLongLevEdit, t.long_leg, tr("Long"))) return;
+    if (!parseLeg(scfdShortImEdit, scfdShortLevEdit, t.short_leg, tr("Short"))) return;
+    const bool isShort = scfdRoleCombo->currentIndex() == 1;
+    auto r = walletModel->scalarCfdPropose(t, isShort, scfdProposeOwnerEdit->text().trimmed(), scfdProposeCpEdit->text().trimmed());
+    if (!r.success) { showError(r.error); return; }
+    scfdOfferOut->setPlainText(r.offer_json);
+    scfdStatusText->append(tr("Proposed as %1 — hand the offer to the counterparty.").arg(isShort ? tr("short") : tr("long")));
+}
+
+void TreasuryPage::onScfdAccept()
+{
+    if (!walletModel) { showError(tr("Wallet not ready")); return; }
+    auto r = walletModel->scalarCfdAccept(scfdAcceptOfferIn->toPlainText().trimmed(), scfdAcceptOwnerEdit->text().trimmed(),
+                                          scfdAcceptCpEdit->text().trimmed(), scfdAcceptConfirm->isChecked());
+    if (!r.success) { showError(r.error); return; }
+    if (!r.contract_id.isEmpty()) { scfdContractIdEdit->setText(r.contract_id); scfdStatusText->append(tr("Contract id: %1").arg(r.contract_id)); }
+    if (!r.acceptance_json.isEmpty()) { scfdAcceptanceOut->setPlainText(r.acceptance_json); scfdStatusText->append(tr("Accepted — hand the acceptance back to the proposer.")); }
+    else if (!r.action_required.isEmpty()) scfdStatusText->append(tr("Review: %1").arg(r.action_required));
+}
+
+void TreasuryPage::onScfdImport()
+{
+    if (!walletModel) { showError(tr("Wallet not ready")); return; }
+    auto r = walletModel->scalarCfdImportAcceptance(scfdImportOfferIn->toPlainText().trimmed(), scfdImportAcceptanceIn->toPlainText().trimmed());
+    if (!r.success) { showError(r.error); return; }
+    scfdContractIdEdit->setText(r.contract_id);
+    scfdStatusText->append(tr("Imported acceptance — contract %1 is %2.").arg(r.contract_id, r.state));
+}
+
+void TreasuryPage::onScfdBuildOpen()
+{
+    if (!walletModel || !clientModel) { showError(tr("Wallet not ready")); return; }
+    const bool isShort = scfdLegCombo->currentIndex() == 1;
+    double fr = 0.0;
+    if (!scfdFeeRateEdit->text().trimmed().isEmpty()) {
+        bool okfr = false; fr = scfdFeeRateEdit->text().trimmed().toDouble(&okfr);
+        if (!okfr || !std::isfinite(fr) || fr <= 0.0) { showError(tr("Invalid fee rate")); return; }
+    }
+    auto r = walletModel->scalarCfdBuildOpen(scfdContractIdEdit->text().trimmed(), isShort, scfdOpenPsbtIn->toPlainText().trimmed(), fr);
+    if (!r.success) { showError(r.error); return; }
+    // Sign THIS wallet's inputs in-GUI (walletprocesspsbt). When both legs are signed (the 2nd party,
+    // augmenting the 1st party's already-signed PSBT) the open is a normal funding tx -> finalize + broadcast
+    // directly and pre-fill the record txid; otherwise the partial-signed PSBT is handed to the counterparty.
+    const std::string wname = walletModel->getWalletName().toStdString();
+    try {
+        UniValue pp(UniValue::VARR); pp.push_back(r.psbt.toStdString()); pp.push_back(true);
+        UniValue pr = clientModel->node().executeRpc("walletprocesspsbt", pp, wname);
+        const QString signedPsbt = QString::fromStdString(pr["psbt"].get_str());
+        const bool complete = pr.exists("complete") && pr["complete"].get_bool();
+        scfdOpenPsbtOut->setPlainText(signedPsbt);
+        if (complete) {
+            UniValue fp(UniValue::VARR); fp.push_back(signedPsbt.toStdString());
+            UniValue fres = clientModel->node().executeRpc("finalizepsbt", fp, wname);
+            if (fres.exists("complete") && fres["complete"].get_bool() && fres.exists("hex")) {
+                UniValue sp(UniValue::VARR); sp.push_back(fres["hex"].get_str());
+                const QString txid = QString::fromStdString(clientModel->node().executeRpc("sendrawtransaction", sp, wname).get_str());
+                scfdRecordTxidEdit->setText(txid);
+                scfdStatusText->append(tr("Open broadcast: %1 — now Record open in BOTH wallets.").arg(txid));
+            } else {
+                scfdStatusText->append(tr("Open PSBT fully signed — finalize + broadcast it (finalizepsbt)."));
+            }
+        } else {
+            scfdStatusText->append(tr("Built + signed your inputs (%1 leg, vout %2, fee %3). Hand the PSBT to the counterparty to augment + co-sign.").arg(r.leg).arg(r.vault_index).arg(r.fee));
+        }
+    } catch (...) {
+        scfdOpenPsbtOut->setPlainText(r.psbt);
+        scfdStatusText->append(tr("Built open (%1 leg) — could not auto-sign; run walletprocesspsbt on it.").arg(r.leg));
+    }
+}
+
+void TreasuryPage::onScfdRecordOpen()
+{
+    if (!walletModel) { showError(tr("Wallet not ready")); return; }
+    auto r = walletModel->scalarCfdRecordOpen(scfdContractIdEdit->text().trimmed(), scfdRecordTxidEdit->text().trimmed());
+    if (!r.success) { showError(r.error); return; }
+    scfdStatusText->append(tr("Recorded open — long %1 / short %2.").arg(r.long_vault, r.short_vault));
+}
+
+void TreasuryPage::onScfdBuildSettlement()
+{
+    if (!walletModel || !clientModel) { showError(tr("Wallet not ready")); return; }
+    const bool isShort = scfdLegCombo->currentIndex() == 1;
+    double fr = 0.0;
+    if (!scfdFeeRateEdit->text().trimmed().isEmpty()) {
+        bool okfr = false; fr = scfdFeeRateEdit->text().trimmed().toDouble(&okfr);
+        if (!okfr || !std::isfinite(fr) || fr <= 0.0) { showError(tr("Invalid fee rate")); return; }
+    }
+    auto r = walletModel->scalarCfdBuildSettlement(scfdContractIdEdit->text().trimmed(), isShort, fr);
+    if (!r.success) { showError(r.error); return; }
+    scfdSettlePsbtOut->setPlainText(r.psbt);
+    // Sign the keeper fee input in-GUI (walletprocesspsbt) so the Finalize step has a complete fee input;
+    // the vault covenant input is already finalized by build_settlement. Pre-fill the (signed) Finalize box.
+    const std::string wname = walletModel->getWalletName().toStdString();
+    try {
+        UniValue pp(UniValue::VARR); pp.push_back(r.psbt.toStdString()); pp.push_back(true);
+        UniValue pr = clientModel->node().executeRpc("walletprocesspsbt", pp, wname);
+        scfdFinalizeIn->setPlainText(QString::fromStdString(pr["psbt"].get_str()));
+        scfdStatusText->append(tr("Built settlement (%1 leg, owner %2 / cp %3%4) + signed the fee input — click Finalize, then broadcast/mine the hex.")
+                                   .arg(isShort ? tr("short") : tr("long")).arg(r.payout_owner).arg(r.payout_cp)
+                                   .arg(r.is_fallback ? tr(" — fallback") : QString()));
+    } catch (...) {
+        scfdFinalizeIn->setPlainText(r.psbt);
+        scfdStatusText->append(tr("Built settlement (%1 leg) — sign the fee input (walletprocesspsbt) then Finalize.").arg(isShort ? tr("short") : tr("long")));
+    }
+}
+
+void TreasuryPage::onScfdFinalize()
+{
+    if (!walletModel) { showError(tr("Wallet not ready")); return; }
+    auto r = walletModel->scalarCfdFinalizeSettlement(scfdFinalizeIn->toPlainText().trimmed());
+    if (!r.success) { showError(r.error); return; }
+    scfdStatusText->append(tr("Finalized settlement — broadcast hex:\n%1").arg(r.hex));
+}
+
+void TreasuryPage::onScfdBuildCoop()
+{
+    if (!walletModel) { showError(tr("Wallet not ready")); return; }
+    const bool isShort = scfdLegCombo->currentIndex() == 1;
+    QList<QPair<QString, qint64>> outs;
+    bool amtOk = true;
+    auto add = [&](QLineEdit* a, QLineEdit* m) {
+        const QString addr = a->text().trimmed();
+        if (addr.isEmpty()) return;
+        bool ok = false;
+        const double amt = m->text().trimmed().toDouble(&ok);
+        // Bound to MAX_MONEY (21,000,000 TSC) BEFORE the sats conversion so absurd input can't overflow/round badly.
+        if (!ok || !std::isfinite(amt) || amt <= 0.0 || amt > 21000000.0) { showError(tr("Invalid coop output amount for %1 (0 < amount ≤ 21,000,000)").arg(addr)); amtOk = false; return; }
+        outs.append({addr, static_cast<qint64>(qRound64(amt * 100000000.0))});
+    };
+    add(scfdCoopAddr1Edit, scfdCoopAmt1Edit);
+    if (!amtOk) return;
+    add(scfdCoopAddr2Edit, scfdCoopAmt2Edit);
+    if (!amtOk) return;
+    if (outs.isEmpty()) { showError(tr("Add at least one coop output")); return; }
+    auto r = walletModel->scalarCfdBuildCoopClose(scfdContractIdEdit->text().trimmed(), isShort, outs);
+    if (!r.success) { showError(r.error); return; }
+    scfdCoopPsbtIO->setPlainText(r.psbt);
+    scfdStatusText->append(tr("Built coop close (%1 leg, fee %2). Each party Signs coop in turn.").arg(isShort ? tr("short") : tr("long")).arg(r.fee));
+}
+
+void TreasuryPage::onScfdSignCoop()
+{
+    if (!walletModel) { showError(tr("Wallet not ready")); return; }
+    const bool isShort = scfdLegCombo->currentIndex() == 1;
+    auto r = walletModel->scalarCfdSignCoop(scfdContractIdEdit->text().trimmed(), isShort, scfdCoopPsbtIO->toPlainText().trimmed());
+    if (!r.success) { showError(r.error); return; }
+    scfdCoopPsbtIO->setPlainText(r.complete ? r.hex : r.psbt);
+    scfdStatusText->append(r.complete ? tr("Coop close complete — broadcast the hex above.") : tr("Signed your half — pass the PSBT to the counterparty."));
+}
+
+void TreasuryPage::onScfdPrice()
+{
+    if (!walletModel) { showError(tr("Wallet not ready")); return; }
+    double sigma = -1.0; // < 0 -> omit (resolved from curves/chain)
+    if (!scfdPriceSigmaEdit->text().trimmed().isEmpty()) {
+        bool ok = false; sigma = scfdPriceSigmaEdit->text().trimmed().toDouble(&ok);
+        if (!ok || !std::isfinite(sigma) || sigma < 0.0) { showError(tr("Invalid sigma (must be a non-negative number)")); return; }
+    }
+    auto r = walletModel->scalarCfdPrice(scfdContractIdEdit->text().trimmed(), sigma);
+    if (!r.success) { showError(r.error); return; }
+    // Show BOTH sides (the MTM/greeks are exact negatives) so neither a long nor a short user misreads it;
+    // amounts are in the collateral numeraire (native TSC sats unless asset-collateralised).
+    QString s = tr("R=%1  F/K=%2  | σ=%3 τ=%4 DF=%5 prov=%6  numéraire=%7%8%9\n"
+                   "LONG : MTM exp %10 / intr %11   Δ=%12 vega=%13 θ=%14\n"
+                   "SHORT: MTM exp %15 / intr %16   Δ=%17 vega=%18 θ=%19")
+        .arg(r.current_ratio, 0, 'f', 4).arg(r.forecast_ratio, 0, 'f', 4)
+        .arg(r.sigma, 0, 'f', 3).arg(r.tau_years, 0, 'f', 3).arg(r.discount_factor, 0, 'f', 4)
+        .arg(r.forward_provenance).arg(r.collateral_is_native ? tr("native") : tr("asset C"))
+        .arg(r.fixing_reached ? tr(" [fixed]") : QString()).arg(r.is_fallback ? tr(" [fallback]") : QString())
+        .arg(r.expected_long_mtm, 0, 'f', 0).arg(r.intrinsic_long_mtm, 0, 'f', 0)
+        .arg(r.long_delta_to_cross_rate, 0, 'f', 0).arg(r.long_vega, 0, 'f', 0).arg(r.long_theta, 0, 'f', 0)
+        .arg(r.expected_short_mtm, 0, 'f', 0).arg(r.intrinsic_short_mtm, 0, 'f', 0)
+        .arg(r.short_delta_to_cross_rate, 0, 'f', 0).arg(r.short_vega, 0, 'f', 0).arg(r.short_theta, 0, 'f', 0);
+    if (r.model_unreliable) s += tr("\n⚠ MODEL UNRELIABLE");
+    scfdPriceLabel->setText(s);
+    if (!r.warnings.isEmpty()) scfdStatusText->append(tr("Pricing warnings: %1").arg(r.warnings.join(QStringLiteral("; "))));
+    if (r.model_unreliable) scfdStatusText->append(tr("⚠ Pricing model is unreliable — do not act on this MTM."));
+}
+
+void TreasuryPage::onCfdGenSalt()
+{
+    std::random_device rd;
+    std::mt19937_64 gen(rd());
+    std::uniform_int_distribution<uint64_t> dis;
+    QString s;
+    for (int i = 0; i < 4; ++i) s += QString("%1").arg(dis(gen), 16, 16, QChar('0'));
+    cfdSaltEdit->setText(s);
+}
+
+void TreasuryPage::onCfdPairPreview()
+{
+    if (!cfdPairIdLabel) return;
+    const QString root = cfdParentCombo ? cfdParentCombo->currentData().toString() : QString();
+    const QString ls = cfdLongSuffixEdit ? cfdLongSuffixEdit->text().trimmed().toUpper() : QString();
+    const QString ss = cfdShortSuffixEdit ? cfdShortSuffixEdit->text().trimmed().toUpper() : QString();
+    if (root.isEmpty() || ls.isEmpty() || ss.isEmpty()) {
+        cfdPairIdLabel->setText(tr("(choose a root + long/short suffix)"));
+        return;
+    }
+    cfdPairIdLabel->setText(tr("L = %1.%2   S = %1.%3").arg(root, ls, ss));
+}
+
+bool TreasuryPage::collectCfdSeriesTerms(WalletModel::ScalarNotePairTermsInput& out)
+{
+    out.source_type = static_cast<int>(ScalarCfdSourceType::ISSUER_PUBLISHED); // CHAIN_INTRINSIC fails closed (no resolver yet)
+    out.payoff_mode = cfdPayoffModeCombo->currentData().toInt();
+    out.loss_direction = cfdLossDirCombo->currentData().toInt();
+
+    const QString u = cfdUnderlyingEdit->text().trimmed().toLower();
+    if (!IsHex64(u)) { cfdStatusText->append(tr("✗ Underlying (U) must be a 64-hex asset id.")); return false; }
+    out.underlying_asset_id = u;
+
+    if (!ParseU32(cfdSeriesFeedIdEdit->text(), out.feed_id)) { cfdStatusText->append(tr("✗ Feed id must be a uint32.")); return false; }
+
+    bool ok = false;
+    const qulonglong fixing = cfdFixingRefEdit->text().trimmed().toULongLong(&ok);
+    if (!ok) { cfdStatusText->append(tr("✗ Fixing epoch must be a non-negative integer (u64).")); return false; }
+    out.fixing_ref = fixing;
+
+    const qulonglong deadline = cfdDeadlineHeightEdit->text().trimmed().toULongLong(&ok);
+    if (!ok || deadline > 0xFFFFFFFFULL) { cfdStatusText->append(tr("✗ Deadline height must be a u32 block height.")); return false; }
+    out.publication_deadline_height = static_cast<quint32>(deadline);
+
+    const qulonglong settle = cfdSettleLockEdit->text().trimmed().toULongLong(&ok);
+    if (!ok || settle > 0xFFFFFFFFULL) { cfdStatusText->append(tr("✗ Settle-lock height must be a u32 block height.")); return false; }
+    out.settle_lock_height = static_cast<quint32>(settle);
+
+    out.scalar_format_id = cfdFormatSpin->value();
+
+    const QString strike = cfdStrikeEdit->text().trimmed().toLower();
+    if (!IsHex64(strike)) { cfdStatusText->append(tr("✗ Strike must be 64 hex chars in the chosen format.")); return false; }
+    out.strike = strike;
+
+    const QString fallback = cfdFallbackEdit->text().trimmed().toLower();
+    if (!IsHex64(fallback)) { cfdStatusText->append(tr("✗ Fallback scalar must be 64 hex chars.")); return false; }
+    out.fallback_scalar = fallback;
+
+    const double lev = cfdLeverageEdit->text().trimmed().toDouble(&ok);
+    if (!ok || lev <= 0.0) { cfdStatusText->append(tr("✗ Leverage must be a positive number.")); return false; }
+    const long long lq = std::llround(lev * 65536.0);
+    if (lq < 1 || lq > 0xFFFFFFFFLL) { cfdStatusText->append(tr("✗ Leverage is out of the representable range.")); return false; }
+    out.lambda_q = static_cast<quint32>(lq);
+
+    // Collateral C: combo data is "" (native), "custom" (read the hex field), or a collateral-safe asset id.
+    const QString cdata = cfdCollateralCombo->currentData().toString();
+    QString c;
+    if (cdata == QStringLiteral("custom")) {
+        c = cfdCollateralEdit->text().trimmed().toLower();
+        if (!IsHex64(c)) { cfdStatusText->append(tr("✗ Custom collateral (C) must be a 64-hex asset id.")); return false; }
+    } else {
+        c = cdata.toLower();  // "" = native; otherwise a chosen collateral-safe asset id
+    }
+    out.collateral_asset_id = c;  // blank -> native sentinel (the RPC defaults to zero/native)
+
+    const qulonglong im = cfdVaultImEdit->text().trimmed().toULongLong(&ok);
+    if (!ok || im == 0) { cfdStatusText->append(tr("✗ Lot IM must be a positive integer (C units; sats if native).")); return false; }
+    out.vault_im = im;
+
+    out.lot_count = static_cast<quint32>(cfdLotCountSpin->value());
+
+    QString salt = cfdSaltEdit->text().trimmed().toLower();
+    if (salt.isEmpty()) { onCfdGenSalt(); salt = cfdSaltEdit->text().trimmed().toLower(); }
+    if (!IsHex64(salt)) { cfdStatusText->append(tr("✗ Series salt must be 64 hex chars.")); return false; }
+    out.series_salt = salt;
+    return true;
+}
+
+void TreasuryPage::onCfdRegister()
+{
+    if (!walletModel || !clientModel) { showError(tr("Wallet or client model not initialized")); return; }
+    if (!cfdParentCombo || cfdParentCombo->count() == 0) {
+        showError(tr("No wallet-controlled root is available to sponsor the pair."));
+        return;
+    }
+    WalletModel::ScalarNotePairTermsInput t;
+    if (!collectCfdSeriesTerms(t)) return;
+
+    const QString root = cfdParentCombo->currentData().toString();
+    const QString ls = cfdLongSuffixEdit->text().trimmed().toUpper();
+    const QString ss = cfdShortSuffixEdit->text().trimmed().toUpper();
+    if (ls.isEmpty() || ss.isEmpty() || ls == ss) {
+        showError(tr("Enter distinct long and short suffixes (the L and S child tickers).")); return;
+    }
+
+    bool feeOk = false;
+    const double feeRate = cfdFeeRateEdit->text().trimmed().toDouble(&feeOk);
+    if (!feeOk || feeRate <= 0.0) { showError(tr("Fee rate must be a positive number (sat/vB).")); return; }
+    qint64 bondSats = 0;
+    const QString bondStr = cfdBondEdit->text().trimmed();
+    if (!bondStr.isEmpty() && !ParseTscToSats(bondStr, bondSats)) {
+        showError(tr("Child bond must be a non-negative TSC amount with at most 8 decimals.")); return;
+    }
+
+    QString confirm = tr("<b>Register CFD asset series</b><br/><br/>");
+    confirm += tr("<b>Long token:</b> %1.%2<br/><b>Short token:</b> %1.%3<br/>").arg(root, ls, ss);
+    confirm += tr("<b>Lots (N):</b> %1, each IM %2 (in C's units)<br/>").arg(t.lot_count).arg(t.vault_im);
+    confirm += tr("<b>Collateral:</b> %1<br/><br/>").arg(t.collateral_asset_id.isEmpty() ? tr("native TSC") : t.collateral_asset_id);
+    confirm += tr("This registers the L and S child shells only (no minting). After it confirms, click "
+                  "'2. Issue pair'.<br/><br/>Proceed?");
+    QMessageBox box(TopLevelDialogParent(this));
+    box.setWindowTitle(tr("Confirm Pair Registration"));
+    box.setTextFormat(Qt::RichText);
+    box.setText(confirm);
+    box.setIcon(QMessageBox::Question);
+    box.setStandardButtons(QMessageBox::Yes | QMessageBox::No);
+    box.setDefaultButton(QMessageBox::No);
+    box.setWindowModality(Qt::WindowModal);
+    if (box.exec() != QMessageBox::Yes) { cfdStatusText->append(tr("Registration cancelled.")); return; }
+
+    WalletModel::UnlockContext ctx(walletModel->requestUnlock());
+    if (!ctx.isValid()) { showError(tr("Wallet locked. Please unlock to register the pair.")); return; }
+
+    WalletModel::ScalarNotePairRegisterResult r = walletModel->scalarNotePairBuildRegister(t, root, ls, ss, bondSats, feeRate, true);
+    if (!r.success) { cfdStatusText->append(tr("✗ Register failed: %1").arg(r.error)); showError(r.error); return; }
+    m_cfdRegisterTxid = r.txid;
+    cfdPairIdLabel->setText(tr("pair %1  |  L=%2  S=%3").arg(r.pair_id.left(16) + QStringLiteral("…"), r.long_ticker, r.short_ticker));
+    cfdStatusText->append(tr("✓ Registered pair %1 (L %2 / S %3). TxID %4.")
+                              .arg(r.pair_id.left(16) + QStringLiteral("…")).arg(r.long_ticker).arg(r.short_ticker).arg(r.txid));
+    cfdStatusText->append(tr("  → Wait for 1 confirmation, then click '2. Issue pair'."));
+    cfdRegisterButton->setEnabled(false);
+    cfdIssueButton->setEnabled(true);
+    saveCfdDraft(/*stage=*/1);  // terms + salt + register txid now durable across an app restart
+    refreshAssetList();
+    refreshICUDashboard();
+}
+
+void TreasuryPage::onCfdIssue()
+{
+    if (!walletModel) { showError(tr("Wallet not ready")); return; }
+    WalletModel::ScalarNotePairTermsInput t;
+    if (!collectCfdSeriesTerms(t)) return;
+    bool feeOk = false;
+    const double feeRate = cfdFeeRateEdit->text().trimmed().toDouble(&feeOk);
+    if (!feeOk || feeRate <= 0.0) { showError(tr("Fee rate must be a positive number (sat/vB).")); return; }
+    qint64 vaultNative = 546;
+    const QString vnStr = cfdVaultNativeEdit->text().trimmed();
+    if (!vnStr.isEmpty() && !ParseTscToSats(vnStr, vaultNative)) {
+        showError(tr("Vault native carrier must be a TSC amount with at most 8 decimals.")); return;
+    }
+
+    WalletModel::UnlockContext ctx(walletModel->requestUnlock());
+    if (!ctx.isValid()) { showError(tr("Wallet locked. Please unlock to issue the pair.")); return; }
+
+    WalletModel::ScalarNotePairIssueResult r = walletModel->scalarNotePairBuildIssue(t, vaultNative, feeRate, true);
+    if (!r.success) { cfdStatusText->append(tr("✗ Issue failed: %1").arg(r.error)); showError(r.error); return; }
+    m_cfdIssueTxid = r.txid;
+    cfdStatusText->append(tr("✓ Issued %1 L + %1 S units and funded %1 vaults. Mint TxID %2.").arg(r.lot_count).arg(r.txid));
+    cfdStatusText->append(tr("  → Wait for 1 confirmation, then click '3. Record issue'."));
+    cfdIssueButton->setEnabled(false);
+    cfdRecordButton->setEnabled(true);
+    saveCfdDraft(/*stage=*/2);  // persist the issuance txid so Record survives a restart
+    refreshAssetList();
+}
+
+void TreasuryPage::onCfdRecord()
+{
+    if (!walletModel) { showError(tr("Wallet not ready")); return; }
+    if (m_cfdIssueTxid.isEmpty()) { showError(tr("No issuance txid — run '2. Issue pair' first.")); return; }
+    WalletModel::ScalarNotePairTermsInput t;
+    if (!collectCfdSeriesTerms(t)) return;
+
+    WalletModel::ScalarNotePairRecordResult r = walletModel->scalarNotePairRecordIssue(t, m_cfdIssueTxid, m_cfdRegisterTxid);
+    if (!r.success) { cfdStatusText->append(tr("✗ Record failed: %1").arg(r.error)); showError(r.error); return; }
+    cfdStatusText->append(tr("✓ Recorded pair %1 (%2 lots) — persisted: %3.")
+                              .arg(r.pair_id.left(16) + QStringLiteral("…")).arg(r.lot_count).arg(r.persisted ? tr("yes") : tr("no")));
+    cfdStatusText->append(tr("  → Done. Click 'New pair' to create another."));
+    cfdRecordButton->setEnabled(false);
+    clearCfdDraft();   // the pair is recorded in the wallet now; the local draft is no longer needed
+    onCfdRefreshList();
+    refreshAssetList();
+    refreshICUDashboard();
+}
+
+void TreasuryPage::onCfdReset()
+{
+    cfdLongSuffixEdit->clear();
+    cfdShortSuffixEdit->clear();
+    cfdSaltEdit->clear();
+    cfdStrikeEdit->clear();
+    cfdFallbackEdit->clear();
+    cfdPairIdLabel->setText(tr("(register to preview the pair id)"));
+    m_cfdIssueTxid.clear();
+    m_cfdRegisterTxid.clear();
+    cfdRegisterButton->setEnabled(true);
+    cfdIssueButton->setEnabled(false);
+    cfdRecordButton->setEnabled(false);
+    clearCfdDraft();   // discard any saved in-progress draft
+    cfdStatusText->append(tr("— Ready for a new pair —"));
+}
+
+void TreasuryPage::saveCfdDraft(int stage)
+{
+    QSettings s;
+    s.beginGroup(QStringLiteral("ScalarNotePairDraft"));
+    s.setValue("active", true);
+    s.setValue("stage", stage);
+    // Scope the draft to its wallet + chain so Resume can refuse to restore into the wrong context.
+    s.setValue("wallet", walletModel ? walletModel->getWalletName() : QString());
+    s.setValue("chain", CurrentChainName(clientModel));
+    s.setValue("root", cfdParentCombo ? cfdParentCombo->currentData().toString() : QString());
+    s.setValue("long_suffix", cfdLongSuffixEdit->text());
+    s.setValue("short_suffix", cfdShortSuffixEdit->text());
+    s.setValue("payoff_mode", cfdPayoffModeCombo->currentIndex());
+    s.setValue("loss_dir", cfdLossDirCombo->currentIndex());
+    s.setValue("underlying", cfdUnderlyingEdit->text());
+    s.setValue("feed_id", cfdSeriesFeedIdEdit->text());
+    s.setValue("fixing_ref", cfdFixingRefEdit->text());
+    s.setValue("deadline", cfdDeadlineHeightEdit->text());
+    s.setValue("settle_lock", cfdSettleLockEdit->text());
+    s.setValue("format", cfdFormatSpin->value());
+    s.setValue("strike", cfdStrikeEdit->text());
+    s.setValue("fallback", cfdFallbackEdit->text());
+    s.setValue("leverage", cfdLeverageEdit->text());
+    s.setValue("collateral_idx", cfdCollateralCombo->currentIndex());
+    s.setValue("collateral_data", cfdCollateralCombo->currentData().toString());
+    s.setValue("collateral_hex", cfdCollateralEdit->text());
+    s.setValue("vault_im", cfdVaultImEdit->text());
+    s.setValue("lot_count", cfdLotCountSpin->value());
+    s.setValue("salt", cfdSaltEdit->text());
+    s.setValue("bond", cfdBondEdit->text());
+    s.setValue("vault_native", cfdVaultNativeEdit->text());
+    s.setValue("fee", cfdFeeRateEdit->text());
+    s.setValue("register_txid", m_cfdRegisterTxid);
+    s.setValue("issue_txid", m_cfdIssueTxid);
+    s.endGroup();
+    if (cfdResumeButton) cfdResumeButton->setEnabled(true);
+}
+
+void TreasuryPage::clearCfdDraft()
+{
+    QSettings s;
+    s.remove(QStringLiteral("ScalarNotePairDraft"));
+    if (cfdResumeButton) cfdResumeButton->setEnabled(false);
+}
+
+void TreasuryPage::onCfdResume()
+{
+    QSettings s;
+    s.beginGroup(QStringLiteral("ScalarNotePairDraft"));
+    if (!s.value("active", false).toBool()) { s.endGroup(); cfdStatusText->append(tr("No saved pair draft to resume.")); return; }
+    // Refuse to restore a draft made for a different wallet or chain (wrong vault context / txids).
+    const QString draftWallet = s.value("wallet").toString();
+    const QString draftChain = s.value("chain").toString();
+    const QString curWallet = walletModel ? walletModel->getWalletName() : QString();
+    const QString curChain = CurrentChainName(clientModel);
+    if (draftWallet != curWallet || draftChain != curChain) {
+        s.endGroup();
+        cfdStatusText->append(tr("✗ The saved draft belongs to wallet '%1' on chain '%2' (current: '%3' / '%4'); not resuming.")
+                                  .arg(draftWallet.isEmpty() ? tr("(default)") : draftWallet).arg(draftChain)
+                                  .arg(curWallet.isEmpty() ? tr("(default)") : curWallet).arg(curChain));
+        return;
+    }
+    const int stage = s.value("stage", 0).toInt();
+    const QString root = s.value("root").toString();
+    cfdLongSuffixEdit->setText(s.value("long_suffix").toString());
+    cfdShortSuffixEdit->setText(s.value("short_suffix").toString());
+    cfdPayoffModeCombo->setCurrentIndex(s.value("payoff_mode", 0).toInt());
+    cfdLossDirCombo->setCurrentIndex(s.value("loss_dir", 0).toInt());
+    cfdUnderlyingEdit->setText(s.value("underlying").toString());
+    cfdSeriesFeedIdEdit->setText(s.value("feed_id", "0").toString());
+    cfdFixingRefEdit->setText(s.value("fixing_ref").toString());
+    cfdDeadlineHeightEdit->setText(s.value("deadline").toString());
+    cfdSettleLockEdit->setText(s.value("settle_lock").toString());
+    cfdFormatSpin->setValue(s.value("format", assets::SCALAR_FORMAT_RAW_U256_LE).toInt());
+    cfdStrikeEdit->setText(s.value("strike").toString());
+    cfdFallbackEdit->setText(s.value("fallback").toString());
+    cfdLeverageEdit->setText(s.value("leverage", "1.0").toString());
+    cfdVaultImEdit->setText(s.value("vault_im").toString());
+    cfdLotCountSpin->setValue(s.value("lot_count", 10).toInt());
+    cfdSaltEdit->setText(s.value("salt").toString());
+    cfdBondEdit->setText(s.value("bond").toString());
+    cfdVaultNativeEdit->setText(s.value("vault_native").toString());
+    cfdFeeRateEdit->setText(s.value("fee").toString());
+    m_cfdRegisterTxid = s.value("register_txid").toString();
+    m_cfdIssueTxid = s.value("issue_txid").toString();
+    // Restore the collateral choice by its saved id (the combo is repopulated by the asset scan).
+    const QString collData = s.value("collateral_data").toString();
+    const QString collHex = s.value("collateral_hex").toString();
+    s.endGroup();
+
+    if (cfdParentCombo) {
+        const int idx = cfdParentCombo->findData(root);
+        if (idx >= 0) cfdParentCombo->setCurrentIndex(idx);
+        else if (!root.isEmpty()) cfdStatusText->append(tr("⚠ Saved sponsoring root '%1' is not in this wallet's controlled set.").arg(root));
+    }
+    if (cfdCollateralCombo) {
+        int cidx = cfdCollateralCombo->findData(collData);
+        if (cidx < 0) cidx = cfdCollateralCombo->findData(QStringLiteral("custom"));
+        if (cidx >= 0) cfdCollateralCombo->setCurrentIndex(cidx);
+        if (collData == QStringLiteral("custom")) cfdCollateralEdit->setText(collHex);
+        onCfdCollateralChanged();
+    }
+
+    // Restore the step gating for the saved stage.
+    if (stage >= 1) cfdRegisterButton->setEnabled(false);
+    cfdIssueButton->setEnabled(stage == 1);
+    cfdRecordButton->setEnabled(stage == 2);
+    if (stage == 1) cfdStatusText->append(tr("↻ Resumed a REGISTERED pair (awaiting issuance). Click '2. Issue pair' once it has confirmed."));
+    else if (stage == 2) cfdStatusText->append(tr("↻ Resumed an ISSUED pair (awaiting record). Mint TxID %1; click '3. Record issue' once it has confirmed.").arg(m_cfdIssueTxid));
+    onCfdPairPreview();
+}
+
+void TreasuryPage::onCfdRefreshList()
+{
+    if (!walletModel) return;
+    WalletModel::ScalarNotePairListResult r = walletModel->scalarNotePairList();
+    if (!r.success) { cfdStatusText->append(tr("✗ Could not list pairs: %1").arg(r.error)); return; }
+    cfdPairTable->setRowCount(0);
+    for (const WalletModel::ScalarNotePairListEntry& e : r.pairs) {
+        const int row = cfdPairTable->rowCount();
+        cfdPairTable->insertRow(row);
+        QTableWidgetItem* idItem = new QTableWidgetItem(e.pair_id.left(20) + QStringLiteral("…"));
+        idItem->setToolTip(e.pair_id);
+        idItem->setData(Qt::UserRole, e.pair_id);
+        idItem->setData(Qt::UserRole + 1, e.terms_json);     // full terms -> settle/redeem/unwind
+        idItem->setData(Qt::UserRole + 2, e.lot_count);
+        idItem->setData(Qt::UserRole + 3, e.lot_vaults);     // per-lot vault outpoints -> autofill (no manual entry)
+        cfdPairTable->setItem(row, 0, idItem);
+        cfdPairTable->setItem(row, 1, new QTableWidgetItem(QString::number(e.lot_count)));
+        cfdPairTable->setItem(row, 2, new QTableWidgetItem(e.issue_txid.left(16) + QStringLiteral("…")));
+        cfdPairTable->setItem(row, 3, new QTableWidgetItem(QString::number(e.lot_vaults.size())));
+    }
+    if (cfdPairTable->rowCount() > 0 && cfdPairTable->currentRow() < 0) cfdPairTable->selectRow(0);
+    cfdStatusText->append(tr("Listed %1 recorded note pairs.").arg(r.pairs.size()));
+}
+
+void TreasuryPage::onCfdPairSelectionChanged()
+{
+    const int row = cfdPairTable->currentRow();
+    QTableWidgetItem* idItem = row >= 0 ? cfdPairTable->item(row, 0) : nullptr;
+    const bool ready = idItem && !idItem->data(Qt::UserRole + 1).toString().isEmpty();
+    if (ready) {
+        const int lotCount = idItem->data(Qt::UserRole + 2).toInt();
+        cfdLotIndexSpin->setRange(0, std::max(0, lotCount - 1));
+    }
+    cfdSettleButton->setEnabled(ready);
+    cfdUnwindButton->setEnabled(ready);
+    cfdRedeemButton->setEnabled(ready);
+    onCfdLotIndexChanged();  // autofill the vault outpoint for the now-selected pair + lot
+}
+
+void TreasuryPage::onCfdLotIndexChanged()
+{
+    // Carry the recorded per-lot vault outpoint into the settle/unwind field — no manual entry needed.
+    // The field stays editable for the rare case of a respent/rotated vault.
+    const int row = cfdPairTable->currentRow();
+    QTableWidgetItem* idItem = row >= 0 ? cfdPairTable->item(row, 0) : nullptr;
+    const int lot = cfdLotIndexSpin->value();
+    if (idItem) {
+        const QStringList vaults = idItem->data(Qt::UserRole + 3).toStringList();
+        if (lot >= 0 && lot < vaults.size()) cfdVaultOutpointEdit->setText(vaults.at(lot));
+    }
+    // Invalidate the settlement→redeem context once the selection moves off the settled pair/lot, so a stale
+    // auto-filled pot can never linger in the live redeem control.
+    const QString curPair = idItem ? idItem->data(Qt::UserRole).toString() : QString();
+    if (m_cfdSettledLot >= 0 && (curPair != m_cfdSettledPairId || lot != m_cfdSettledLot)) {
+        m_cfdSettledPairId.clear();
+        m_cfdSettledLongPot.clear();
+        m_cfdSettledShortPot.clear();
+        m_cfdSettledLot = -1;
+    }
+    onCfdRedeemSideChanged();  // re-fill for the settled context, or clear when there is none
+}
+
+void TreasuryPage::onCfdSettle()
+{
+    if (!walletModel) { showError(tr("Wallet not ready")); return; }
+    const int row = cfdPairTable->currentRow();
+    QTableWidgetItem* idItem = row >= 0 ? cfdPairTable->item(row, 0) : nullptr;
+    if (!idItem) { showError(tr("Select a pair first.")); return; }
+    const QString terms = idItem->data(Qt::UserRole + 1).toString();
+    const int lot = cfdLotIndexSpin->value();
+    const QString vault = cfdVaultOutpointEdit->text().trimmed();
+    if (terms.isEmpty()) { showError(tr("Selected pair has no terms to act on.")); return; }
+    if (vault.isEmpty() || !vault.contains(':')) { showError(tr("Enter the lot vault outpoint as txid:vout.")); return; }
+
+    QMessageBox box(TopLevelDialogParent(this));
+    box.setWindowTitle(tr("Confirm Settlement"));
+    box.setText(tr("Settle lot %1 of the selected pair?\n\nThis folds the buried fixing (or the committed fallback) "
+                   "and pays both pots. It only succeeds once the fixing is usable and the settle-lock CLTV is open.").arg(lot));
+    box.setIcon(QMessageBox::Question);
+    box.setStandardButtons(QMessageBox::Yes | QMessageBox::No);
+    box.setDefaultButton(QMessageBox::No);
+    if (box.exec() != QMessageBox::Yes) return;
+
+    WalletModel::UnlockContext ctx(walletModel->requestUnlock());
+    if (!ctx.isValid()) { showError(tr("Wallet locked. Please unlock to settle.")); return; }
+
+    WalletModel::ScalarNotePairActionResult r = walletModel->scalarNotePairSettle(terms, lot, vault);
+    if (!r.success) { cfdStatusText->append(tr("✗ Settle failed: %1").arg(r.error)); showError(r.error); return; }
+    cfdStatusText->append(tr("✓ %1 (txid %2)").arg(r.detail).arg(r.txid));
+    // Settle → redeem hand-off: remember the two pots this settlement produced (scoped to this exact pair+lot)
+    // and auto-fill the redeem pot for the currently-selected side (mirrors the option-series one-click flow).
+    m_cfdSettledPairId = idItem->data(Qt::UserRole).toString();
+    m_cfdSettledLongPot = r.long_pot;
+    m_cfdSettledShortPot = r.short_pot;
+    m_cfdSettledLot = lot;
+    onCfdRedeemSideChanged();
+    if (!r.long_pot.isEmpty() || !r.short_pot.isEmpty()) {
+        cfdStatusText->append(tr("  → pots: long %1 / short %2 — 'Redeem pot' is pre-filled for the chosen side.")
+                                  .arg(r.long_pot.isEmpty() ? tr("(none)") : r.long_pot)
+                                  .arg(r.short_pot.isEmpty() ? tr("(none)") : r.short_pot));
+    }
+}
+
+void TreasuryPage::onCfdRedeemSideChanged()
+{
+    // The redeem pot is auto-managed ONLY for the exact pair+lot that was just settled. For any other
+    // context — different pair/lot, no settlement, or the selected side paid zero (empty pot) — the field
+    // is cleared so a stale outpoint can never reach a live redeem. (Manual entry remains possible: type a
+    // pot as the last action before clicking Redeem.)
+    const int row = cfdPairTable->currentRow();
+    QTableWidgetItem* idItem = row >= 0 ? cfdPairTable->item(row, 0) : nullptr;
+    const QString curPair = idItem ? idItem->data(Qt::UserRole).toString() : QString();
+    const bool atSettled = (m_cfdSettledLot >= 0 && !m_cfdSettledPairId.isEmpty()
+                            && curPair == m_cfdSettledPairId && cfdLotIndexSpin->value() == m_cfdSettledLot);
+    if (!atSettled) { cfdRedeemPotEdit->clear(); return; }
+    const bool redeemLong = cfdRedeemSideCombo->currentData().toBool();
+    cfdRedeemPotEdit->setText(redeemLong ? m_cfdSettledLongPot : m_cfdSettledShortPot);  // empty side -> clears
+}
+
+void TreasuryPage::onCfdCollateralChanged()
+{
+    // The raw-hex field is only meaningful for the "Custom…" collateral entry.
+    if (!cfdCollateralCombo || !cfdCollateralEdit) return;
+    cfdCollateralEdit->setVisible(cfdCollateralCombo->currentData().toString() == QStringLiteral("custom"));
+}
+
+void TreasuryPage::onCfdUnwind()
+{
+    if (!walletModel) { showError(tr("Wallet not ready")); return; }
+    const int row = cfdPairTable->currentRow();
+    QTableWidgetItem* idItem = row >= 0 ? cfdPairTable->item(row, 0) : nullptr;
+    if (!idItem) { showError(tr("Select a pair first.")); return; }
+    const QString terms = idItem->data(Qt::UserRole + 1).toString();
+    const int lot = cfdLotIndexSpin->value();
+    const QString vault = cfdVaultOutpointEdit->text().trimmed();
+    if (terms.isEmpty()) { showError(tr("Selected pair has no terms to act on.")); return; }
+    if (vault.isEmpty() || !vault.contains(':')) { showError(tr("Enter the lot vault outpoint as txid:vout.")); return; }
+
+    QMessageBox box(TopLevelDialogParent(this));
+    box.setWindowTitle(tr("Confirm Complete-Set Unwind"));
+    box.setText(tr("Unwind lot %1?\n\nThis retires one L unit AND one S unit to their burn sinks and reclaims the full "
+                   "lot collateral. Permissionless — requires you hold 1 L + 1 S; no fixing is needed.").arg(lot));
+    box.setIcon(QMessageBox::Question);
+    box.setStandardButtons(QMessageBox::Yes | QMessageBox::No);
+    box.setDefaultButton(QMessageBox::No);
+    if (box.exec() != QMessageBox::Yes) return;
+
+    WalletModel::UnlockContext ctx(walletModel->requestUnlock());
+    if (!ctx.isValid()) { showError(tr("Wallet locked. Please unlock to unwind.")); return; }
+
+    WalletModel::ScalarNotePairActionResult r = walletModel->scalarNotePairUnwind(terms, lot, vault, QString());
+    if (!r.success) { cfdStatusText->append(tr("✗ Unwind failed: %1").arg(r.error)); showError(r.error); return; }
+    cfdStatusText->append(tr("✓ %1 (txid %2)").arg(r.detail).arg(r.txid));
+}
+
+void TreasuryPage::onCfdRedeem()
+{
+    if (!walletModel) { showError(tr("Wallet not ready")); return; }
+    const int row = cfdPairTable->currentRow();
+    QTableWidgetItem* idItem = row >= 0 ? cfdPairTable->item(row, 0) : nullptr;
+    if (!idItem) { showError(tr("Select a pair first.")); return; }
+    const QString terms = idItem->data(Qt::UserRole + 1).toString();
+    const int lot = cfdLotIndexSpin->value();
+    const bool redeemLong = cfdRedeemSideCombo->currentData().toBool();
+    const QString pot = cfdRedeemPotEdit->text().trimmed();
+    if (terms.isEmpty()) { showError(tr("Selected pair has no terms to act on.")); return; }
+    if (pot.isEmpty() || !pot.contains(':')) { showError(tr("Enter the settlement pot outpoint as txid:vout.")); return; }
+
+    QMessageBox box(TopLevelDialogParent(this));
+    box.setWindowTitle(tr("Confirm Redemption"));
+    box.setText(tr("Redeem the %1 pot %2 for lot %3?\n\nThis retires one of your %1 tokens to the side sink and sweeps "
+                   "the pot value to you.").arg(redeemLong ? tr("long (L)") : tr("short (S)")).arg(pot).arg(lot));
+    box.setIcon(QMessageBox::Question);
+    box.setStandardButtons(QMessageBox::Yes | QMessageBox::No);
+    box.setDefaultButton(QMessageBox::No);
+    if (box.exec() != QMessageBox::Yes) return;
+
+    WalletModel::UnlockContext ctx(walletModel->requestUnlock());
+    if (!ctx.isValid()) { showError(tr("Wallet locked. Please unlock to redeem.")); return; }
+
+    WalletModel::ScalarNotePairActionResult r = walletModel->scalarNotePairRedeem(terms, redeemLong, lot, pot, QString());
+    if (!r.success) { cfdStatusText->append(tr("✗ Redeem failed: %1").arg(r.error)); showError(r.error); return; }
+    cfdStatusText->append(tr("✓ %1 (txid %2)").arg(r.detail).arg(r.txid));
+    cfdRedeemPotEdit->clear();
+}
+
+void TreasuryPage::onCfdFeedLookup()
+{
+    if (!walletModel || !clientModel) { showError(tr("Wallet not ready")); return; }
+    if (!cfdFeedAssetCombo || cfdFeedAssetCombo->count() == 0) { showError(tr("No wallet-controlled feed asset.")); return; }
+    const QString assetId = cfdFeedAssetCombo->currentData().toString();
+    quint32 feedId = 0;
+    if (!ParseU32(cfdFeedIdEdit->text(), feedId)) { showError(tr("Feed id must be a uint32.")); return; }
+    try {
+        UniValue p(UniValue::VARR);
+        p.push_back(assetId.toStdString());
+        UniValue info = clientModel->node().executeRpc("getassetinfo", p, walletModel->getWalletName().toStdString());
+        if (info.exists("icu_txid") && info.exists("icu_vout")) {
+            cfdFeedIcuEdit->setText(QString::fromStdString(info["icu_txid"].get_str()) + ":" +
+                                    QString::number(info["icu_vout"].getInt<int64_t>()));
+        }
+        if (cfdFeedNewIcuAmtEdit->text().trimmed().isEmpty() && info.exists("rotation_min_sats")) {
+            const qint64 floor = info["rotation_min_sats"].getInt<int64_t>();
+            if (floor > 0) cfdFeedNewIcuAmtEdit->setText(FormatSats(floor));
+        }
+    } catch (const std::exception& e) {
+        cfdFeedStatusText->append(tr("✗ getassetinfo failed: %1").arg(QString::fromStdString(e.what())));
+    } catch (...) {
+        cfdFeedStatusText->append(tr("✗ Could not read the asset's current ICU."));
+    }
+    // Next epoch = this feed's head + 1 (or 1 if none).
+    WalletModel::ScalarFeedListResult fl = walletModel->scalarListFeeds(assetId);
+    quint64 next = 1;
+    if (fl.success) {
+        for (const WalletModel::ScalarFeedEntry& fe : fl.feeds) {
+            if (fe.feed_id == feedId) { next = fe.last_epoch + 1; break; }
+        }
+    }
+    cfdFeedEpochEdit->setText(QString::number(next));
+    cfdFeedStatusText->append(tr("Looked up %1: next epoch for feed %2 is %3.")
+                                  .arg(assetId.left(12) + QStringLiteral("…")).arg(feedId).arg(next));
+}
+
+void TreasuryPage::onCfdFeedNewAddr()
+{
+    if (!clientModel || !walletModel) { showError(tr("Wallet not ready")); return; }
+    try {
+        UniValue p(UniValue::VARR);
+        p.push_back("");
+        p.push_back("bech32m");
+        UniValue a = clientModel->node().executeRpc("getnewaddress", p, walletModel->getWalletName().toStdString());
+        cfdFeedNewIcuAddrEdit->setText(QString::fromStdString(a.get_str()));
+    } catch (...) {
+        showError(tr("Could not generate a successor ICU address."));
+    }
+}
+
+void TreasuryPage::onCfdFeedPublish()
+{
+    if (!walletModel || !clientModel) { showError(tr("Wallet not ready")); return; }
+    if (!cfdFeedAssetCombo || cfdFeedAssetCombo->count() == 0) { showError(tr("No wallet-controlled feed asset.")); return; }
+    const QString assetId = cfdFeedAssetCombo->currentData().toString();
+    quint32 feedId = 0;
+    if (!ParseU32(cfdFeedIdEdit->text(), feedId)) { showError(tr("Feed id must be a uint32.")); return; }
+
+    const QString icu = cfdFeedIcuEdit->text().trimmed();
+    const int colon = icu.indexOf(':');
+    if (colon <= 0) { showError(tr("Current ICU must be txid:vout (click 'Lookup').")); return; }
+    const QString icuTxid = icu.left(colon);
+    bool voutOk = false;
+    const int icuVout = icu.mid(colon + 1).toInt(&voutOk);
+    if (!IsHex64(icuTxid) || !voutOk || icuVout < 0) { showError(tr("Current ICU outpoint is malformed.")); return; }
+
+    const QString newAddr = cfdFeedNewIcuAddrEdit->text().trimmed();
+    if (newAddr.isEmpty()) { showError(tr("Enter a successor ICU address (click 'New address').")); return; }
+    qint64 newAmt = 0;
+    if (!ParseTscToSats(cfdFeedNewIcuAmtEdit->text().trimmed(), newAmt) || newAmt <= 0) {
+        showError(tr("Successor bond must be a positive TSC amount.")); return;
+    }
+    bool epochOk = false;
+    const qulonglong epoch = cfdFeedEpochEdit->text().trimmed().toULongLong(&epochOk);
+    if (!epochOk || epoch == 0) { showError(tr("Epoch must be a positive integer (head+1).")); return; }
+    const QString scalar = cfdFeedScalarEdit->text().trimmed().toLower();
+    if (!IsHex64(scalar)) { showError(tr("Scalar must be 64 hex chars.")); return; }
+    bool feeOk = false;
+    const double feeRate = cfdFeedRateEdit->text().trimmed().toDouble(&feeOk);
+    if (!feeOk || feeRate <= 0.0) { showError(tr("Fee rate must be a positive number (sat/vB).")); return; }
+
+    QMessageBox box(TopLevelDialogParent(this));
+    box.setWindowTitle(tr("Confirm Feed Publication"));
+    box.setText(tr("Publish scalar epoch %1 for feed %2 of asset %3?\n\nThis spends the asset's current ICU and emits "
+                   "the scalar carrier. Epochs are append-only and immutable once published.")
+                    .arg(epoch).arg(feedId).arg(assetId.left(12) + QStringLiteral("…")));
+    box.setIcon(QMessageBox::Question);
+    box.setStandardButtons(QMessageBox::Yes | QMessageBox::No);
+    box.setDefaultButton(QMessageBox::No);
+    if (box.exec() != QMessageBox::Yes) return;
+
+    WalletModel::UnlockContext ctx(walletModel->requestUnlock());
+    if (!ctx.isValid()) { showError(tr("Wallet locked. Please unlock to publish.")); return; }
+
+    WalletModel::ScalarFeedPublishResult r = walletModel->scalarPublish(
+        assetId, icuTxid, icuVout, newAddr, newAmt,
+        feedId, epoch, scalar, cfdFeedFormatSpin->value(), feeRate);
+    if (!r.success) { cfdFeedStatusText->append(tr("✗ Publish failed: %1").arg(r.error)); showError(r.error); return; }
+    cfdFeedStatusText->append(tr("✓ Published epoch %1 (txid %2).").arg(epoch).arg(r.txid));
+    cfdFeedStatusText->append(tr("  → It becomes settlement-usable once buried >= maturity."));
+    refreshICUDashboard();
+}
+
+void TreasuryPage::onCfdFeedRead()
+{
+    if (!walletModel) { showError(tr("Wallet not ready")); return; }
+    if (!cfdFeedAssetCombo || cfdFeedAssetCombo->count() == 0) { showError(tr("No wallet-controlled feed asset.")); return; }
+    const QString assetId = cfdFeedAssetCombo->currentData().toString();
+    quint32 feedId = 0;
+    if (!ParseU32(cfdFeedIdEdit->text(), feedId)) { showError(tr("Feed id must be a uint32.")); return; }
+    qint64 epoch = -1;
+    const QString epochStr = cfdFeedReadEpochEdit->text().trimmed();
+    if (!epochStr.isEmpty()) {
+        bool ok = false; epoch = static_cast<qint64>(epochStr.toLongLong(&ok));
+        if (!ok || epoch < 0) { showError(tr("Read epoch must be a non-negative integer (or blank for latest).")); return; }
+    }
+    WalletModel::ScalarFeedGetResult r = walletModel->scalarGetFeed(assetId, feedId, epoch);
+    if (!r.success) { cfdFeedReadLabel->setText(tr("✗ %1").arg(r.error)); return; }
+    cfdFeedReadLabel->setText(tr("epoch %1 (head %2) — scalar %3 — fmt %4 — height %5 — %6")
+                                  .arg(r.epoch).arg(r.last_epoch).arg(r.scalar.left(20) + QStringLiteral("…"))
+                                  .arg(r.scalar_format_id).arg(r.publication_height)
+                                  .arg(r.buried ? tr("BURIED (usable)") : tr("not yet buried")));
+}
+
 void TreasuryPage::onRegisterAsset()
 {
     if (!walletModel || !clientModel) {
@@ -5541,11 +6932,19 @@ void TreasuryPage::refreshAssetList()
                 QSignalBlocker blockDistTarget(distTargetAssetCombo);
                 QSignalBlocker blockDistAsset(distAssetCombo);
                 QSignalBlocker blockOptParent(optParentCombo);
+                QSignalBlocker blockCfdCollateral(cfdCollateralCombo);
 
                 if (mintAssetCombo) mintAssetCombo->clear();
                 if (burnAssetCombo) burnAssetCombo->clear();
                 if (regParentCombo) regParentCombo->clear();
                 if (optParentCombo) optParentCombo->clear();
+                if (cfdParentCombo) cfdParentCombo->clear();
+                if (cfdFeedAssetCombo) cfdFeedAssetCombo->clear();
+                if (cfdCollateralCombo) {
+                    cfdCollateralCombo->clear();
+                    cfdCollateralCombo->addItem(tr("Native (TSC)"), QString());          // native sentinel
+                    cfdCollateralCombo->addItem(tr("Custom (enter id)…"), QStringLiteral("custom"));
+                }
                 if (zkAssetCombo) zkAssetCombo->clear();
                 if (govAssetCombo) govAssetCombo->clear();
                 if (distTargetAssetCombo) distTargetAssetCombo->clear();
@@ -5637,6 +7036,20 @@ void TreasuryPage::refreshAssetList()
                                 // Same wallet-controlled roots feed the option-series wizard's parent dropdown.
                                 if (optParentCombo && !ticker.isEmpty() && !ticker.contains('.')) {
                                     optParentCombo->addItem(ticker, ticker);
+                                }
+                                // …and the CFD-asset-series sponsoring root dropdown.
+                                if (cfdParentCombo && !ticker.isEmpty() && !ticker.contains('.')) {
+                                    cfdParentCombo->addItem(ticker, ticker);
+                                }
+                                // The scalar feed publisher can issue a feed from ANY wallet-controlled asset
+                                // (root or child) — the display label keeps the ticker, the data holds the id.
+                                if (cfdFeedAssetCombo) {
+                                    cfdFeedAssetCombo->addItem(displayName, assetId);
+                                }
+                                // §5.1 collateral picker: offer only COLLATERAL_SAFE assets. The policy bit is
+                                // already in the parsed IssuerReg, so the filter costs nothing extra here.
+                                if (cfdCollateralCombo && (issuerReg->policy_bits & assets::COLLATERAL_SAFE)) {
+                                    cfdCollateralCombo->addItem(displayName + tr(" [safe]"), assetId);
                                 }
                             }
                         } catch (...) {
@@ -8876,6 +10289,8 @@ void TreasuryPage::updateVisibilityForMode()
         // Add issuer tabs
         tabWidget->addTab(registrationTab, tr("Register Asset"));
         tabWidget->addTab(optionSeriesTab, tr("Option Series"));
+        tabWidget->addTab(cfdSeriesTab, tr("CFD Asset Series"));
+        tabWidget->addTab(scfdTab, tr("Bilateral CFD"));
         tabWidget->addTab(verifyOptionTab, tr("Verify Option"));
         tabWidget->addTab(mintTab, tr("Mint"));
         tabWidget->addTab(burnTab, tr("Burn"));
@@ -8968,6 +10383,7 @@ void TreasuryPage::updateVisibilityForMode()
         // Add holder tabs
         tabWidget->addTab(dashboardTab, tr("My Assets"));
         tabWidget->addTab(verifyOptionTab, tr("Verify Option"));
+        tabWidget->addTab(scfdTab, tr("Bilateral CFD")); // two-party lifecycle — the acceptor/holder needs it too
         tabWidget->addTab(zkComplianceTab, tr("Compliance"));
         tabWidget->addTab(governanceTab, tr("Governance"));
 

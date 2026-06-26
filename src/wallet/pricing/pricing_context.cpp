@@ -355,6 +355,35 @@ bool PricingContext::HasDifficultyCurve(PriceSource source) const
                                          : m_difficulty_curve_market.has_value();
 }
 
+bool PricingContext::AddScalarForwardCurve(const ScalarFeedKey& key, const ScalarForwardCurve& curve)
+{
+    if (auto err = curve.Validate()) {
+        LogPrintf("PricingContext::AddScalarForwardCurve: Validation failed: %s\n", *err);
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(m_mutex);
+    // In-memory per-feed store (DB persistence is a follow-up; the pricing path is identical either way).
+    if (curve.source == PriceSource::MARK) m_scalar_curves_mark[key] = curve;
+    else m_scalar_curves_market[key] = curve;
+    return true;
+}
+
+std::optional<ScalarForwardCurve> PricingContext::GetScalarForwardCurve(const ScalarFeedKey& key, PriceSource source) const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    const auto& m = (source == PriceSource::MARK) ? m_scalar_curves_mark : m_scalar_curves_market;
+    const auto it = m.find(key);
+    if (it == m.end()) return std::nullopt;
+    return it->second;
+}
+
+bool PricingContext::HasScalarForwardCurve(const ScalarFeedKey& key, PriceSource source) const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    const auto& m = (source == PriceSource::MARK) ? m_scalar_curves_mark : m_scalar_curves_market;
+    return m.find(key) != m.end();
+}
+
 bool PricingContext::AddDifficultyVolSurface(const DifficultyVolSurface& surface)
 {
     if (auto err = surface.Validate()) {
@@ -486,6 +515,8 @@ void PricingContext::ClearCache()
     m_vol_surfaces_mark.clear();
     m_vol_surfaces_market.clear();
     m_correlation_matrix.reset();
+    m_scalar_curves_mark.clear();
+    m_scalar_curves_market.clear();
 }
 
 bool PricingContext::LoadFromDB()

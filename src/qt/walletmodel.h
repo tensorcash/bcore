@@ -987,6 +987,191 @@ public:
     // Redeem ONE settlement pot (build_redeem, broadcast): retire 1 unit to the sink, sweep the pot.
     OptionSeriesActionResult optionSeriesRedeem(const QString& terms_json, int lot_index, const QString& pot_outpoint);
 
+    // ── Scalar note-pair (securitised CFD asset series) RPC wrappers ─────────────────────────────────────
+    // Typed pass-throughs over the scalar.* securitisation RPCs (CFD_GENERALISATION.md §6/§7): a TWO-sided
+    // tokenised CFD that mints a long token L and a short token S against per-lot OP_SCALAR_CFD_SETTLE vaults.
+    // Structurally mirrors the option-series wizard (register → issue → record), but two-sided, settled on an
+    // issuer-published scalar feed (or the committed fallback), with a permissionless complete-set unwind.
+    // All hash/amount fields are carried as the RPC's own encodings: 64-hex ids, scalar values as 64-hex
+    // (display hex of the uint256), `vault_im` in C's units (sats if native), strike/fallback in scalar_format_id.
+    struct ScalarNotePairTermsInput {
+        int      source_type{0};        // 0 ISSUER_PUBLISHED / 1 CHAIN_INTRINSIC
+        int      payoff_mode{0};        // 0 STRIKE / 1 REALIZED
+        int      loss_direction{0};     // owner leg: 0 long / 1 short
+        QString  underlying_asset_id;   // U (64-hex; empty/zero iff CHAIN_INTRINSIC)
+        quint32  feed_id{0};
+        quint64  fixing_ref{0};         // ISSUER: scalar_epoch; CHAIN: window-end height
+        quint32  publication_deadline_height{0};
+        quint32  settle_lock_height{0};
+        int      scalar_format_id{0};
+        QString  strike;                // K, 64-hex in scalar_format_id's encoding
+        QString  fallback_scalar;       // 64-hex (fires iff no in-time real fixing, §3.4)
+        quint32  lambda_q{0};           // Q16 leverage
+        QString  collateral_asset_id;   // C (64-hex; empty/zero = native TSC sentinel)
+        quint64  vault_im{0};           // per-lot IM in C's units (sats if native)
+        quint32  lot_count{0};          // N
+        QString  series_salt;           // 64-hex (the dialog auto-generates one if left blank)
+    };
+    struct ScalarNotePairRegisterResult {
+        bool success{false};
+        QString pair_id;
+        QString long_token_id, short_token_id;
+        QString long_ticker, short_ticker;
+        QString txid;                   // register tx (may be "(pending)")
+        QString error;
+    };
+    struct ScalarNotePairIssueResult {
+        bool success{false};
+        QString pair_id;
+        int lot_count{0};               // N units minted per side = N vaults funded
+        QString txid;                   // issuance (mint) tx
+        QString error;
+    };
+    struct ScalarNotePairRecordResult {
+        bool success{false};
+        QString pair_id;
+        int lot_count{0};
+        bool persisted{false};
+        QString error;
+    };
+    struct ScalarNotePairListEntry {
+        QString pair_id;
+        int lot_count{0};
+        QString issue_txid;
+        QString long_icu_outpoint, short_icu_outpoint;
+        QStringList lot_vaults;         // the N per-lot vault outpoints "txid:vout" (lot_vaults[i] = lot i)
+        QString terms_json;             // the full terms (round-trips into build_settlement/redeem/unwind)
+    };
+    struct ScalarNotePairListResult {
+        bool success{false};
+        QList<ScalarNotePairListEntry> pairs;
+        QString error;
+    };
+    // A lifecycle action result (settle / redeem / unwind). `txid` is the broadcast transaction id.
+    struct ScalarNotePairActionResult {
+        bool success{false};
+        QString txid;
+        QString detail;                 // a human summary for the status log
+        QString long_pot, short_pot;    // (settle) the two settlement-pot outpoints, for one-click redeem
+        QString error;
+    };
+
+    ScalarNotePairRegisterResult scalarNotePairBuildRegister(const ScalarNotePairTermsInput& terms, const QString& root,
+                                                             const QString& long_suffix, const QString& short_suffix,
+                                                             qint64 child_bond_sats = 0, double fee_rate = 0.0, bool broadcast = true);
+    ScalarNotePairIssueResult scalarNotePairBuildIssue(const ScalarNotePairTermsInput& terms, qint64 vault_native_sats = 546,
+                                                       double fee_rate = 0.0, bool broadcast = true);
+    ScalarNotePairRecordResult scalarNotePairRecordIssue(const ScalarNotePairTermsInput& terms, const QString& issue_txid,
+                                                         const QString& register_txid = QString());
+    ScalarNotePairListResult scalarNotePairList();
+    // Keeper settlement of ONE lot vault (scalar.build_settlement, broadcast): folds the buried fixing (or the
+    // committed fallback) and pays both pots. `vault_outpoint` is the lot's "txid:vout" (from scalar.list).
+    ScalarNotePairActionResult scalarNotePairSettle(const QString& terms_json, int lot_index, const QString& vault_outpoint,
+                                                    double fee_rate = 0.0);
+    // Redeem ONE side's token against its settlement pot (scalar.build_redeem, broadcast).
+    ScalarNotePairActionResult scalarNotePairRedeem(const QString& terms_json, bool redeem_long, int lot_index,
+                                                    const QString& pot_outpoint, const QString& holder_address, double fee_rate = 0.0);
+    // Permissionless complete-set unwind of ONE lot vault (scalar.build_unwind, broadcast): retire 1 L + 1 S,
+    // reclaim the full collateral — no fixing required.
+    ScalarNotePairActionResult scalarNotePairUnwind(const QString& terms_json, int lot_index, const QString& vault_outpoint,
+                                                    const QString& holder_address, double fee_rate = 0.0);
+
+    // ── Scalar feed (issuer-published oracle) RPC wrappers ──────────────────────────────────────────────
+    struct ScalarFeedPublishResult {
+        bool success{false};
+        QString txid;                   // broadcast txid if broadcast=true
+        QString hex;                    // raw transaction hex
+        QString error;
+    };
+    struct ScalarFeedEntry {
+        quint32 feed_id{0};
+        quint64 last_epoch{0};
+    };
+    struct ScalarFeedListResult {
+        bool success{false};
+        QList<ScalarFeedEntry> feeds;
+        QString error;
+    };
+    struct ScalarFeedGetResult {
+        bool success{false};
+        quint64 epoch{0}, last_epoch{0};
+        QString scalar;                 // 64-hex display value
+        int scalar_format_id{0};
+        qint64 publication_height{0};
+        bool buried{false};             // settlement-usable (buried >= maturity)
+        QString error;
+    };
+    // Publish a scalar feed value (scalarpublish_raw): spends the asset's current ICU, recreates the successor
+    // verbatim, and emits one ISSUER_SCALAR carrier. autofund + broadcast use the loaded wallet.
+    ScalarFeedPublishResult scalarPublish(const QString& asset_id, const QString& icu_txid, int icu_vout,
+                                          const QString& new_icu_address, qint64 new_icu_amount_sats,
+                                          quint32 feed_id, quint64 scalar_epoch, const QString& scalar_hex,
+                                          int scalar_format_id, double fee_rate = 0.0);
+    ScalarFeedListResult scalarListFeeds(const QString& asset_id);
+    // Read a published (asset, feed, epoch) scalar; pass epoch < 0 for the latest (head).
+    ScalarFeedGetResult scalarGetFeed(const QString& asset_id, quint32 feed_id, qint64 epoch = -1);
+
+    // ── Bilateral scalar CFD (scalarcfd.*) RPC wrappers ─────────────────────────────────────────────────
+    // Two-party CFD on an issuer-published FX cross rate X = base/quote (CFD_GENERALISATION.md §7): a long
+    // and a short leg, each its own OP_SCALAR_CFD_SETTLE vault, with Fair-Sign atomic open + a 2-of-2
+    // cooperative close. Distinct from the securitised note pair above (that mints tradeable L/S tokens).
+    struct ScalarCfdLegInput { qint64 im_sats{0}; quint32 lambda_q{0}; };
+    struct ScalarCfdTermsInput {
+        int      source_type{0};            // 0 = ISSUER_PUBLISHED (only supported)
+        int      payoff_mode{0};            // 0 = STRIKE denom, 1 = REALIZED denom
+        QString  underlying_asset_id;       // U (64-hex)
+        quint32  feed_id{0};
+        quint64  fixing_ref{0};             // scalar epoch the contract settles against
+        quint32  publication_deadline_height{0};
+        quint32  settle_lock_height{0};
+        int      scalar_format_id{0};
+        QString  strike;                    // K, 64-hex
+        QString  fallback_scalar;           // 64-hex
+        QString  collateral_asset_id;       // C (64-hex); empty = native TSC
+        ScalarCfdLegInput long_leg;
+        ScalarCfdLegInput short_leg;
+    };
+    struct ScalarCfdProposeResult { bool success{false}; QString offer_json; QString error; };
+    struct ScalarCfdAcceptResult { bool success{false}; QString contract_id, acceptance_json, action_required, error; };
+    struct ScalarCfdImportResult { bool success{false}; QString contract_id, state, error; };
+    struct ScalarCfdOpenResult { bool success{false}; QString psbt, fee, leg, error; int vault_index{-1}; };
+    struct ScalarCfdRecordOpenResult { bool success{false}; QString long_vault, short_vault, error; };
+    struct ScalarCfdSettlementResult { bool success{false}; QString psbt, fee, payout_owner, payout_cp, error;
+                                       bool is_fallback{false}; int vault_input_index{-1}; };
+    struct ScalarCfdFinalizeResult { bool success{false}; QString hex, error; };
+    struct ScalarCfdCoopCloseResult { bool success{false}; QString psbt, fee, error; };
+    struct ScalarCfdSignCoopResult { bool success{false}; bool complete{false}; QString psbt, hex, error; };
+    struct ScalarCfdPriceResult {
+        bool success{false};
+        double current_ratio{0.0}, forecast_ratio{0.0};
+        double intrinsic_long_mtm{0.0}, intrinsic_short_mtm{0.0}, expected_long_mtm{0.0}, expected_short_mtm{0.0};
+        double sigma{0.0}, tau_years{0.0}, discount_factor{1.0};
+        double long_delta_to_cross_rate{0.0}, long_vega{0.0}, long_theta{0.0};
+        double short_delta_to_cross_rate{0.0}, short_vega{0.0}, short_theta{0.0};
+        QString forward_provenance, contract_id;
+        bool fixing_reached{false}, is_fallback{false}, model_unreliable{false}, collateral_is_native{true};
+        QStringList warnings;
+        QString error;
+    };
+    // propose: proposer defines economics + side + its two P2TR payout addresses (owner = leg it posts; cp =
+    // its claim on the counterparty's leg). Returns the offer JSON to hand out-of-band.
+    ScalarCfdProposeResult scalarCfdPropose(const ScalarCfdTermsInput& terms, bool proposerIsShort,
+                                            const QString& ownerAddr, const QString& cpAddr);
+    ScalarCfdAcceptResult scalarCfdAccept(const QString& offer_json, const QString& ownerAddr,
+                                          const QString& cpAddr, bool confirmed);
+    ScalarCfdImportResult scalarCfdImportAcceptance(const QString& offer_json, const QString& acceptance_json);
+    ScalarCfdOpenResult scalarCfdBuildOpen(const QString& contract_id, bool isShort,
+                                           const QString& priorPsbt = QString(), double fee_rate = 0.0);
+    ScalarCfdRecordOpenResult scalarCfdRecordOpen(const QString& contract_id, const QString& txid);
+    ScalarCfdSettlementResult scalarCfdBuildSettlement(const QString& contract_id, bool isShort, double fee_rate = 0.0);
+    ScalarCfdFinalizeResult scalarCfdFinalizeSettlement(const QString& psbt);
+    ScalarCfdCoopCloseResult scalarCfdBuildCoopClose(const QString& contract_id, bool isShort,
+                                                     const QList<QPair<QString, qint64>>& outputs);
+    ScalarCfdSignCoopResult scalarCfdSignCoop(const QString& contract_id, bool isShort, const QString& psbt);
+    // price: any of sigma / forward_cross_rate / discount_factor < 0 is omitted (resolved from curves/chain).
+    ScalarCfdPriceResult scalarCfdPrice(const QString& contract_id, double sigma = -1.0,
+                                        double forward_cross_rate = -1.0, double discount_factor = -1.0);
+
     // Spot contract RPC wrappers
     struct SpotProposeResult {
         bool success{false};

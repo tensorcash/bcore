@@ -10,6 +10,7 @@
 #include <wallet/pricing/vol_surface.h>
 #include <wallet/pricing/correlation_matrix.h>
 #include <wallet/pricing/difficulty_curve.h>
+#include <wallet/pricing/scalar_forward_curve.h>
 #include <wallet/pricing/difficulty_vol_surface.h>
 #include <wallet/pricing/warnings.h>
 #include <uint256.h>
@@ -111,6 +112,16 @@ public:
     bool HasDifficultyVolSurface(PriceSource source) const;
 
     /**
+     * Scalar (FX cross-rate) forward curve operations, PER FEED — keyed by (underlying, feed_id,
+     * collateral). A scalar feed is a base/quote cross rate, so each (base, quote, feed) has its own
+     * forward curve; PV discounting uses the COLLATERAL asset's discount curve (GetCurve), not here.
+     * In-memory in v1 (DB persistence is a follow-up); the per-feed map is set by the caller / RPC.
+     */
+    bool AddScalarForwardCurve(const ScalarFeedKey& key, const ScalarForwardCurve& curve);
+    std::optional<ScalarForwardCurve> GetScalarForwardCurve(const ScalarFeedKey& key, PriceSource source) const;
+    bool HasScalarForwardCurve(const ScalarFeedKey& key, PriceSource source) const;
+
+    /**
      * Get market data coverage summary for diagnostics
      */
     MarketDataCoverage GetCoverageSummary(int64_t current_time) const;
@@ -148,6 +159,8 @@ private:
     std::optional<DifficultyCurve> m_difficulty_curve_market;
     std::optional<DifficultyVolSurface> m_difficulty_vol_mark;  // chain-global difficulty vol surface
     std::optional<DifficultyVolSurface> m_difficulty_vol_market;
+    std::map<ScalarFeedKey, ScalarForwardCurve> m_scalar_curves_mark;   // per-feed scalar forward curves
+    std::map<ScalarFeedKey, ScalarForwardCurve> m_scalar_curves_market;
 
     /**
      * Persistence helpers
