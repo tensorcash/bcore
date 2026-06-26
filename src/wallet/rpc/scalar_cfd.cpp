@@ -331,8 +331,8 @@ const std::vector<RPCArg> kScalarEconArgs = {
     {"publication_deadline_height", RPCArg::Type::NUM, RPCArg::Optional::NO, "Last height a real fixing counts (§3.4)"},
     {"settle_lock_height", RPCArg::Type::NUM, RPCArg::Optional::NO, "Leaf CLTV (block height)"},
     {"scalar_format_id", RPCArg::Type::NUM, RPCArg::Optional::NO, "Scalar encoding (1 = RAW_U256_LE)"},
-    {"strike", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Strike K (32-byte hex)"},
-    {"fallback_scalar", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Fallback scalar (32-byte hex)"},
+    {"strike", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Strike K, NUMERIC value (32-byte display hex); stored as the format's wire bytes, must fit the format width"},
+    {"fallback_scalar", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Fallback scalar, NUMERIC value (32-byte display hex); same encoding rules as strike"},
     {"collateral_asset_id", RPCArg::Type::STR_HEX, RPCArg::Default{""}, "Collateral asset C (32-byte hex); omit/empty = native"},
     {"long", RPCArg::Type::OBJ, RPCArg::Optional::NO, "Long leg economics",
         {{"im", RPCArg::Type::STR, RPCArg::Optional::NO, "Initial margin (collateral units, decimal)"},
@@ -503,7 +503,20 @@ RPCHelpMan scalarcfd_propose()
         [](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue {
             std::shared_ptr<CWallet> pwallet = GetWalletForJSONRPCRequest(request);
             if (!pwallet) return UniValue::VNULL;
-            const ScalarCfdContractTerms econ = ParseScalarCfdEconomics(request.params[0]);
+            ScalarCfdContractTerms econ = ParseScalarCfdEconomics(request.params[0]);
+            // The proposer supplies strike/fallback as a NUMERIC display-hex value; store the format's wire
+            // bytes (identity for LE, byte-reversed for BE) so settlement reads back the intended number.
+            // This is the sole human-numeric ingress — the offer then carries wire, which accept/import
+            // round-trip verbatim (no re-encode), so the two parties commit byte-identical terms.
+            {
+                uint256 w;
+                if (!EncodeScalarToWire(econ.scalar_format_id, econ.strike, w))
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, "strike exceeds the scalar_format_id width");
+                econ.strike = w;
+                if (!EncodeScalarToWire(econ.scalar_format_id, econ.fallback_scalar, w))
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, "fallback_scalar exceeds the scalar_format_id width");
+                econ.fallback_scalar = w;
+            }
             const std::string role = request.params[1].get_str();
             bool proposer_is_short;
             if (role == "short") proposer_is_short = true;

@@ -131,6 +131,7 @@ BASE_SCRIPTS = [
     'feature_scalar_settle.py',
     'feature_scalar_settle_asset.py',
     'feature_scalar_note_pair.py',
+    'feature_scalar_format.py',
     'feature_scalarcfd_lifecycle.py',
     'feature_icu_child.py',
     'feature_assets_basic_highlevel.py',

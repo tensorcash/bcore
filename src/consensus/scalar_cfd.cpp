@@ -161,13 +161,81 @@ bool ComputeScalarCfdPayout(const arith_uint256& strike,
     return true;
 }
 
+namespace {
+//! Interpret the stored 32 bytes (uint256 is little-endian internally) as a BIG-endian integer:
+//! value = Σ b[i]·256^(31−i), b[0] most significant.
+arith_uint256 DecodeBE(const uint256& raw)
+{
+    arith_uint256 v;
+    const unsigned char* b = raw.begin();
+    for (int i = 0; i < 32; ++i) { v <<= 8; v += b[i]; }
+    return v;
+}
+//! True iff the value fits in `bits` (the high 32−bits/8 bytes of its encoding are zero) — the
+//! canonical-width check for the fixed-width formats. Full-width (256) is always canonical.
+bool FitsBits(const arith_uint256& v, unsigned bits)
+{
+    return bits >= 256 || (v >> static_cast<int>(bits)).EqualTo(0);
+}
+} // namespace
+
 bool DecodeScalarValue(uint16_t scalar_format_id, const uint256& raw, arith_uint256& out)
 {
+    // Byte order + canonical width only; the payoff ratio is scale-invariant (see asset.h). A value that
+    // overflows a fixed-width format's range is NON-canonical -> reject so the opcode fails closed
+    // (SCALARCFD_ENCODING) rather than settling on an ambiguous encoding.
     switch (scalar_format_id) {
     case assets::SCALAR_FORMAT_RAW_U256_LE:
-        out = UintToArith256(raw); // raw 256-bit LE: identity decode, every value canonical
-        return true;
+        out = UintToArith256(raw); return true;        // every 256-bit LE value is canonical
+    case assets::SCALAR_FORMAT_RAW_U256_BE:
+        out = DecodeBE(raw); return true;              // every 256-bit BE value is canonical
+    case assets::SCALAR_FORMAT_U64_LE: {
+        const arith_uint256 v = UintToArith256(raw);
+        if (!FitsBits(v, 64)) return false;
+        out = v; return true;
+    }
+    case assets::SCALAR_FORMAT_U64_BE: {
+        const arith_uint256 v = DecodeBE(raw);
+        if (!FitsBits(v, 64)) return false;
+        out = v; return true;
+    }
+    case assets::SCALAR_FORMAT_U128_LE: {
+        const arith_uint256 v = UintToArith256(raw);
+        if (!FitsBits(v, 128)) return false;
+        out = v; return true;
+    }
+    case assets::SCALAR_FORMAT_U128_BE: {
+        const arith_uint256 v = DecodeBE(raw);
+        if (!FitsBits(v, 128)) return false;
+        out = v; return true;
+    }
     default:
         return false; // unknown encoding -> opcode fails closed (SCALARCFD_ENCODING)
     }
+}
+
+bool EncodeScalarToWire(uint16_t scalar_format_id, const uint256& numeric_value, uint256& wire_out)
+{
+    // Inverse of DecodeScalarValue: given a VALUE as a plain number (e.g. uint256::FromHex of the user's
+    // display hex), produce the wire bytes W such that DecodeScalarValue(format, W) == value and W is
+    // canonical — or false if the value exceeds the format's width. This is what lets the RPC/Ql keep a
+    // single numeric "display hex" convention while the wire honours the format's byte order (LE vs BE).
+    unsigned width;
+    bool big_endian;
+    switch (scalar_format_id) {
+    case assets::SCALAR_FORMAT_RAW_U256_LE: width = 256; big_endian = false; break;
+    case assets::SCALAR_FORMAT_RAW_U256_BE: width = 256; big_endian = true;  break;
+    case assets::SCALAR_FORMAT_U64_LE:      width = 64;  big_endian = false; break;
+    case assets::SCALAR_FORMAT_U64_BE:      width = 64;  big_endian = true;  break;
+    case assets::SCALAR_FORMAT_U128_LE:     width = 128; big_endian = false; break;
+    case assets::SCALAR_FORMAT_U128_BE:     width = 128; big_endian = true;  break;
+    default: return false;
+    }
+    if (!FitsBits(UintToArith256(numeric_value), width)) return false; // value too large for the format
+    if (big_endian) {
+        for (int i = 0; i < 32; ++i) wire_out.begin()[i] = numeric_value.begin()[31 - i];
+    } else {
+        wire_out = numeric_value;
+    }
+    return true;
 }

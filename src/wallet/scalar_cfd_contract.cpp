@@ -43,8 +43,13 @@ bool ScalarCfdContractTerms::Validate(std::string& err) const
     if (chain && !underlying_asset_id.IsNull()) { err = "CHAIN_INTRINSIC requires a zero underlying_asset_id"; return false; }
     if (!chain && underlying_asset_id.IsNull()) { err = "ISSUER_PUBLISHED requires a non-zero underlying_asset_id"; return false; }
 
-    // scalar_format must be a known encoding (probe-decode the committed strike, as the opcode will).
-    { arith_uint256 tmp; if (!DecodeScalarValue(scalar_format_id, strike, tmp)) { err = "unknown scalar_format_id"; return false; } }
+    // scalar_format must be a known encoding AND BOTH committed literals must decode canonically under it —
+    // exactly as the opcode reads them at settlement (interpreter.cpp). A non-canonical strike/fallback in a
+    // persisted record or a metadata-derived descriptor would fail SCALARCFD_ENCODING and brick the contract,
+    // so the integrity gate rejects it here rather than at spend time.
+    if (!assets::IsKnownScalarFormat(scalar_format_id)) { err = "unknown scalar_format_id"; return false; }
+    { arith_uint256 tmp; if (!DecodeScalarValue(scalar_format_id, strike, tmp)) { err = "strike not canonical for scalar_format_id"; return false; } }
+    { arith_uint256 tmp; if (!DecodeScalarValue(scalar_format_id, fallback_scalar, tmp)) { err = "fallback_scalar not canonical for scalar_format_id"; return false; } }
 
     const bool native = collateral_asset_id.IsNull();
     auto check_leg = [&](const ScalarCfdLegTerms& leg, const char* name) -> bool {

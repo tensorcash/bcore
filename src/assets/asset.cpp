@@ -1,5 +1,7 @@
 #include <assets/asset.h>
 #include <assets/icu_payload.h>
+#include <arith_uint256.h>        // DecodeScalarValue out-param
+#include <consensus/scalar_cfd.h> // DecodeScalarValue (publication canonicality)
 #include <serialize.h>
 #include <logging.h>
 #include <hash.h>
@@ -573,6 +575,7 @@ std::vector<unsigned char> BuildIssuerScalarTlv(const IssuerScalar& s)
 
 ScalarPubStatus CheckScalarPublication(
     uint16_t scalar_format_id,
+    const uint256& scalar,
     uint64_t scalar_epoch,
     bool carrier_unspendable,
     bool underlying_registered,
@@ -582,6 +585,11 @@ ScalarPubStatus CheckScalarPublication(
     bool epoch_exists)
 {
     if (!IsKnownScalarFormat(scalar_format_id)) return ScalarPubStatus::BadFormat;
+    // Reject a value the settlement opcode could not read (e.g. a fixed-width format with non-zero
+    // padding bytes): DecodeScalarValue is the single source of truth for "canonical under this format".
+    // Without this, a non-canonical "real" fixing is staged, then the opcode fails closed at settlement
+    // and — because an in-time real fixing pre-empts the fallback — the contract is bricked.
+    { arith_uint256 tmp; if (!DecodeScalarValue(scalar_format_id, scalar, tmp)) return ScalarPubStatus::NonCanonical; }
     if (!carrier_unspendable)                    return ScalarPubStatus::CarrierSpendable;
     if (!underlying_registered)                  return ScalarPubStatus::UnknownAsset;
     if (!icu_authenticated)                      return ScalarPubStatus::NoIcuAuth;
@@ -599,6 +607,7 @@ const char* ScalarPubStatusString(ScalarPubStatus status)
     switch (status) {
         case ScalarPubStatus::Ok:               return "scalar-ok";
         case ScalarPubStatus::BadFormat:        return "scalar-bad-format";
+        case ScalarPubStatus::NonCanonical:     return "scalar-noncanonical";
         case ScalarPubStatus::CarrierSpendable: return "scalar-carrier-spendable";
         case ScalarPubStatus::UnknownAsset:     return "scalar-unknown-asset";
         case ScalarPubStatus::NoIcuAuth:        return "scalar-no-icu-auth";

@@ -354,6 +354,9 @@ BOOST_AUTO_TEST_CASE(validate_terms)
     reject_economic([](ScalarNotePairTerms& t){ t.payoff_mode = 5; });
     reject_economic([](ScalarNotePairTerms& t){ t.loss_direction = 5; });
     reject_economic([](ScalarNotePairTerms& t){ t.scalar_format_id = 0xFFFF; });
+    // Non-canonical committed literals for a fixed-width format are rejected at the integrity gate (Slice 6).
+    reject_economic([](ScalarNotePairTerms& t){ t.scalar_format_id = assets::SCALAR_FORMAT_U64_BE; t.strike = *uint256::FromHex(std::string(64, 'f')); });
+    reject_economic([](ScalarNotePairTerms& t){ t.scalar_format_id = assets::SCALAR_FORMAT_U64_BE; t.strike = uint256{}; t.fallback_scalar = *uint256::FromHex(std::string(64, 'f')); });
     reject_economic([](ScalarNotePairTerms& t){ t.lot_count = 0; });
     reject_economic([](ScalarNotePairTerms& t){ t.lambda_q = 0; });
     reject_economic([](ScalarNotePairTerms& t){ t.vault_im = static_cast<uint64_t>(MIN_SETTLE_OUTPUT) - 1; });
@@ -387,6 +390,18 @@ BOOST_AUTO_TEST_CASE(validate_terms)
     {
         ScalarNotePairTerms t = ExampleTerms();
         t.collateral_asset_id = uint256{};
+        RederiveTokens(t);
+        std::string e;
+        BOOST_CHECK(ValidateScalarNotePairTerms(t, e));
+    }
+
+    // A wide strike/fallback that overflows U64 IS canonical under RAW_U256 (no width bound) -> accepted.
+    // Mirrors the bilateral RAW-wide acceptance, proving the canonicality gate is format-specific.
+    {
+        ScalarNotePairTerms t = ExampleTerms();
+        t.scalar_format_id = assets::SCALAR_FORMAT_RAW_U256_BE;
+        t.strike = *uint256::FromHex(std::string(64, 'f'));
+        t.fallback_scalar = t.strike;
         RederiveTokens(t);
         std::string e;
         BOOST_CHECK(ValidateScalarNotePairTerms(t, e));
