@@ -215,7 +215,7 @@ int64_t GetTransactionSigOpCost(const CTransaction& tx, const CCoinsViewCache& i
 
 bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, const CCoinsViewCache& inputs, int nSpendHeight, CAmount& txfee, bool skip_expensive_zk_verification)
 {
-    LogPrintf("CheckTxInputs: START tx=%s\n", tx.GetHash().ToString());
+    LogDebug(BCLog::VALIDATION, "CheckTxInputs: START tx=%s\n", tx.GetHash().ToString());
     // Assets activation gating: before activation height, any vExt usage is consensus-invalid
     if (nSpendHeight < ::Params().GetConsensus().AssetsHeight) {
         for (const auto& out : tx.vout) {
@@ -508,7 +508,7 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, 
         } else {
             AssetRegistryEntry e;
             if (inputs.ReadAssetPolicy(aid, e)) {
-                LogPrintf("CheckTxInputs: ReadAssetPolicy SUCCESS for asset %s, has_kyc=%d\n", aid.ToString(), e.has_kyc);
+                LogDebug(BCLog::VALIDATION, "CheckTxInputs: ReadAssetPolicy SUCCESS for asset %s, has_kyc=%d\n", aid.ToString(), e.has_kyc);
                 policy_bits = e.policy_bits;
                 allowed_mask = e.allowed_spk_families ? e.allowed_spk_families : ((policy_bits & assets::BURN_JOINT_REQUIRED) ? assets::SPK_HOLDER_ONLY : assets::SPK_DEFAULT_ALLOWED);
                 if (e.has_kyc) {
@@ -540,7 +540,7 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, 
                     snap.delegated = eff.delegated;
                     snap.active_root_activation_height = eff.active_root_activation_height;
                     kyc_policies[aid] = snap;
-                    LogPrintf("CheckTxInputs: KYC policy loaded for asset %s (delegated=%d)\n", aid.ToString(), eff.delegated);
+                    LogDebug(BCLog::VALIDATION, "CheckTxInputs: KYC policy loaded for asset %s (delegated=%d)\n", aid.ToString(), eff.delegated);
                 }
             } else {
                 LogPrintf("CheckTxInputs: ReadAssetPolicy FAILED for asset %s - policy not found in DB\n", aid.ToString());
@@ -637,9 +637,9 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, 
     // 1. All KYC asset inputs use segwit script families (P2WPKH/P2WSH/P2TR)
     // 2. All KYC asset inputs have witness data with proof+public_inputs layout
     // 3. Count one proof per asset for DoS cap enforcement
-    LogPrintf("CheckTxInputs: entering KYC validation loop, kyc_policies.size=%d\n", kyc_policies.size());
+    LogDebug(BCLog::VALIDATION, "CheckTxInputs: entering KYC validation loop, kyc_policies.size=%d\n", kyc_policies.size());
     for (const auto& [aid, policy] : kyc_policies) {
-        LogPrintf("CheckTxInputs: checking KYC policy for asset %s\n", aid.ToString());
+        LogDebug(BCLog::VALIDATION, "CheckTxInputs: checking KYC policy for asset %s\n", aid.ToString());
         if (!policy.required) continue;
         if (policy.vk_commitment.IsNull()) {
             return state.Invalid(TxValidationResult::TX_CONSENSUS, "zkchunk-missing");
@@ -746,9 +746,9 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, 
         // Validate witness layout for all inputs, count one proof per asset
         bool counted_asset{false};
         bool skip_kyc_validation = false;  // Flag to skip validation if in mempool check context
-        LogPrintf("CheckTxInputs: validating witness layout for %d inputs\n", it_inputs->second.size());
+        LogDebug(BCLog::VALIDATION, "CheckTxInputs: validating witness layout for %d inputs\n", it_inputs->second.size());
         for (int input_index : it_inputs->second) {
-            LogPrintf("CheckTxInputs: accessing coin for input %d\n", input_index);
+            LogDebug(BCLog::VALIDATION, "CheckTxInputs: accessing coin for input %d\n", input_index);
             const Coin& coin = inputs.AccessCoin(tx.vin[input_index].prevout);
             if (coin.IsSpent()) {
                 LogPrintf("CheckTxInputs: WARNING - coin is spent! Skipping all KYC validation for this asset (mempool consistency check context)\n");
@@ -757,21 +757,21 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, 
             }
 
             // Check script type is witness-compatible
-            LogPrintf("CheckTxInputs: checking witness script type for input %d\n", input_index);
+            LogDebug(BCLog::VALIDATION, "CheckTxInputs: checking witness script type for input %d\n", input_index);
             if (!IsWitnessScriptType(coin.out.scriptPubKey)) {
                 LogPrintf("CheckTxInputs: FAIL - input %d is not witness script type\n", input_index);
                 return state.Invalid(TxValidationResult::TX_CONSENSUS, "kyc-spend-nonsegwit");
             }
 
             // Witness layout validation (signature presence check only)
-            LogPrintf("CheckTxInputs: checking witness layout for input %d\n", input_index);
+            LogDebug(BCLog::VALIDATION, "CheckTxInputs: checking witness layout for input %d\n", input_index);
             const auto& witness = tx.vin[input_index].scriptWitness;
             if (!HasValidZkWitnessLayout(witness)) {
                 LogPrintf("CheckTxInputs: FAIL - input %d has invalid witness layout, witness.stack.size=%d\n",
                          input_index, witness.stack.size());
                 return state.Invalid(TxValidationResult::TX_CONSENSUS, "zk-witness-empty");
             }
-            LogPrintf("CheckTxInputs: input %d passed witness checks\n", input_index);
+            LogDebug(BCLog::VALIDATION, "CheckTxInputs: input %d passed witness checks\n", input_index);
 
             // Count one proof per asset (not per input) for DoS cap
             if (!counted_asset) {
@@ -781,17 +781,17 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, 
         }
 
         // Skip ZK proof validation if we're in mempool consistency check context
-        LogPrintf("CheckTxInputs: finished witness loop, skip_kyc_validation=%d\n", skip_kyc_validation);
+        LogDebug(BCLog::VALIDATION, "CheckTxInputs: finished witness loop, skip_kyc_validation=%d\n", skip_kyc_validation);
         if (skip_kyc_validation) {
-            LogPrintf("CheckTxInputs: skipping ZK_PROOF_PAYLOAD validation for asset %s (mempool check)\n", aid.ToString());
+            LogDebug(BCLog::VALIDATION, "CheckTxInputs: skipping ZK_PROOF_PAYLOAD validation for asset %s (mempool check)\n", aid.ToString());
             continue;
         }
 
         // Validate ZK_PROOF_PAYLOAD TLV presence (exactly one per asset required)
-        LogPrintf("CheckTxInputs: checking ZK_PROOF_PAYLOAD presence for asset %s, zk_proof_payloads.size=%d\n",
+        LogDebug(BCLog::VALIDATION, "CheckTxInputs: checking ZK_PROOF_PAYLOAD presence for asset %s, zk_proof_payloads.size=%d\n",
                  aid.ToString(), zk_proof_payloads.size());
         auto proof_it = zk_proof_payloads.find(aid);
-        LogPrintf("CheckTxInputs: find() returned, checking if found\n");
+        LogDebug(BCLog::VALIDATION, "CheckTxInputs: find() returned, checking if found\n");
         if (proof_it == zk_proof_payloads.end() || proof_it->second.empty()) {
             LogPrintf("CheckTxInputs: FAIL - ZK proof missing or empty for asset %s\n", aid.ToString());
             return state.Invalid(TxValidationResult::TX_CONSENSUS, "zk-proof-missing");
@@ -800,7 +800,7 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, 
             LogPrintf("CheckTxInputs: FAIL - duplicate ZK proofs for asset %s\n", aid.ToString());
             return state.Invalid(TxValidationResult::TX_CONSENSUS, "zk-proof-duplicate");
         }
-        LogPrintf("CheckTxInputs: ZK_PROOF_PAYLOAD validation passed for asset %s\n", aid.ToString());
+        LogDebug(BCLog::VALIDATION, "CheckTxInputs: ZK_PROOF_PAYLOAD validation passed for asset %s\n", aid.ToString());
     }
 
     // Groth16 Proof Verification Pass: Cryptographically verify compliance proofs
@@ -829,14 +829,14 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, 
     //   [4] = output_key_high (upper 128 bits of child x-only key, left-padded to 32 bytes)
     //   [5] = output_key_low  (lower 128 bits of child x-only key, left-padded to 32 bytes)
     const std::array<unsigned char, 32> chain_separator_bytes = Consensus::ComputeChainSeparatorBytes(::Params());
-    LogPrintf("CheckTxInputs: chain_separator for this network = %s\n", HexStr(chain_separator_bytes));
+    LogDebug(BCLog::VALIDATION, "CheckTxInputs: chain_separator for this network = %s\n", HexStr(chain_separator_bytes));
 
     for (const auto& [aid, policy] : kyc_policies) {
         if (!policy.required) continue;
 
         // Skip ZK verification only for explicit mempool consistency checks.
         if (skip_expensive_zk_verification) {
-            LogPrintf("CheckTxInputs: skipping ZK verification for asset %s (mempool consistency check, already verified on acceptance)\n", aid.ToString());
+            LogDebug(BCLog::VALIDATION, "CheckTxInputs: skipping ZK verification for asset %s (mempool consistency check, already verified on acceptance)\n", aid.ToString());
             continue;
         }
 
@@ -1082,7 +1082,7 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, 
                     return state.Invalid(TxValidationResult::TX_CONSENSUS, "kyc-proof-output-mismatch");
                 }
             }
-            LogPrintf("CheckTxInputs: output key binding OK for all %zu inputs of asset %s (%zu public inputs)\n",
+            LogDebug(BCLog::VALIDATION, "CheckTxInputs: output key binding OK for all %zu inputs of asset %s (%zu public inputs)\n",
                       inputs_it->second.size(), aid.ToString(), pub_input_count);
         }
 
@@ -1105,7 +1105,7 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, 
         const groth16::VerifyError verify_result = groth16::VerifyGroth16WithPolicy(proof_span, pub_span, vk_span, vk_ctx);
         switch (verify_result) {
             case groth16::VerifyError::OK:
-                LogPrintf("CheckTxInputs: groth16 verification OK for asset %s\n", aid.ToString());
+                LogDebug(BCLog::VALIDATION, "CheckTxInputs: groth16 verification OK for asset %s\n", aid.ToString());
                 break;
             case groth16::VerifyError::InvalidProofFormat:
                 LogPrintf("CheckTxInputs: groth16 invalid proof format for asset %s\n", aid.ToString());
@@ -1135,6 +1135,6 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, 
         return state.Invalid(TxValidationResult::TX_CONSENSUS, "zk-proof-cap");
     }
 
-    LogPrintf("CheckTxInputs: SUCCESS tx=%s\n", tx.GetHash().ToString());
+    LogDebug(BCLog::VALIDATION, "CheckTxInputs: SUCCESS tx=%s\n", tx.GetHash().ToString());
     return true;
 }

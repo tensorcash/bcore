@@ -387,6 +387,12 @@ public:
         // (-assetsheight / -assetsdelegationheight are honored on regtest chains only).
         consensus.AssetsHeight = 0;
         consensus.AssetsDelegationHeight = 0;
+        // Scalar-CFD coordinated mainnet activation. Hardcoded (not gArgs) so the
+        // consensus height can never come from node-local config — every mainnet
+        // node must agree. The whole tensor fleet must run a scalarcfd-capable
+        // binary and finish resync before this height. NOTE: the binary appends a
+        // scalar_undo channel to CBlockUndo, so each node reindexes/resyncs on upgrade.
+        consensus.ScalarCfdHeight = 4610;
     }
 };
 
@@ -925,6 +931,14 @@ public:
         consensus.vdf_spv_commitment_height = 0;
         consensus.vdf_spv_vdfverify_height = 0;
         consensus.reuse_entropy_height = 5000;
+        // Scalar-CFD subsystem (ISSUER_SCALAR carrier + OP_SCALAR_CFD_SETTLE opcode + the Slice-6 format
+        // catalogue). Coordinated testnet activation. This is a parser RELAXATION with no prior scalar
+        // contracts traded, so it only requires the whole tensor-test fleet to run a scalarcfd-capable
+        // binary before this height. tensor (mainnet) keeps the INT_MAX default (inert) until its own
+        // coordinated activation. Overridable via -scalarcfdheight so the height is tunable without a
+        // rebuild (the baked default is the consensus value; every node must agree). NOTE: the binary
+        // appends a scalar_undo channel to CBlockUndo, so each node must reindex/resync when upgrading.
+        consensus.ScalarCfdHeight = gArgs.GetIntArg("-scalarcfdheight", 6528);
         genesis = CreateGenesisBlock(1296688602, 371708380, 0x207fffff, 3, 50 * COIN, true);
 
         consensus.DefaultModelName = "Qwen/Qwen3-0.6B";

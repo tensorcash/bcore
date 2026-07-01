@@ -304,16 +304,19 @@ TreasuryPage::TreasuryPage(const PlatformStyle* platformStyle, QWidget* parent)
     // Initialize to Asset Holder view (default) - but don't refresh data yet
     // (wallet and client models aren't set until later)
     if (isIssuerMode) {
+        // Core issuance lifecycle first (ICU Dashboard is the landing page), then the option/CFD
+        // derivative builders grouped together on the right as optional advanced steps.
+        tabWidget->addTab(dashboardTab, tr("ICU Dashboard"));
         tabWidget->addTab(registrationTab, tr("Register Asset"));
+        tabWidget->addTab(mintTab, tr("Mint"));
+        tabWidget->addTab(burnTab, tr("Burn"));
+        tabWidget->addTab(zkComplianceTab, tr("Compliance"));
+        tabWidget->addTab(distributionTab, tr("Distribution"));
+        tabWidget->addTab(governanceTab, tr("Governance"));
         tabWidget->addTab(optionSeriesTab, tr("Option Series"));
         tabWidget->addTab(cfdSeriesTab, tr("CFD Asset Series"));
         tabWidget->addTab(scfdTab, tr("Bilateral CFD"));
         tabWidget->addTab(verifyOptionTab, tr("Verify Option"));
-        tabWidget->addTab(mintTab, tr("Mint"));
-        tabWidget->addTab(burnTab, tr("Burn"));
-        tabWidget->addTab(dashboardTab, tr("ICU Dashboard"));
-        tabWidget->addTab(zkComplianceTab, tr("Compliance"));
-        tabWidget->addTab(distributionTab, tr("Distribution"));
 
         // Issuer mode table headers
         dashboardICUTable->setColumnCount(9);
@@ -3260,27 +3263,36 @@ bool TreasuryPage::collectOptionSeriesTerms(WalletModel::OptionSeriesTermsInput&
     }
     out.strike_nbits = strikeNbits;
 
-    // Fixing entered as a duration from the CURRENT tip (re-fetched here so the schedule is anchored to
-    // the height at registration, not when the form was opened). Settle-lock = fixing + the safety window.
-    int tipHeight = m_optChainHeight;
-    if (walletModel) {
-        const WalletModel::DifficultyChainDefaults d = walletModel->difficultyChainDefaults();
-        if (d.success && d.height > 0) { tipHeight = d.height; m_optChainHeight = d.height; }
+    // Fixing/settle schedule. Once the series is REGISTERED these heights are frozen (m_optFixingHeight)
+    // and MUST be reused verbatim: the id is TaggedHash(descriptor) and the descriptor commits the
+    // absolute fixing/settle heights, so recomputing "tip + duration" at Issue/Record — after the tip has
+    // advanced past registration — would derive a different series_id and the registry lookup would miss.
+    if (m_optFixingHeight > 0) {
+        out.fixing_height = static_cast<quint32>(m_optFixingHeight);
+        out.settle_lock_height = static_cast<quint32>(m_optSettleLockHeight);
+    } else {
+        // Pre-registration: fixing entered as a duration from the CURRENT tip (re-fetched here so the
+        // schedule is anchored to the live height). Settle-lock = fixing + the safety window.
+        int tipHeight = m_optChainHeight;
+        if (walletModel) {
+            const WalletModel::DifficultyChainDefaults d = walletModel->difficultyChainDefaults();
+            if (d.success && d.height > 0) { tipHeight = d.height; m_optChainHeight = d.height; }
+        }
+        if (tipHeight <= 0) {
+            optStatusText->append(tr("✗ Could not read the chain height to schedule the fixing."));
+            return false;
+        }
+        const int unitDays = optFixingUnitCombo ? optFixingUnitCombo->currentData().toInt() : 1;
+        const qint64 durBlocks = static_cast<qint64>(optFixingDurationSpin->value()) * unitDays * 144;
+        const qint64 fixing = static_cast<qint64>(tipHeight) + durBlocks;
+        const qint64 settle = fixing + optSettleWindowSpin->value();
+        if (settle >= 500000000LL) {   // LOCKTIME_THRESHOLD: settle-lock must stay a block height
+            optStatusText->append(tr("✗ The fixing + settlement schedule is too far in the future."));
+            return false;
+        }
+        out.fixing_height = static_cast<quint32>(fixing);
+        out.settle_lock_height = static_cast<quint32>(settle);
     }
-    if (tipHeight <= 0) {
-        optStatusText->append(tr("✗ Could not read the chain height to schedule the fixing."));
-        return false;
-    }
-    const int unitDays = optFixingUnitCombo ? optFixingUnitCombo->currentData().toInt() : 1;
-    const qint64 durBlocks = static_cast<qint64>(optFixingDurationSpin->value()) * unitDays * 144;
-    const qint64 fixing = static_cast<qint64>(tipHeight) + durBlocks;
-    const qint64 settle = fixing + optSettleWindowSpin->value();
-    if (settle >= 500000000LL) {   // LOCKTIME_THRESHOLD: settle-lock must stay a block height
-        optStatusText->append(tr("✗ The fixing + settlement schedule is too far in the future."));
-        return false;
-    }
-    out.fixing_height = static_cast<quint32>(fixing);
-    out.settle_lock_height = static_cast<quint32>(settle);
 
     // Leverage (×) -> lambda_q (Q16).
     bool levOk = false;
@@ -3340,6 +3352,52 @@ void TreasuryPage::setOptionSeriesFormEnabled(bool enabled)
         optFixingDurationSpin, optFixingUnitCombo, optSettleWindowSpin, optLeverageEdit, optLotImEdit, optLotCountSpin,
         optExampleMoveSpin, optRefPremiumEdit, optSaltEdit, optSaltGenButton, optBondEdit};
     for (QWidget* w : widgets) if (w) w->setEnabled(enabled);
+}
+
+bool TreasuryPage::recoverOptionSeriesFrozenSchedule(const QString& identifier)
+{
+    if (!walletModel) return false;
+    const QString id = identifier.trimmed();
+    if (id.isEmpty() || id.startsWith(QLatin1Char('('))) return false;
+
+    const WalletModel::OptionSeriesBackingResult r = walletModel->optionSeriesVerifyById(id);
+    if (!r.success || !r.authentic || r.terms_json.isEmpty()) {
+        if (optStatusText) {
+            optStatusText->append(tr("⚠ Could not recover the registered schedule from chain: %1")
+                                      .arg(!r.error.isEmpty() ? r.error : r.reason));
+        }
+        return false;
+    }
+
+    UniValue terms;
+    if (!terms.read(r.terms_json.toStdString()) || !terms.isObject()) {
+        if (optStatusText) optStatusText->append(tr("⚠ Recovered descriptor terms were not parseable."));
+        return false;
+    }
+
+    const UniValue& fixingValue = terms.find_value("fixing_height");
+    const UniValue& settleValue = terms.find_value("settle_lock_height");
+    if (fixingValue.isNull() || settleValue.isNull()) {
+        if (optStatusText) optStatusText->append(tr("⚠ Recovered descriptor did not contain fixing/settle heights."));
+        return false;
+    }
+
+    const int64_t fixing = fixingValue.getInt<int64_t>();
+    const int64_t settle = settleValue.getInt<int64_t>();
+    if (fixing <= 0 || settle <= 0 ||
+        fixing > std::numeric_limits<int>::max() ||
+        settle > std::numeric_limits<int>::max()) {
+        if (optStatusText) optStatusText->append(tr("⚠ Recovered fixing/settle heights are out of range."));
+        return false;
+    }
+
+    m_optFixingHeight = static_cast<int>(fixing);
+    m_optSettleLockHeight = static_cast<int>(settle);
+    if (optStatusText) {
+        optStatusText->append(tr("✓ Recovered registered schedule from chain: fixing %1, settle %2.")
+                                  .arg(m_optFixingHeight).arg(m_optSettleLockHeight));
+    }
+    return true;
 }
 
 bool TreasuryPage::resolveSpendableWriterAddress(const QString& writerInput, QString& addressOut, QString& errOut)
@@ -3416,6 +3474,10 @@ void TreasuryPage::saveOptionSeriesDraft(int stage)
     s.setValue("strike", optStrikeTpsEdit->text());
     s.setValue("fix_dur", optFixingDurationSpin->value());
     s.setValue("fix_unit", optFixingUnitCombo->currentIndex());
+    // Persist the FROZEN absolute schedule so a resumed (already-registered) draft re-derives the same
+    // series_id instead of recomputing tip+duration against a now-advanced tip.
+    s.setValue("fix_height", m_optFixingHeight);
+    s.setValue("settle_height", m_optSettleLockHeight);
     s.setValue("settle_window", optSettleWindowSpin->value());
     s.setValue("leverage", optLeverageEdit->text());
     s.setValue("lot_im", optLotImEdit->text());
@@ -3491,18 +3553,27 @@ void TreasuryPage::onOptScheduleAndPayoffPreview()
     // Fixing as a duration -> absolute block height (144 blocks/day on all TSC chains).
     const int unitDays = optFixingUnitCombo ? optFixingUnitCombo->currentData().toInt() : 1;
     const qint64 durBlocks = static_cast<qint64>(optFixingDurationSpin->value()) * unitDays * 144;
-    if (optFixingHeightLabel) {
-        if (m_optChainHeight > 0) {
-            const qint64 fixing = m_optChainHeight + durBlocks;
-            optFixingHeightLabel->setText(tr("≈ block %1   (tip %2 + %3 blocks)")
-                                              .arg(fixing).arg(m_optChainHeight).arg(durBlocks));
-        } else {
-            optFixingHeightLabel->setText(tr("now + %1 blocks (chain height pending)").arg(durBlocks));
+    if (m_optFixingHeight > 0) {
+        if (optFixingHeightLabel) {
+            optFixingHeightLabel->setText(tr("block %1 (registered)").arg(m_optFixingHeight));
         }
-    }
-    if (optSettleHeightLabel && m_optChainHeight > 0) {
-        const qint64 fixing = m_optChainHeight + durBlocks;
-        optSettleHeightLabel->setText(tr("≈ block %1   (fixing + %2)").arg(fixing + optSettleWindowSpin->value()).arg(optSettleWindowSpin->value()));
+        if (optSettleHeightLabel) {
+            optSettleHeightLabel->setText(tr("block %1 (registered)").arg(m_optSettleLockHeight));
+        }
+    } else {
+        if (optFixingHeightLabel) {
+            if (m_optChainHeight > 0) {
+                const qint64 fixing = m_optChainHeight + durBlocks;
+                optFixingHeightLabel->setText(tr("≈ block %1   (tip %2 + %3 blocks)")
+                                                  .arg(fixing).arg(m_optChainHeight).arg(durBlocks));
+            } else {
+                optFixingHeightLabel->setText(tr("now + %1 blocks (chain height pending)").arg(durBlocks));
+            }
+        }
+        if (optSettleHeightLabel && m_optChainHeight > 0) {
+            const qint64 fixing = m_optChainHeight + durBlocks;
+            optSettleHeightLabel->setText(tr("≈ block %1   (fixing + %2)").arg(fixing + optSettleWindowSpin->value()).arg(optSettleWindowSpin->value()));
+        }
     }
 
     // Worked payoff per unit: a favourable m%% move past strike pays min(leverage*m, 1) * lot_collateral.
@@ -3617,6 +3688,11 @@ void TreasuryPage::onOptRegister()
         showError(r.error);
         return;
     }
+    // Freeze the schedule that produced this registered id, so Issue/Record re-derive the SAME series_id
+    // even though the tip has since advanced (t still holds the heights build_register committed to).
+    m_optFixingHeight = static_cast<int>(t.fixing_height);
+    m_optSettleLockHeight = static_cast<int>(t.settle_lock_height);
+    onOptScheduleAndPayoffPreview();
     optAssetIdLabel->setText(r.asset_id);
     optStatusText->append(tr("✓ Registered %1 (asset %2). TxID %3.")
                               .arg(r.ticker).arg(r.asset_id).arg(r.txid));
@@ -3688,12 +3764,15 @@ void TreasuryPage::onOptReset()
     optSaltEdit->clear();
     optAssetIdLabel->setText(tr("(derive to preview)"));
     m_optIssueTxid.clear();
+    m_optFixingHeight = 0;       // unfreeze: the next series computes its schedule from the live tip again
+    m_optSettleLockHeight = 0;
     optRegisterButton->setEnabled(true);
     optIssueButton->setEnabled(false);
     optRecordButton->setEnabled(false);
     clearOptionSeriesDraft();  // discard any saved in-progress draft
     optStatusText->append(tr("— Ready for a new series —"));
     onOptPreviewUpdate();
+    onOptScheduleAndPayoffPreview();
 }
 
 void TreasuryPage::onOptResume()
@@ -3736,6 +3815,10 @@ void TreasuryPage::onOptResume()
     optFeeRateEdit->setText(s.value("fee").toString());
     optAssetIdLabel->setText(s.value("asset_id").toString());
     m_optIssueTxid = s.value("issue_txid").toString();
+    // Restore the frozen schedule (a stage>=1 draft is already registered; reuse the exact heights so
+    // Issue/Record derive the registered series_id rather than recomputing against the current tip).
+    m_optFixingHeight = s.value("fix_height", 0).toInt();
+    m_optSettleLockHeight = s.value("settle_height", 0).toInt();
     s.endGroup();
 
     if (optParentCombo) {
@@ -3744,8 +3827,25 @@ void TreasuryPage::onOptResume()
         else if (!root.isEmpty()) optStatusText->append(tr("⚠ Saved sponsoring root '%1' is not in this wallet's controlled set.").arg(root));
     }
 
+    if (stage >= 1 && (m_optFixingHeight <= 0 || m_optSettleLockHeight <= 0)) {
+        const QString savedAssetId = optAssetIdLabel ? optAssetIdLabel->text().trimmed() : QString();
+        if (recoverOptionSeriesFrozenSchedule(savedAssetId)) {
+            saveOptionSeriesDraft(stage);
+        }
+    }
+
     // Restore the step gating for the saved stage (form stays locked once registered).
     if (stage >= 1) { setOptionSeriesFormEnabled(false); optRegisterButton->setEnabled(false); }
+    if (stage >= 1 && (m_optFixingHeight <= 0 || m_optSettleLockHeight <= 0)) {
+        optIssueButton->setEnabled(false);
+        optRecordButton->setEnabled(false);
+        optStatusText->append(tr("✗ This registered draft was saved before the schedule-freeze fix, and "
+                                 "the exact on-chain heights could not be recovered yet. Wait until the "
+                                 "registration is confirmed and Resume again, or click 'New series'."));
+        onOptPreviewUpdate();
+        onOptScheduleAndPayoffPreview();
+        return;
+    }
     optIssueButton->setEnabled(stage == 1);
     optRecordButton->setEnabled(stage == 2);
     if (stage == 1) {
@@ -3754,6 +3854,7 @@ void TreasuryPage::onOptResume()
         optStatusText->append(tr("↻ Resumed an ISSUED series (awaiting record). Mint TxID %1; click '3. Record issue' once it has confirmed.").arg(m_optIssueTxid));
     }
     onOptPreviewUpdate();
+    onOptScheduleAndPayoffPreview();
 }
 
 void TreasuryPage::onOptRefreshList()
@@ -4767,6 +4868,17 @@ bool TreasuryPage::collectCfdSeriesTerms(WalletModel::ScalarNotePairTermsInput& 
     return true;
 }
 
+void TreasuryPage::setCfdSeriesFormEnabled(bool enabled)
+{
+    QWidget* const widgets[] = {
+        cfdParentCombo, cfdLongSuffixEdit, cfdShortSuffixEdit, cfdPayoffModeCombo, cfdLossDirCombo,
+        cfdUnderlyingEdit, cfdSeriesFeedIdEdit, cfdFixingRefEdit, cfdDeadlineHeightEdit, cfdSettleLockEdit,
+        cfdFormatSpin, cfdStrikeEdit, cfdFallbackEdit, cfdLeverageEdit, cfdCollateralCombo,
+        cfdCollateralEdit, cfdVaultImEdit, cfdLotCountSpin, cfdSaltEdit, cfdSaltGenButton, cfdBondEdit};
+    for (QWidget* w : widgets) if (w) w->setEnabled(enabled);
+    if (enabled) onCfdCollateralChanged();
+}
+
 void TreasuryPage::onCfdRegister()
 {
     if (!walletModel || !clientModel) { showError(tr("Wallet or client model not initialized")); return; }
@@ -4819,6 +4931,7 @@ void TreasuryPage::onCfdRegister()
     cfdStatusText->append(tr("✓ Registered pair %1 (L %2 / S %3). TxID %4.")
                               .arg(r.pair_id.left(16) + QStringLiteral("…")).arg(r.long_ticker).arg(r.short_ticker).arg(r.txid));
     cfdStatusText->append(tr("  → Wait for 1 confirmation, then click '2. Issue pair'."));
+    setCfdSeriesFormEnabled(false);
     cfdRegisterButton->setEnabled(false);
     cfdIssueButton->setEnabled(true);
     saveCfdDraft(/*stage=*/1);  // terms + salt + register txid now durable across an app restart
@@ -4875,6 +4988,7 @@ void TreasuryPage::onCfdRecord()
 
 void TreasuryPage::onCfdReset()
 {
+    setCfdSeriesFormEnabled(true);
     cfdLongSuffixEdit->clear();
     cfdShortSuffixEdit->clear();
     cfdSaltEdit->clear();
@@ -4994,7 +5108,7 @@ void TreasuryPage::onCfdResume()
     }
 
     // Restore the step gating for the saved stage.
-    if (stage >= 1) cfdRegisterButton->setEnabled(false);
+    if (stage >= 1) { setCfdSeriesFormEnabled(false); cfdRegisterButton->setEnabled(false); }
     cfdIssueButton->setEnabled(stage == 1);
     cfdRecordButton->setEnabled(stage == 2);
     if (stage == 1) cfdStatusText->append(tr("↻ Resumed a REGISTERED pair (awaiting issuance). Click '2. Issue pair' once it has confirmed."));
@@ -6876,6 +6990,10 @@ void TreasuryPage::refreshAssetList()
         const QString govSelected = govAssetCombo ? govAssetCombo->currentData().toString() : QString();
         const QString distTargetSelected = distTargetAssetCombo ? distTargetAssetCombo->currentData().toString() : QString();
         const QString distAssetSelected = distAssetCombo ? distAssetCombo->currentData().toString() : QString();
+        const QString regParentSelected = regParentCombo ? regParentCombo->currentData().toString() : QString();
+        const QString optParentSelected = optParentCombo ? optParentCombo->currentData().toString() : QString();
+        const QString cfdParentSelected = cfdParentCombo ? cfdParentCombo->currentData().toString() : QString();
+        const QString cfdCollateralSelected = cfdCollateralCombo ? cfdCollateralCombo->currentData().toString() : QString();
 
         auto appendStatus = [&](const QString& text) {
             if (isIssuerMode && regStatusText) {
@@ -6931,7 +7049,9 @@ void TreasuryPage::refreshAssetList()
                 QSignalBlocker blockGov(govAssetCombo);
                 QSignalBlocker blockDistTarget(distTargetAssetCombo);
                 QSignalBlocker blockDistAsset(distAssetCombo);
+                QSignalBlocker blockRegParent(regParentCombo);
                 QSignalBlocker blockOptParent(optParentCombo);
+                QSignalBlocker blockCfdParent(cfdParentCombo);
                 QSignalBlocker blockCfdCollateral(cfdCollateralCombo);
 
                 if (mintAssetCombo) mintAssetCombo->clear();
@@ -7065,6 +7185,10 @@ void TreasuryPage::refreshAssetList()
                     restoreSelection(burnAssetCombo, burnSelected);
                     restoreSelection(zkAssetCombo, zkSelected);
                     restoreSelection(govAssetCombo, govSelected);
+                    restoreSelection(regParentCombo, regParentSelected);
+                    restoreSelection(optParentCombo, optParentSelected);
+                    restoreSelection(cfdParentCombo, cfdParentSelected);
+                    restoreSelection(cfdCollateralCombo, cfdCollateralSelected);
 
                 } catch (UniValue& objError) {
                     // Re-add Pre-Registration Mode entry even on error
@@ -7091,6 +7215,10 @@ void TreasuryPage::refreshAssetList()
             activateCombo(zkAssetCombo, zkSelected, &TreasuryPage::onZKAssetSelected);
             activateCombo(distTargetAssetCombo, distTargetSelected, &TreasuryPage::onDistTargetAssetSelected);
             activateCombo(distAssetCombo, distAssetSelected, &TreasuryPage::onDistAssetSelected);
+            onRegChildPreviewUpdate();
+            onOptPreviewUpdate();
+            onCfdPairPreview();
+            onCfdCollateralChanged();
             return;
         }
 
@@ -10286,18 +10414,19 @@ void TreasuryPage::updateVisibilityForMode()
             tabWidget->removeTab(0);
         }
 
-        // Add issuer tabs
+        // Add issuer tabs. Core issuance lifecycle first (ICU Dashboard is the landing page), then the
+        // option/CFD derivative builders grouped together on the right as optional advanced steps.
+        tabWidget->addTab(dashboardTab, tr("ICU Dashboard"));
         tabWidget->addTab(registrationTab, tr("Register Asset"));
+        tabWidget->addTab(mintTab, tr("Mint"));
+        tabWidget->addTab(burnTab, tr("Burn"));
+        tabWidget->addTab(zkComplianceTab, tr("Compliance"));
+        tabWidget->addTab(distributionTab, tr("Distribution"));
+        tabWidget->addTab(governanceTab, tr("Governance"));
         tabWidget->addTab(optionSeriesTab, tr("Option Series"));
         tabWidget->addTab(cfdSeriesTab, tr("CFD Asset Series"));
         tabWidget->addTab(scfdTab, tr("Bilateral CFD"));
         tabWidget->addTab(verifyOptionTab, tr("Verify Option"));
-        tabWidget->addTab(mintTab, tr("Mint"));
-        tabWidget->addTab(burnTab, tr("Burn"));
-        tabWidget->addTab(dashboardTab, tr("ICU Dashboard"));
-        tabWidget->addTab(zkComplianceTab, tr("Compliance"));
-        tabWidget->addTab(distributionTab, tr("Distribution"));
-        tabWidget->addTab(governanceTab, tr("Governance"));
 
         // Update dashboard table headers for issuer view
         dashboardICUTable->setColumnCount(9);

@@ -247,6 +247,13 @@ private:
     QSpinBox* optExampleMoveSpin{nullptr};     // payoff preview: example difficulty move %
     QLabel* optPayoffLabel{nullptr};           // worked payoff per unit
     int m_optChainHeight{0};                   // cached tip height for the fixing-duration preview
+    // Absolute fixing/settle heights FROZEN at registration. The form enters the fixing as a duration
+    // from the current tip, so re-reading it after the tip advances (at Issue/Record) would recompute a
+    // different schedule -> a different series_id -> the registry lookup would miss. Once registered we
+    // reuse these frozen heights so every later step derives the exact id that was registered. 0 = unset
+    // (pre-registration; collectOptionSeriesTerms computes from the live tip).
+    int m_optFixingHeight{0};
+    int m_optSettleLockHeight{0};
     QLineEdit* optSaltEdit{nullptr};
     QPushButton* optSaltGenButton{nullptr};
     QLineEdit* optBondEdit{nullptr};           // child bond (TSC, optional)
@@ -610,6 +617,7 @@ private:
     // on any invalid field. `out` is filled on success.
     bool collectOptionSeriesTerms(WalletModel::OptionSeriesTermsInput& out);
     void setOptionSeriesFormEnabled(bool enabled); // lock the terms once a series is registered
+    bool recoverOptionSeriesFrozenSchedule(const QString& identifier); // old drafts: recover heights from on-chain descriptor
     // Resolve a writer field (a wallet Taproot address, or a 64-hex x-only key) to a bech32m address this
     // wallet can SIGN with — required so issuance/settlement/buy-back can rotate the ICU + sign. Returns
     // false (with errOut) if the key is not a wallet-controlled Taproot output.
@@ -678,6 +686,7 @@ private Q_SLOTS:
     // ── CFD asset series (scalar note pair) ─────────────────────────────────────────────────────────────
     void setupCfdSeriesTab();
     bool collectCfdSeriesTerms(WalletModel::ScalarNotePairTermsInput& out); // form -> RPC terms (validated)
+    void setCfdSeriesFormEnabled(bool enabled); // lock descriptor fields once the pair is registered
     void saveCfdDraft(int stage);     // persist the in-progress pair (1=registered, 2=issued) to QSettings
     void clearCfdDraft();
     void onCfdGenSalt();              // fill the series salt with random bytes
