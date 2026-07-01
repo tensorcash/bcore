@@ -164,7 +164,58 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     pblock->vtx.emplace_back();
 
     LOCK(::cs_main);
-    CBlockIndex* pindexPrev = m_chainstate.m_chain.Tip();
+    CBlockIndex* pindexPrev = nullptr;
+    if (m_options.prev_block_hash) {
+        // Build-ahead: assemble on a specific pending parent one level above the
+        // active tip, instead of the tip itself. Enforce the invariant HERE,
+        // atomically under cs_main, rather than trusting the caller/selector:
+        // the target can go stale between getmininginfo and this call.
+        //
+        // Enforce the assembler mode in code, not just by caller convention: the
+        // parent's UTXO set is NOT the active coins view, so mempool selection
+        // and TestBlockValidity (both run against the active chainstate) would be
+        // wrong. Build-ahead templates are coinbase-only.
+        if (m_mempool != nullptr) {
+            throw std::runtime_error(strprintf(
+                "%s: build-ahead requires use_mempool=false (parent coins view is not the active one)",
+                __func__));
+        }
+        if (m_options.test_block_validity) {
+            throw std::runtime_error(strprintf(
+                "%s: build-ahead requires test_block_validity=false (would validate against the active tip)",
+                __func__));
+        }
+        pindexPrev = m_chainstate.m_chainman.m_blockman.LookupBlockIndex(*m_options.prev_block_hash);
+        if (pindexPrev == nullptr) {
+            throw std::runtime_error(strprintf("%s: build-ahead prev_block_hash %s not found",
+                                               __func__, m_options.prev_block_hash->ToString()));
+        }
+        if (pindexPrev->pprev != m_chainstate.m_chain.Tip()) {
+            throw std::runtime_error(strprintf(
+                "%s: build-ahead parent %s is not one level above the active tip",
+                __func__, m_options.prev_block_hash->ToString()));
+        }
+        if (pindexPrev->nStatus & BLOCK_FAILED_MASK) {
+            throw std::runtime_error(strprintf("%s: build-ahead parent %s is failed",
+                                               __func__, m_options.prev_block_hash->ToString()));
+        }
+        // Exclude only our OWN Full_Red verdict (this node computed the block is
+        // zero-work / penalised — NOT a BLOCK_FAILED, so the mask check above
+        // does not cover it). GetOwnFullStatus() == getFull(own=true) returns the
+        // raw own status, so an in-progress (Not_Checked/Amber) parent — the
+        // normal build-ahead state — is NOT excluded. The aggregate
+        // GetRequestStatus(Full) calls getFull(own=false), which maps
+        // own-Amber-with-no-peer-reports to Full_Red and would wrongly exclude A
+        // during its own validation window (validationapi.cpp:135).
+        if (g_ValidationApi != nullptr &&
+            g_ValidationApi->GetOwnFullStatus(*m_options.prev_block_hash) ==
+                static_cast<uint8_t>(ValidationResponseValue::Full_Red)) {
+            throw std::runtime_error(strprintf("%s: build-ahead parent %s is Full_Red (own verdict)",
+                                               __func__, m_options.prev_block_hash->ToString()));
+        }
+    } else {
+        pindexPrev = m_chainstate.m_chain.Tip();
+    }
     assert(pindexPrev != nullptr);
     nHeight = pindexPrev->nHeight + 1;
 
