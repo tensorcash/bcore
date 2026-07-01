@@ -1409,7 +1409,8 @@ RPCHelpMan scalar_list()
                     {RPCResult::Type::STR, "short_icu_outpoint", "Token S current ICU (txid:vout)"},
                     {RPCResult::Type::ARR, "lot_vaults", "The N persisted vault outpoints (txid:vout)",
                         {{RPCResult::Type::STR, "", "outpoint"}}},
-                    {RPCResult::Type::ANY, "terms", "The full note-pair terms (incl. derived L/S + pair_id)"},
+                    {RPCResult::Type::OBJ_DYN, "terms", "The full note-pair terms (incl. derived L/S + pair_id)",
+                        {{RPCResult::Type::ELISION, "", ""}}},
                 }}}},
         RPCExamples{HelpExampleCli("scalar.list", "")},
         [](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue {

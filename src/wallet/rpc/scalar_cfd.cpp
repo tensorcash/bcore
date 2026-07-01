@@ -322,25 +322,6 @@ UniValue OfferToJSON(bool proposer_is_short, const uint256& salt, const ScalarCf
     return offer;
 }
 
-const std::vector<RPCArg> kScalarEconArgs = {
-    {"source_type", RPCArg::Type::NUM, RPCArg::Default{0}, "0 = ISSUER_PUBLISHED (only supported value)"},
-    {"payoff_mode", RPCArg::Type::NUM, RPCArg::Default{0}, "0 = STRIKE-denominator, 1 = REALIZED-denominator"},
-    {"underlying_asset_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Oracle asset U (32-byte hex)"},
-    {"feed_id", RPCArg::Type::NUM, RPCArg::Optional::NO, "Feed id of U"},
-    {"fixing_ref", RPCArg::Type::NUM, RPCArg::Optional::NO, "Scalar epoch to settle against"},
-    {"publication_deadline_height", RPCArg::Type::NUM, RPCArg::Optional::NO, "Last height a real fixing counts (§3.4)"},
-    {"settle_lock_height", RPCArg::Type::NUM, RPCArg::Optional::NO, "Leaf CLTV (block height)"},
-    {"scalar_format_id", RPCArg::Type::NUM, RPCArg::Optional::NO, "Scalar encoding (1 = RAW_U256_LE)"},
-    {"strike", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Strike K, NUMERIC value (32-byte display hex); stored as the format's wire bytes, must fit the format width"},
-    {"fallback_scalar", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Fallback scalar, NUMERIC value (32-byte display hex); same encoding rules as strike"},
-    {"collateral_asset_id", RPCArg::Type::STR_HEX, RPCArg::Default{""}, "Collateral asset C (32-byte hex); omit/empty = native"},
-    {"long", RPCArg::Type::OBJ, RPCArg::Optional::NO, "Long leg economics",
-        {{"im", RPCArg::Type::STR, RPCArg::Optional::NO, "Initial margin (collateral units, decimal)"},
-         {"lambda_q", RPCArg::Type::NUM, RPCArg::Optional::NO, "Leverage in Q16"}}},
-    {"short", RPCArg::Type::OBJ, RPCArg::Optional::NO, "Short leg economics",
-        {{"im", RPCArg::Type::STR, RPCArg::Optional::NO, "Initial margin (collateral units, decimal)"},
-         {"lambda_q", RPCArg::Type::NUM, RPCArg::Optional::NO, "Leverage in Q16"}}},
-};
 
 // ----- open / record_open helpers -----
 
@@ -492,13 +473,19 @@ RPCHelpMan scalarcfd_propose()
         "counterparty's leg). Returns an offer to hand to the counterparty out-of-band. Nothing is persisted "
         "— the record is created by scalarcfd.accept (acceptor) and scalarcfd.import_acceptance (proposer).",
         {
-            {"terms", RPCArg::Type::OBJ, RPCArg::Optional::NO, "Contract economics (no payout keys)", kScalarEconArgs},
+            {"terms", RPCArg::Type::OBJ_USER_KEYS, RPCArg::Optional::NO,
+                "Contract economics (no payout keys). Fields: source_type (0=ISSUER_PUBLISHED), payoff_mode "
+                "(0=STRIKE,1=REALIZED), underlying_asset_id (hex), feed_id, fixing_ref, publication_deadline_height, "
+                "settle_lock_height, scalar_format_id, strike (hex), fallback_scalar (hex), collateral_asset_id "
+                "(hex; omit=native), and long/short each an object {im (decimal collateral units), lambda_q (Q16)}",
+                {{"", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "A terms field"}}},
             {"role", RPCArg::Type::STR, RPCArg::Optional::NO, "Proposer's side: \"long\" or \"short\""},
             {"owner", RPCArg::Type::STR, RPCArg::Optional::NO, "Proposer's P2TR payout address for the leg they post"},
             {"cp", RPCArg::Type::STR, RPCArg::Optional::NO, "Proposer's P2TR payout address for their claim on the counterparty's leg"},
         },
         RPCResult{RPCResult::Type::OBJ, "", "",
-            {{RPCResult::Type::ANY, "offer", "The offer to hand to the counterparty (consumed by scalarcfd.accept)"}}},
+            {{RPCResult::Type::OBJ_DYN, "offer", "The offer to hand to the counterparty (consumed by scalarcfd.accept)",
+                {{RPCResult::Type::ELISION, "", ""}}}}},
         RPCExamples{HelpExampleCli("scalarcfd.propose", "'{...terms...}' \"long\" \"bcrt1p...\" \"bcrt1p...\"")},
         [](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue {
             std::shared_ptr<CWallet> pwallet = GetWalletForJSONRPCRequest(request);
@@ -564,7 +551,8 @@ RPCHelpMan scalarcfd_accept()
         RPCResult{RPCResult::Type::OBJ, "", "",
             {
                 {RPCResult::Type::STR_HEX, "contract_id", "The assembled contract id"},
-                {RPCResult::Type::ANY, "acceptance", /*optional=*/true, "Acceptance for the proposer (only when confirmed)"},
+                {RPCResult::Type::OBJ_DYN, "acceptance", /*optional=*/true, "Acceptance for the proposer (only when confirmed)",
+                    {{RPCResult::Type::ELISION, "", ""}}},
                 {RPCResult::Type::STR, "action_required", /*optional=*/true, "Present when not yet confirmed"},
             }},
         RPCExamples{HelpExampleCli("scalarcfd.accept", "'{...offer...}' \"bcrt1p...\" \"bcrt1p...\" '{\"confirmed\":true}'")},
