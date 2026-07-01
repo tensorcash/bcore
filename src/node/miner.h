@@ -182,6 +182,16 @@ public:
         // Whether to call TestBlockValidity() at the end of CreateNewBlock().
         bool test_block_validity{true};
         bool print_modified_fee{DEFAULT_PRINT_MODIFIED_FEE};
+        // Build-ahead: assemble the template on this specific parent instead of
+        // the active tip. Set ONLY by the broker-mining build-ahead path (which
+        // calls BlockAssembler directly, so this stays off the public
+        // BlockCreateOptions / Cap'n Proto mining interface). CreateNewBlock
+        // enforces the invariant under cs_main: the parent must exist, have
+        // pprev == active tip, and not be BLOCK_FAILED / Full_Red — else it
+        // throws. Callers using this must also set use_mempool=false and
+        // test_block_validity=false (the parent's coins view is not the active
+        // one, so mempool selection and TestBlockValidity do not apply).
+        std::optional<uint256> prev_block_hash{};
     };
 
     explicit BlockAssembler(Chainstate& chainstate, const CTxMemPool* mempool, const Options& options);

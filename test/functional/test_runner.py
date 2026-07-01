@@ -362,6 +362,7 @@ BASE_SCRIPTS = [
     'mining_mainnet.py',
     'feature_broker_mining_rpc.py',
     'feature_broker_mining_mode_flag.py',
+    'feature_broker_mining_build_ahead.py',
     # 'feature_signet.py', ## skipped until we have a proper signet setup
     'p2p_mutated_blocks.py',
     'rpc_named_arguments.py',

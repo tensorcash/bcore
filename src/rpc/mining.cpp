@@ -9,6 +9,7 @@
 #include <chain.h>
 #include <chainparams.h>
 #include <chainparamsbase.h>
+#include <common/args.h>
 #include <common/system.h>
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
@@ -52,9 +53,12 @@
 
 #include <chrono>
 #include <cstring>
+#include <map>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdint.h>
+#include <sync.h>
 #include <vector>
 
 using interfaces::BlockRef;
@@ -66,6 +70,153 @@ using node::NodeContext;
 using node::RegenerateCommitments;
 using node::UpdateTime;
 using util::ToString;
+
+// =============================================================================
+// Build-ahead (speculative next-tip) support.
+//
+// When we mine a block A that is quick-valid and smell-OK but still in async
+// Full validation, A has only a header index: AcceptBlockHeader ran, the Full
+// request was kicked off, and ProcessNewBlock returned BEFORE AcceptBlock wrote
+// the body (validation.cpp:9163). So A is NOT the active tip, has no
+// BLOCK_HAVE_DATA, and its body (hence cumulative_tick) is not on disk. Left
+// alone, the whole fleet keeps mining siblings of A on the current tip for the
+// entire validation window. Build-ahead lets the broker point workers at A's
+// child instead.
+//
+// A is an eligible build-ahead PARENT iff, evaluated atomically under cs_main:
+//   * we submitted it (present in g_own_pending) — own, not a peer's block;
+//   * its header index exists and A->pprev == active tip (exactly one level
+//     ahead — this also excludes the sync-accepted side-branch flavour of
+//     accepted_pending_connect, where the chain already advanced past us, and
+//     bounds speculative depth to 1);
+//   * not BLOCK_FAILED_MASK;
+//   * its OWN Full verdict is not Full_Red (GetOwnFullStatus; locally
+//     zero-work / penalised — NOT a BLOCK_FAILED, so the mask check alone is
+//     insufficient). An in-progress own verdict (Not_Checked/Amber) stays
+//     eligible; the peer-aggregate getFull(false) is deliberately NOT used, as
+//     it maps own-Amber-with-no-peers to Red and would drop A mid-window;
+//   * its Quick_Smell status is Quick_OK_Smell_OK — so EarlyPropagation already
+//     fired (validation.cpp:9184) and peers have A; building A's child is not a
+//     private branch. Smell_Fail blocks are deliberately excluded.
+//
+// cumulative_tick is a CBlock body field (primitives/block.h:100), so once A's
+// body is off the active chain it cannot be ReadBlock'd. We record it at submit
+// time; GetParentCumulativeTick() reads through to this registry when ReadBlock
+// fails — needed both to assemble A's child template and to compute the child's
+// own cumulative_tick if it is submitted while A is still pending.
+// =============================================================================
+namespace {
+
+struct OwnPendingBlock {
+    int height{0};
+    uint256 prev_hash;
+    uint64_t cumulative_tick{0};
+};
+
+Mutex g_own_pending_mutex;
+std::map<uint256, OwnPendingBlock> g_own_pending GUARDED_BY(g_own_pending_mutex);
+
+void RecordOwnPendingBlock(const uint256& hash, int height, const uint256& prev_hash,
+                           uint64_t cumulative_tick)
+{
+    LOCK(g_own_pending_mutex);
+    g_own_pending[hash] = OwnPendingBlock{height, prev_hash, cumulative_tick};
+    // Bound growth. An entry whose height is well below the highest recorded
+    // pending height can never again have the active tip as its parent, so it
+    // can never be eligible; drop it. (Eligibility is re-checked live anyway;
+    // this is purely to keep the map small.)
+    if (g_own_pending.size() > 64) {
+        int max_h = 0;
+        for (const auto& kv : g_own_pending) max_h = std::max(max_h, kv.second.height);
+        for (auto it = g_own_pending.begin(); it != g_own_pending.end();) {
+            if (it->second.height + 8 < max_h) it = g_own_pending.erase(it);
+            else ++it;
+        }
+    }
+}
+
+// Cumulative tick of `prev_hash`: from disk if its body is present, else from
+// the own-pending registry (a build-ahead parent still in Full validation).
+std::optional<uint64_t> GetParentCumulativeTick(ChainstateManager& chainman,
+                                                const uint256& prev_hash)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+{
+    const CBlockIndex* pprev = chainman.m_blockman.LookupBlockIndex(prev_hash);
+    if (pprev != nullptr && (pprev->nStatus & BLOCK_HAVE_DATA)) {
+        CBlock prev_blk;
+        if (chainman.m_blockman.ReadBlock(prev_blk, *pprev)) {
+            return prev_blk.cumulative_tick;
+        }
+    }
+    LOCK(g_own_pending_mutex);
+    auto it = g_own_pending.find(prev_hash);
+    if (it != g_own_pending.end()) return it->second.cumulative_tick;
+    return std::nullopt;
+}
+
+// Full eligibility check for a build-ahead parent (see block comment above).
+bool IsBuildAheadEligible(ChainstateManager& chainman, const uint256& hash)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+{
+    {
+        LOCK(g_own_pending_mutex);
+        if (g_own_pending.find(hash) == g_own_pending.end()) return false;
+    }
+    const CBlockIndex* pindex = chainman.m_blockman.LookupBlockIndex(hash);
+    if (pindex == nullptr || pindex->pprev == nullptr) return false;
+    if (pindex->pprev != chainman.ActiveChain().Tip()) return false;
+    if (pindex->nStatus & BLOCK_FAILED_MASK) return false;
+    if (g_ValidationApi == nullptr) return false;
+    // Exclude only our OWN Full_Red verdict (GetOwnFullStatus == getFull(own=true),
+    // the raw own status). An in-progress (Not_Checked/Amber) parent — the normal
+    // build-ahead state — stays eligible. The aggregate GetRequestStatus(Full)
+    // uses getFull(own=false), which maps own-Amber-with-no-peers to Full_Red
+    // (validationapi.cpp:135) and would wrongly drop A during its own validation
+    // window.
+    if (g_ValidationApi->GetOwnFullStatus(hash) ==
+        static_cast<uint8_t>(ValidationResponseValue::Full_Red)) {
+        return false;
+    }
+    ValidationResponseValue st;
+    if (!g_ValidationApi->GetRequestStatus(hash, ValidationReqType::Quick_Smell, st) ||
+        st != ValidationResponseValue::Quick_OK_Smell_OK) {
+        return false;
+    }
+    return true;
+}
+
+// Best eligible build-ahead parent among our own pending blocks. If several own
+// siblings are pending (found in the small window before build-ahead engaged),
+// pick deterministically by (cumulative_tick desc, hash asc) to mirror chain
+// selection. Returns nullptr when there is no eligible parent.
+const CBlockIndex* SelectBuildAheadParent(ChainstateManager& chainman)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+{
+    std::vector<uint256> candidates;
+    {
+        LOCK(g_own_pending_mutex);
+        candidates.reserve(g_own_pending.size());
+        for (const auto& kv : g_own_pending) candidates.push_back(kv.first);
+    }
+    const CBlockIndex* best = nullptr;
+    uint64_t best_ct = 0;
+    for (const uint256& h : candidates) {
+        if (!IsBuildAheadEligible(chainman, h)) continue;
+        uint64_t ct = 0;
+        {
+            LOCK(g_own_pending_mutex);
+            auto it = g_own_pending.find(h);
+            if (it != g_own_pending.end()) ct = it->second.cumulative_tick;
+        }
+        if (best == nullptr || ct > best_ct || (ct == best_ct && h < best->GetBlockHash())) {
+            best = chainman.m_blockman.LookupBlockIndex(h);
+            best_ct = ct;
+        }
+    }
+    return best;
+}
+
+} // namespace
 
 /**
  * Return average network hashes per second based on the last 'lookup' blocks,
@@ -512,6 +663,8 @@ static RPCHelpMan getmininginfo()
                         {RPCResult::Type::STR_HEX, "tip_hash", "Hash of the current chain tip"},
                         {RPCResult::Type::NUM_TIME, "tip_time", "Unix timestamp of the current chain tip"},
                         {RPCResult::Type::NUM, "tip_age_seconds", "Seconds elapsed since the current chain tip's nTime (used by the broker to verify template freshness)"},
+                        {RPCResult::Type::STR_HEX, "build_ahead_parent_hash", /*optional=*/true, "Hash of an own, smell-OK block one level above the tip that is still pending Full validation. When present, the broker may mint work units on it (create_mining_work_unit prev_block_hash) so the fleet mines its child rather than siblings of the current tip. Absent when there is no eligible build-ahead parent."},
+                        {RPCResult::Type::NUM, "build_ahead_parent_height", /*optional=*/true, "Height of build_ahead_parent_hash (its child would be at this height + 1). Present iff build_ahead_parent_hash is."},
                         (IsDeprecatedRPCEnabled("warnings") ?
                             RPCResult{RPCResult::Type::STR, "warnings", "any network and blockchain warnings (DEPRECATED)"} :
                             RPCResult{RPCResult::Type::ARR, "warnings", "any network and blockchain warnings (run with `-deprecatedrpc=warnings` to return the latest warning as a single string)",
@@ -565,6 +718,14 @@ static RPCHelpMan getmininginfo()
     obj.pushKV("tip_hash", tip.GetBlockHash().ToString());
     obj.pushKV("tip_time", static_cast<int64_t>(tip.nTime));
     obj.pushKV("tip_age_seconds", GetTime() - static_cast<int64_t>(tip.nTime));
+
+    // Build-ahead parent: an own, smell-OK, pending block one level above the
+    // tip that the broker may point workers at (see SelectBuildAheadParent).
+    // cs_main is held here (LOCK above), as the selector requires.
+    if (const CBlockIndex* ba = SelectBuildAheadParent(chainman)) {
+        obj.pushKV("build_ahead_parent_hash", ba->GetBlockHash().ToString());
+        obj.pushKV("build_ahead_parent_height", ba->nHeight);
+    }
 
     obj.pushKV("warnings", node::GetWarningsForRpc(*CHECK_NONFATAL(node.warnings), IsDeprecatedRPCEnabled("warnings")));
     return obj;
@@ -1339,6 +1500,12 @@ static RPCHelpMan create_mining_work_unit()
                 "Hex-encoded extranonce bytes appended to the coinbase scriptSig after the height push. "
                 "Different tags rotate the merkle root. The final scriptSig size is bounded by consensus "
                 "(coinbase scriptSig must be 2..100 bytes; the request is rejected if exceeded)."},
+            {"prev_block_hash", RPCArg::Type::STR_HEX, RPCArg::Default{""},
+                "Build-ahead: assemble a coinbase-only child of this specific parent instead of the "
+                "active tip. The parent must be the CURRENT build-ahead target advertised by "
+                "getmininginfo.build_ahead_parent_hash (own, smell-OK, pending Full validation, exactly "
+                "one level above the tip). The call FAILS CLOSED (RPC error) if it is not — there is no "
+                "silent fallback to the active tip. Omit/empty for normal active-tip mining."},
         },
         RPCResult{RPCResult::Type::OBJ, "", "",
         {
@@ -1348,6 +1515,7 @@ static RPCHelpMan create_mining_work_unit()
             {RPCResult::Type::NUM, "expires_at", "unix epoch seconds when this work unit will be evicted"},
             {RPCResult::Type::NUM, "height", "height of the block being assembled"},
             {RPCResult::Type::STR, "network", "chain name (matches request)"},
+            {RPCResult::Type::STR_HEX, "tip_hash", "hash of the block this work unit builds on (hashPrevBlock). The broker keys stale-tip lease supersession on this: when getmininginfo.tip_hash advances past it, the lease is dead."},
         }},
         RPCExamples{
             HelpExampleCli("create_mining_work_unit", "\"regtest\" \"5121...ae\" \"01\"")
@@ -1384,13 +1552,63 @@ static RPCHelpMan create_mining_work_unit()
         extranonce_bytes = ParseHexV(request.params[2], "extranonce_tag");
     }
 
-    // Assemble block via the same path JobSchedulerLoop uses (extapi.cpp:431).
-    // miner.createNewBlock acquires its own locks internally; do not hold cs_main here.
-    auto blockTemplate = miner.createNewBlock({.coinbase_output_script = payout_script});
-    if (!blockTemplate) {
-        throw JSONRPCError(RPC_INTERNAL_ERROR, "failed to assemble block");
+    // Optional build-ahead parent (params[3]).
+    std::optional<uint256> build_ahead_parent;
+    if (!request.params[3].isNull() && !request.params[3].get_str().empty()) {
+        build_ahead_parent = ParseHashV(request.params[3], "prev_block_hash");
     }
-    CBlock block = blockTemplate->getBlock();
+
+    CBlock block;
+    if (build_ahead_parent) {
+        // Fail closed unless the requested parent is EXACTLY the currently
+        // advertised best build-ahead target. Checking mere eligibility would
+        // let a non-best eligible sibling through when several own siblings are
+        // pending; the broker must build on the same parent getmininginfo
+        // advertises (SelectBuildAheadParent's deterministic winner). A silent
+        // fallback to the active tip would mint a work unit the broker wrongly
+        // believes is build-ahead. CreateNewBlock re-checks the structural
+        // invariant a second time, also under cs_main.
+        {
+            LOCK(cs_main);
+            const CBlockIndex* target = SelectBuildAheadParent(chainman);
+            if (target == nullptr || target->GetBlockHash() != *build_ahead_parent) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf(
+                    "prev_block_hash %s is not the current build-ahead target "
+                    "(must equal getmininginfo.build_ahead_parent_hash; not own-pending / "
+                    "not the best pending sibling / smell-fail / Full_Red / failed / tip moved)",
+                    build_ahead_parent->ToString()));
+            }
+        }
+        // Coinbase-only child of the pending parent. use_mempool=false and
+        // test_block_validity=false are REQUIRED (CreateNewBlock enforces both):
+        // the parent's UTXO set is not the active coins view. We call
+        // BlockAssembler directly because test_block_validity lives on
+        // BlockAssembler::Options, not the public BlockCreateOptions / Cap'n
+        // Proto mining interface. The mempool pointer is ignored when
+        // use_mempool=false, so pass the node's (possibly null) handle directly.
+        BlockAssembler::Options opts;
+        opts.coinbase_output_script = payout_script;
+        opts.use_mempool = false;
+        opts.test_block_validity = false;
+        opts.prev_block_hash = build_ahead_parent;
+        // BlockAssembler::CreateNewBlock returns the raw node::CBlockTemplate
+        // (with a `.block` member), NOT the interfaces::BlockTemplate wrapper
+        // that miner.createNewBlock returns (whose accessor is getBlock()).
+        auto blockTemplate = BlockAssembler(chainman.ActiveChainstate(),
+                                            node.mempool.get(), opts).CreateNewBlock();
+        if (!blockTemplate) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR, "failed to assemble build-ahead block");
+        }
+        block = blockTemplate->block;
+    } else {
+        // Assemble block via the same path JobSchedulerLoop uses (extapi.cpp:431).
+        // miner.createNewBlock acquires its own locks internally; do not hold cs_main here.
+        auto blockTemplate = miner.createNewBlock({.coinbase_output_script = payout_script});
+        if (!blockTemplate) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR, "failed to assemble block");
+        }
+        block = blockTemplate->getBlock();
+    }
 
     if (block.vtx.empty() || block.vtx[0]->vin.empty()) {
         throw JSONRPCError(RPC_INTERNAL_ERROR, "assembled block has no coinbase input");
@@ -1435,6 +1653,17 @@ static RPCHelpMan create_mining_work_unit()
         block.hashMerkleRoot = BlockMerkleRoot(block);
     }
 
+    // Build-ahead: the parent's body is not on disk, so CreateNewBlock could not
+    // ReadBlock its cumulative_tick and left it at 0. Fix it from the own-pending
+    // registry so the stored work-unit block carries the right cumulative work.
+    // (The active-tip path already has the correct value from CreateNewBlock.)
+    if (build_ahead_parent) {
+        LOCK(cs_main);
+        if (auto parent_ct = GetParentCumulativeTick(chainman, block.hashPrevBlock)) {
+            block.cumulative_tick = *parent_ct + block.pow.tick;
+        }
+    }
+
     // Register in broker tracker -> mint req_id.
     const uint32_t req_id = g_broker_work_units.incrementAndStore(block);
 
@@ -1460,6 +1689,15 @@ static RPCHelpMan create_mining_work_unit()
     result.pushKV("expires_at", expires_at);
     result.pushKV("height", height);
     result.pushKV("network", actual_chain);
+    // The tip this work unit builds on. createNewBlock assembled `block` on
+    // the active chain tip (miner.cpp:167), so hashPrevBlock IS that tip. The
+    // broker stores this as lease.tip_hash and supersedes the lease when
+    // getmininginfo.tip_hash (the active tip) no longer matches. Omitting it —
+    // as this RPC did originally — left the broker with an empty tip_hash,
+    // which its supersede filter silently skips (mining_scheduler.py:914), so
+    // stale-tip leases were never proactively closed and workers kept grinding
+    // the parent until their result-timeout.
+    result.pushKV("tip_hash", block.hashPrevBlock.ToString());
     return result;
 },
     };
@@ -1564,19 +1802,20 @@ static RPCHelpMan submit_mining_response()
     // otherwise the stored block carries stale (zero) values.
     int next_height = 0;
     {
-        const CBlockIndex* prev_index = WITH_LOCK(::cs_main,
-            return chainman.m_blockman.LookupBlockIndex(block.hashPrevBlock));
+        LOCK(::cs_main);
+        const CBlockIndex* prev_index = chainman.m_blockman.LookupBlockIndex(block.hashPrevBlock);
         next_height = prev_index ? prev_index->nHeight + 1 : 0;
         const bool use_merkle = chainman.GetConsensus().IsVdfSpvActive(next_height);
         block.hashPoW = block.pow.GetCommitment(use_merkle);
 
-        if (prev_index != nullptr) {
-            CBlock prev_blk;
-            if (chainman.m_blockman.ReadBlock(prev_blk, *prev_index)) {
-                block.cumulative_tick = prev_blk.cumulative_tick + block.pow.tick;
-            } else {
-                block.cumulative_tick = block.pow.tick;
-            }
+        // Parent cumulative_tick from disk when available, else from the
+        // own-pending registry. The latter matters when THIS block's parent is
+        // itself a build-ahead block still in Full validation (its body is not
+        // on disk): without the read-through, a child submitted during that
+        // window would compute cumulative_tick = tick only and connect with
+        // the wrong cumulative work.
+        if (auto parent_ct = GetParentCumulativeTick(chainman, block.hashPrevBlock)) {
+            block.cumulative_tick = *parent_ct + block.pow.tick;
         } else {
             block.cumulative_tick = block.pow.tick;
         }
@@ -1631,8 +1870,33 @@ static RPCHelpMan submit_mining_response()
     // (sc->found=false) AND the external validation API owns it. A *synchronous*
     // reject sets sc->found and must NOT be treated as in-flight — otherwise a
     // genuine local reject would be mis-reported as accepted_pending_connect.
-    const bool async_validation_in_flight =
-        !sc->found && chainman.GetConsensus().external_api;
+    //
+    // Use the SAME effective external-validation predicate as ProcessNewBlock
+    // (validation.cpp:9153-9155): the raw consensus flag OR the mock harness's
+    // -mockval-force-external. Production is byte-identical to external_api (the
+    // mock flag is a test-only mode); this only makes the pending classification
+    // consistent under the mock validation API so build-ahead's real pending
+    // behaviour (own-pending registration) is exercisable on regtest.
+    const bool has_mock_validation =
+        g_ValidationApi && g_ValidationApi->UsesRequestStatusForBlockProcessing();
+    const bool force_mock_external =
+        has_mock_validation && gArgs.GetBoolArg("-mockval-force-external", false);
+    const bool use_external_validation =
+        chainman.GetConsensus().external_api || force_mock_external;
+    const bool async_validation_in_flight = !sc->found && use_external_validation;
+
+    // Build-ahead: the moment our own block is accepted-but-pending (header in
+    // the tree, Full validation kicked off, body not yet connected), record it
+    // so getmininginfo can advertise it as a build-ahead parent IMMEDIATELY —
+    // i.e. while THIS RPC is still blocked in the ~45s poll loop below.
+    // Registering only after the RPC returns would burn most of the window in
+    // which the fleet could already be mining A's child instead of siblings.
+    // Eligibility (own + pprev==tip + smell-OK + not failed/Full_Red) is
+    // re-checked live by the selector, so recording generously here is safe.
+    if (async_validation_in_flight || (accepted && !block_active_with_data())) {
+        RecordOwnPendingBlock(block_hash, next_height, blockPtr->hashPrevBlock,
+                              blockPtr->cumulative_tick);
+    }
 
     // Synchronous accept: ProcessNewBlock connected the block into the tree
     // in-line. Decide immediately — there is no async verdict pending. If it is
