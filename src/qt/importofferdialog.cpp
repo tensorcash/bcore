@@ -6,6 +6,7 @@
 #include <qt/bridgesessionmanager.h>
 #include <qt/walletmodel.h>
 #include <qt/reviewofferdialog.h>
+#include <qt/reviewcontractofferdialog.h>
 #include <qt/opencontractdialog.h>
 
 #include <QVBoxLayout>
@@ -305,6 +306,27 @@ bool ImportOfferDialog::validateAndImportOffer(const QString& json)
     }
 
     QJsonObject obj = doc.object();
+
+    // Bilateral-CFD term sheets (difficulty / scalar-feed) are schema-tagged wrappers that embed the signed
+    // offer, not raw contract_type offers. Route them straight to the review dialog, which detects the
+    // schema, renders the embedded offer, and runs the local accept ceremony. This is the out-of-band
+    // acceptor's entry (these products have no order-book / bulletin-board posting).
+    const QString schema = obj.value("schema").toString();
+    if (schema == QLatin1String("difficulty_term_sheet_v1") || schema == QLatin1String("scalarcfd_term_sheet_v1")) {
+        QVariantMap reviewOfferData;
+        reviewOfferData["term_sheet_json"] = json;
+        reviewOfferData["maker_role"] = obj.value("maker_role").toString();
+        reviewOfferData["is_term_sheet"] = true;
+        contractType = (schema == QLatin1String("scalarcfd_term_sheet_v1")) ? QStringLiteral("scalarcfd")
+                                                                            : QStringLiteral("difficulty");
+        offerJson = json;
+        ReviewContractOfferDialog reviewDialog(reviewOfferData, walletModel, this);
+        // The dialog detects the schema, renders the embedded offer, and runs the local accept ceremony
+        // (reporting its own success/failure). Return true only if the user accepted, so onImport() closes
+        // this dialog only on a real acceptance and leaves it open if they cancelled the review.
+        return reviewDialog.exec() == QDialog::Accepted;
+    }
+
     QString type = obj.value("contract_type").toString();
 
     if (type.isEmpty()) {
@@ -353,6 +375,26 @@ bool ImportOfferDialog::validateAndImportOffer(const QString& json)
         QMessageBox::information(this, tr("Coming Soon"),
             tr("Spot contract import will be available in Phase 7."));
         return false;
+
+    } else if (type == "scalar-cfd") {
+        // A RAW scalar-feed CFD offer (not the term-sheet wrapper). Wrap it into a synthetic
+        // scalarcfd_term_sheet_v1 carrying the offer bytes verbatim under offer_raw (so the uint64 fixing_ref
+        // is preserved — see the builder), then route to the review dialog's local accept ceremony. This lets
+        // a counterparty who was handed the raw "Offer JSON" accept it in-app, not just the term sheet.
+        QJsonObject ts;
+        ts["schema"] = QStringLiteral("scalarcfd_term_sheet_v1");
+        ts["maker_role"] = obj.value("proposer_role").toString();
+        ts["offer_raw"] = json;  // exact raw offer bytes
+        const QString tsJson = QString::fromUtf8(QJsonDocument(ts).toJson(QJsonDocument::Compact));
+
+        QVariantMap reviewOfferData;
+        reviewOfferData["term_sheet_json"] = tsJson;
+        reviewOfferData["maker_role"] = obj.value("proposer_role").toString();
+        reviewOfferData["is_term_sheet"] = true;
+        contractType = QStringLiteral("scalarcfd");
+        offerJson = json;
+        ReviewContractOfferDialog reviewDialog(reviewOfferData, walletModel, this);
+        return reviewDialog.exec() == QDialog::Accepted;
 
     } else {
         QMessageBox::critical(this, tr("Unknown Contract Type"),

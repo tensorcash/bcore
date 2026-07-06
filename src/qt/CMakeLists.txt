@@ -253,6 +253,8 @@ if(ENABLE_WALLET)
       spotcontractbuilder.h
       difficultycontractbuilder.cpp
       difficultycontractbuilder.h
+      scalarcfdcontractbuilder.cpp
+      scalarcfdcontractbuilder.h
       crosschaincontractbuilder.cpp
       crosschaincontractbuilder.h
       crosschainprofiledialog.cpp

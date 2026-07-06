@@ -5227,6 +5227,35 @@ QList<QVariantMap> WalletModel::listContracts()
                     contract["short_settled"] = contractObj["short_settled"].get_bool();
                 }
 
+                // Extract scalar-feed bilateral CFD fields (type == "scalarcfd"). Shares the vault/open/
+                // settled/settle_lock keys above; only its feed-specific terms + legs are flattened here to
+                // scfd_* to avoid colliding with the difficulty diff_* / forward long_margin_* keys. IMs are
+                // in the collateral's units (kept as-is, not TSC-scaled).
+                if (contractObj.exists("feed_id")) {
+                    contract["scfd_feed_id"] = contractObj["feed_id"].getInt<int>();
+                }
+                if (contractObj.exists("fixing_ref")) {
+                    contract["scfd_fixing_ref"] = static_cast<qulonglong>(contractObj["fixing_ref"].getInt<int64_t>());
+                }
+                if (contractObj.exists("strike")) {
+                    contract["scfd_strike"] = QString::fromStdString(contractObj["strike"].get_str());
+                }
+                if (contractObj.exists("publication_deadline_height")) {
+                    contract["scfd_publication_deadline_height"] = contractObj["publication_deadline_height"].getInt<int>();
+                }
+                if (contract.value("type").toString() == "scalarcfd") {
+                    if (contractObj.exists("long_leg") && contractObj["long_leg"].isObject()) {
+                        const UniValue& ll = contractObj["long_leg"];
+                        if (ll.exists("im")) contract["scfd_long_im"] = ll["im"].get_real();
+                        if (ll.exists("lambda")) contract["scfd_long_lambda"] = ll["lambda"].get_real();
+                    }
+                    if (contractObj.exists("short_leg") && contractObj["short_leg"].isObject()) {
+                        const UniValue& sl = contractObj["short_leg"];
+                        if (sl.exists("im")) contract["scfd_short_im"] = sl["im"].get_real();
+                        if (sl.exists("lambda")) contract["scfd_short_lambda"] = sl["lambda"].get_real();
+                    }
+                }
+
                 // Detect option contracts: forwards with non-zero premium
                 // Options are registered as "forward" in the backend, but we need to distinguish them in the UI
                 if (contract.value("type").toString() == "forward") {

@@ -32,12 +32,18 @@
 #include <QLineEdit>
 #include <QInputDialog>
 #include <QRegularExpression>
+#include <QComboBox>
+#include <QPlainTextEdit>
+#include <QFormLayout>
+#include <QPushButton>
 #include <QClipboard>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonParseError>
 #include <QByteArray>
+
+#include <cmath>
 #include <algorithm>
 
 namespace {
@@ -369,6 +375,18 @@ public:
             } else {
                 return;  // "settled" (or unknown): no live legs to act on
             }
+        } else if (rawTypeLower == "scalarcfd") {
+            // Scalar-feed CFD: once accepted the two-party open PSBT flow (and record-open) is available;
+            // once opened/partially_settled the "Actions ▼" menu offers unilateral Settle and Coop Close.
+            if (statusLower == "accepted") {
+                buttonText = tr("Actions ▼");        // Build open PSBT / Record open
+                buttonColor = QColor(33, 150, 243);  // Blue
+            } else if (statusLower == "opened" || statusLower == "partially_settled") {
+                buttonText = tr("Actions ▼");        // Settle leg / Cooperative close
+                buttonColor = QColor(76, 175, 80);   // Green
+            } else {
+                return;  // "settled" (or unknown): no live legs to act on
+            }
         } else {
             // Spot contracts (atomic swaps) have no lifecycle actions after acceptance
             // Unknown contract types also have no actions
@@ -448,6 +466,44 @@ public:
                                                              d.value("short_settled").toBool());
                         } else if (actBox.clickedButton() == coopBtn) {
                             changed = handleDifficultyCoopClose(contractId, d);
+                        }
+                    }
+                    if (changed) {
+                        if (auto* rm = qobject_cast<ContractRegistryModel*>(model)) rm->refresh();
+                    }
+                } else if (rawTypeLower == "scalarcfd") {
+                    const QString statusLower = index.sibling(index.row(), ContractRegistryModel::Status).data().toString().toLower();
+                    const QVariantMap d = index.data(ContractRegistryModel::ContractDataRole).toMap();
+                    const QString role = index.sibling(index.row(), ContractRegistryModel::Role).data().toString();
+                    QWidget* p = qobject_cast<QWidget*>(QApplication::activeWindow());
+                    bool changed = false;
+                    if (statusLower == "accepted") {
+                        // Two-party open PSBT flow, then record-open once broadcast.
+                        QMessageBox actBox(p);
+                        actBox.setWindowTitle(tr("Scalar CFD Actions"));
+                        actBox.setText(tr("Choose an action for this scalar-feed CFD:"));
+                        QPushButton* openBtn = actBox.addButton(tr("Open (build/continue PSBT)"), QMessageBox::AcceptRole);
+                        QPushButton* recBtn = actBox.addButton(tr("Record Open (txid)"), QMessageBox::ActionRole);
+                        actBox.addButton(QMessageBox::Cancel);
+                        actBox.exec();
+                        if (actBox.clickedButton() == openBtn) {
+                            changed = handleScalarCfdOpen(contractId, role);
+                        } else if (actBox.clickedButton() == recBtn) {
+                            changed = handleScalarCfdRecordOpen(contractId, QString());
+                        }
+                    } else if (statusLower == "opened" || statusLower == "partially_settled") {
+                        QMessageBox actBox(p);
+                        actBox.setWindowTitle(tr("Scalar CFD Actions"));
+                        actBox.setText(tr("Choose an action for this scalar-feed CFD:"));
+                        QPushButton* settleBtn = actBox.addButton(tr("Settle Leg (unilateral)"), QMessageBox::AcceptRole);
+                        QPushButton* coopBtn = actBox.addButton(tr("Cooperative Close (2-of-2)"), QMessageBox::ActionRole);
+                        actBox.addButton(QMessageBox::Cancel);
+                        actBox.exec();
+                        if (actBox.clickedButton() == settleBtn) {
+                            changed = handleScalarCfdSettle(contractId, d.value("long_settled").toBool(),
+                                                            d.value("short_settled").toBool());
+                        } else if (actBox.clickedButton() == coopBtn) {
+                            changed = handleScalarCfdCoopClose(contractId, d);
                         }
                     }
                     if (changed) {
@@ -754,6 +810,369 @@ private:
                 tr("Failed to broadcast the cooperative close:\n\n%1").arg(QString::fromStdString(e.what())));
             return false;
         }
+    }
+
+    // ===== Scalar-feed CFD (bilateral) Book handlers — the difficulty sibling ==========================
+    // scalarcfd.* takes a bool isShort rather than a leg string; the OPEN is a genuine two-party multi-round
+    // PSBT exchange (unlike difficulty's txid-only record_open), so it has its own build/sign/broadcast dialog.
+
+    // Multi-round two-party open: scalarcfd.build_open funds THIS party's vault leg, optionally augmenting the
+    // counterparty's prior partial PSBT. Party A builds its leg (no prior), signs, hands the PSBT over; party B
+    // augments with the prior PSBT; when both legs are signed the tx is a normal funding tx -> finalize +
+    // broadcast, then BOTH parties record_open(txid).
+    bool handleScalarCfdOpen(const QString& contractId, const QString& role) const
+    {
+        if (!walletModel) return false;
+        QWidget* parent = qobject_cast<QWidget*>(QApplication::activeWindow());
+
+        QDialog dlg(parent);
+        dlg.setWindowTitle(tr("Open Scalar CFD"));
+        dlg.setModal(true);
+        dlg.setMinimumWidth(560);
+        QVBoxLayout* layout = new QVBoxLayout(&dlg);
+        QLabel* intro = new QLabel(tr(
+            "Fund your leg's vault. If your counterparty already built + signed their leg, paste their PSBT "
+            "below to augment it; otherwise leave it blank to start. When both legs are signed the open is "
+            "broadcast, and both parties then Record Open with the resulting txid."), &dlg);
+        intro->setWordWrap(true);
+        layout->addWidget(intro);
+
+        QFormLayout* form = new QFormLayout();
+        QComboBox* legCombo = new QComboBox(&dlg);
+        legCombo->addItem(tr("long"));
+        legCombo->addItem(tr("short"));
+        legCombo->setCurrentIndex(role.toLower() == QLatin1String("short") ? 1 : 0);
+        form->addRow(tr("Your leg:"), legCombo);
+        QLineEdit* feeEdit = new QLineEdit(&dlg);
+        feeEdit->setPlaceholderText(tr("fee rate sat/vB (optional)"));
+        form->addRow(tr("Fee rate:"), feeEdit);
+        QPlainTextEdit* priorEdit = new QPlainTextEdit(&dlg);
+        priorEdit->setPlaceholderText(tr("counterparty partial open PSBT (leave blank to start)"));
+        priorEdit->setMinimumHeight(70);
+        form->addRow(tr("Prior PSBT:"), priorEdit);
+        layout->addLayout(form);
+
+        QDialogButtonBox* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+        buttons->button(QDialogButtonBox::Ok)->setText(tr("Build + Sign My Leg"));
+        layout->addWidget(buttons);
+        QObject::connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+        QObject::connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+        if (dlg.exec() != QDialog::Accepted) return false;
+
+        const bool isShort = legCombo->currentIndex() == 1;
+        const QString priorPsbt = priorEdit->toPlainText().trimmed();
+        // A supplied prior PSBT means this wallet is the SECOND party augmenting the counterparty's already-
+        // funded leg, so the resulting tx funds BOTH vaults and may be broadcast. Without a prior, build_open
+        // funds only THIS wallet's single leg (scalar_cfd.cpp: one vault), and that partial can come back
+        // walletprocesspsbt-"complete" (all of this party's own inputs signed) — but broadcasting it would
+        // publish a one-leg tx that record_open cannot bind. So the first party must ALWAYS hand off, never
+        // broadcast, regardless of the complete flag.
+        const bool hadPrior = !priorPsbt.isEmpty();
+        double fr = 0.0;
+        const QString feeText = feeEdit->text().trimmed();
+        if (!feeText.isEmpty()) {
+            bool okfr = false; fr = feeText.toDouble(&okfr);
+            if (!okfr || !std::isfinite(fr) || fr <= 0.0) {
+                QMessageBox::warning(parent, tr("Open"), tr("Invalid fee rate.")); return false;
+            }
+        }
+
+        WalletModel::ScalarCfdOpenResult built =
+            walletModel->scalarCfdBuildOpen(contractId, isShort, priorPsbt, fr);
+        if (!built.success) {
+            QMessageBox::critical(parent, tr("Open Failed"),
+                tr("Failed to build the open for the %1 leg:\n\n%2")
+                    .arg(isShort ? tr("short") : tr("long"), built.error));
+            return false;
+        }
+
+        // Sign this wallet's inputs; only the AUGMENTING party (prior supplied) may finalize + broadcast a
+        // now-complete PSBT — that tx funds both legs. The first party always hands its partial off.
+        WalletModel::WalletProcessPsbtResult processed =
+            walletModel->walletProcessPsbt(built.psbt, /*sign=*/true, /*sighash=*/QString(),
+                                           /*bip32derivs=*/true, /*finalize=*/false);
+        if (!processed.success) {
+            QMessageBox::critical(parent, tr("Open Failed"),
+                tr("Failed to sign your open inputs:\n\n%1").arg(processed.error));
+            return false;
+        }
+
+        if (processed.complete && hadPrior) {
+            // Both legs signed: finalize + broadcast the funding tx (a normal tx, so finalizepsbt — NOT the
+            // covenant-specific scalarcfd.finalize_settlement), then offer to record the open now.
+            try {
+                const std::string wname = walletModel->getWalletName().toStdString();
+                UniValue fp(UniValue::VARR); fp.push_back(processed.psbt.toStdString());
+                UniValue fres = walletModel->node().executeRpc("finalizepsbt", fp, wname);
+                if (!(fres.exists("complete") && fres["complete"].get_bool() && fres.exists("hex"))) {
+                    QMessageBox::warning(parent, tr("Open"),
+                        tr("The open PSBT is fully signed but did not finalize; finalize + broadcast it manually."));
+                    return false;
+                }
+                UniValue sp(UniValue::VARR); sp.push_back(fres["hex"].get_str());
+                const QString txid = QString::fromStdString(
+                    walletModel->node().executeRpc("sendrawtransaction", sp, wname).get_str());
+                QMessageBox done(parent);
+                done.setIcon(QMessageBox::Information);
+                done.setWindowTitle(tr("Open Broadcast"));
+                done.setText(tr("The open was broadcast.\n\nTxid: %1\n\nRecord Open in BOTH wallets to bind the "
+                                "funded vaults.").arg(txid));
+                QPushButton* recordBtn = done.addButton(tr("Record Open Now"), QMessageBox::AcceptRole);
+                done.addButton(QMessageBox::Close);
+                done.exec();
+                if (done.clickedButton() == recordBtn) {
+                    return handleScalarCfdRecordOpen(contractId, txid);
+                }
+                return false; // recorded separately; no state change until record_open
+            } catch (const UniValue& e) {
+                QMessageBox::critical(parent, tr("Broadcast Failed"),
+                    tr("Failed to broadcast the open:\n\n%1").arg(QString::fromStdString(e.write())));
+                return false;
+            } catch (const std::exception& e) {
+                QMessageBox::critical(parent, tr("Broadcast Failed"),
+                    tr("Failed to broadcast the open:\n\n%1").arg(QString::fromStdString(e.what())));
+                return false;
+            }
+        }
+
+        // Partial: hand the half-built PSBT to the counterparty to augment + co-sign.
+        QMessageBox box(parent);
+        box.setWindowTitle(tr("Open — Your Leg Signed"));
+        box.setIcon(QMessageBox::Information);
+        box.setText(tr("Built + signed your %1 leg (vout %2). Send this PSBT to the counterparty to augment "
+                       "their leg and broadcast; then Record Open in both wallets.")
+                       .arg(built.leg).arg(built.vault_index));
+        box.setDetailedText(processed.psbt);
+        QPushButton* copyBtn = box.addButton(tr("Copy PSBT"), QMessageBox::ActionRole);
+        box.addButton(QMessageBox::Close);
+        box.exec();
+        if (box.clickedButton() == copyBtn) {
+            QClipboard* cb = QApplication::clipboard();
+            if (cb) cb->setText(processed.psbt);
+        }
+        return false;
+    }
+
+    // Bind the funded vault(s) from the broadcast open txid. txidIn prefills from a just-broadcast open;
+    // empty prompts interactively.
+    bool handleScalarCfdRecordOpen(const QString& contractId, const QString& txidIn) const
+    {
+        if (!walletModel) return false;
+        QWidget* parent = qobject_cast<QWidget*>(QApplication::activeWindow());
+        QString txid = txidIn.trimmed();
+        if (txid.isEmpty()) {
+            bool ok = false;
+            txid = QInputDialog::getText(parent, tr("Record Scalar CFD Open"),
+                tr("Enter the broadcast open transaction id that funded this contract's vault(s):"),
+                QLineEdit::Normal, QString(), &ok).trimmed();
+            if (!ok || txid.isEmpty()) return false;
+        }
+        static const QRegularExpression hexRe(QStringLiteral("^[0-9a-fA-F]{64}$"));
+        if (!hexRe.match(txid).hasMatch()) {
+            QMessageBox::warning(parent, tr("Record Open"),
+                tr("That does not look like a 64-character transaction id."));
+            return false;
+        }
+        WalletModel::ScalarCfdRecordOpenResult res = walletModel->scalarCfdRecordOpen(contractId, txid);
+        if (!res.success) {
+            QMessageBox::critical(parent, tr("Record Open Failed"),
+                tr("Failed to record the open transaction:\n\n%1").arg(res.error));
+            return false;
+        }
+        QMessageBox::information(parent, tr("Open Recorded"),
+            tr("The funded vault(s) for contract %1 were recorded; it is now marked opened.")
+                .arg(contractId.left(16) + "..."));
+        return true;
+    }
+
+    // Unilateral covenant settlement of one live scalar leg: build_settlement -> sign the keeper fee input
+    // -> scalarcfd.finalize_settlement (NOT finalizepsbt, which re-verifies the covenant leaf) -> broadcast.
+    bool handleScalarCfdSettle(const QString& contractId, bool longSettled, bool shortSettled) const
+    {
+        if (!walletModel) return false;
+        QWidget* parent = qobject_cast<QWidget*>(QApplication::activeWindow());
+
+        QStringList legs;
+        if (!longSettled) legs << QStringLiteral("long");
+        if (!shortSettled) legs << QStringLiteral("short");
+        if (legs.isEmpty()) {
+            QMessageBox::information(parent, tr("Nothing to Settle"),
+                tr("Both legs of this contract have already been settled."));
+            return false;
+        }
+        QString leg = legs.first();
+        if (legs.size() > 1) {
+            bool ok = false;
+            leg = QInputDialog::getItem(parent, tr("Settle Scalar CFD Leg"),
+                tr("Which leg's IM vault do you want to settle?"), legs, 0, false, &ok);
+            if (!ok) return false;
+        }
+        const bool isShort = (leg == QLatin1String("short"));
+
+        WalletModel::ScalarCfdSettlementResult built = walletModel->scalarCfdBuildSettlement(contractId, isShort, 0.0);
+        if (!built.success) {
+            QMessageBox::critical(parent, tr("Settlement Failed"),
+                tr("Failed to build the settlement for the %1 leg:\n\n%2").arg(leg, built.error));
+            return false;
+        }
+        const QString summary = tr("Settle the %1 leg of contract %2?\n\n"
+                                   "Owner payout: %3\nCounterparty payout: %4\nKeeper fee: %5%6")
+            .arg(leg, contractId.left(16) + "...", built.payout_owner, built.payout_cp, built.fee)
+            .arg(built.is_fallback ? tr("\n(using the fallback scalar)") : QString());
+        if (QMessageBox::question(parent, tr("Confirm Settlement"), summary,
+                                  QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes) {
+            return false;
+        }
+
+        // Sign only the keeper's fee input; the vault input is already finalized signatureless by
+        // build_settlement, so do NOT finalize here — use scalarcfd.finalize_settlement to extract.
+        WalletModel::WalletProcessPsbtResult processed =
+            walletModel->walletProcessPsbt(built.psbt, /*sign=*/true, /*sighash=*/QString(),
+                                           /*bip32derivs=*/true, /*finalize=*/false);
+        if (!processed.success) {
+            QMessageBox::critical(parent, tr("Settlement Failed"),
+                tr("Failed to sign the settlement fee input:\n\n%1").arg(processed.error));
+            return false;
+        }
+        WalletModel::ScalarCfdFinalizeResult finalized = walletModel->scalarCfdFinalizeSettlement(processed.psbt);
+        if (!finalized.success || finalized.hex.isEmpty()) {
+            QMessageBox::critical(parent, tr("Settlement Failed"),
+                tr("Failed to extract the settlement transaction:\n\n%1").arg(finalized.error));
+            return false;
+        }
+        try {
+            UniValue params(UniValue::VARR);
+            params.push_back(finalized.hex.toStdString());
+            UniValue txidVal = walletModel->node().executeRpc("sendrawtransaction", params, "");
+            const QString txid = QString::fromStdString(txidVal.isStr() ? txidVal.get_str() : txidVal.write());
+            QMessageBox::information(parent, tr("Settlement Broadcast"),
+                tr("The %1 leg settled. Transaction id:\n\n%2").arg(leg, txid));
+            return true;
+        } catch (const UniValue& e) {
+            QMessageBox::critical(parent, tr("Broadcast Failed"),
+                tr("Failed to broadcast the settlement transaction:\n\n%1").arg(QString::fromStdString(e.write())));
+            return false;
+        } catch (const std::exception& e) {
+            QMessageBox::critical(parent, tr("Broadcast Failed"),
+                tr("Failed to broadcast the settlement transaction:\n\n%1").arg(QString::fromStdString(e.what())));
+            return false;
+        }
+    }
+
+    // Cooperative close of one live scalar leg (2-of-2). Propose (build + sign half, export) vs Co-sign.
+    bool handleScalarCfdCoopClose(const QString& contractId, const QVariantMap& d) const
+    {
+        if (!walletModel) return false;
+        QWidget* parent = qobject_cast<QWidget*>(QApplication::activeWindow());
+        const bool longSettled = d.value("long_settled").toBool();
+        const bool shortSettled = d.value("short_settled").toBool();
+
+        QStringList legs;
+        if (!longSettled) legs << QStringLiteral("long");
+        if (!shortSettled) legs << QStringLiteral("short");
+        if (legs.isEmpty()) {
+            QMessageBox::information(parent, tr("Nothing to Close"), tr("Both legs have already been settled/closed."));
+            return false;
+        }
+        QString leg = legs.first();
+        if (legs.size() > 1) {
+            bool ok = false;
+            leg = QInputDialog::getItem(parent, tr("Cooperative Close Leg"),
+                tr("Which leg's IM vault do you want to cooperatively close?"), legs, 0, false, &ok);
+            if (!ok) return false;
+        }
+        const bool isShort = (leg == QLatin1String("short"));
+
+        QMessageBox modeBox(parent);
+        modeBox.setWindowTitle(tr("Cooperative Close"));
+        modeBox.setText(tr("A cooperative close needs BOTH parties to sign the 2-of-2 leaf.\n\n"
+                           "Propose: enter the agreed split, sign your half, and hand the PSBT to the counterparty.\n"
+                           "Co-sign: paste the counterparty's PSBT to add your half and broadcast."));
+        QPushButton* proposeBtn = modeBox.addButton(tr("Propose"), QMessageBox::AcceptRole);
+        QPushButton* cosignBtn = modeBox.addButton(tr("Co-sign Partner PSBT"), QMessageBox::ActionRole);
+        modeBox.addButton(QMessageBox::Cancel);
+        modeBox.exec();
+        if (modeBox.clickedButton() == proposeBtn) return scalarCoopPropose(contractId, isShort, leg);
+        if (modeBox.clickedButton() == cosignBtn) return scalarCoopCosign(contractId, isShort, leg);
+        return false;
+    }
+
+    bool scalarCoopPropose(const QString& contractId, bool isShort, const QString& leg) const
+    {
+        QWidget* parent = qobject_cast<QWidget*>(QApplication::activeWindow());
+        bool ok = false;
+        const QString text = QInputDialog::getMultiLineText(parent, tr("Cooperative Close — Agreed Outputs"),
+            tr("Leg: %1.\n\nEnter the agreed outputs, one per line as:\n\n  <address> <amount-TSC>\n\n"
+               "The total must be ≤ the vault value; the remainder is the fee.").arg(leg), QString(), &ok);
+        if (!ok || text.trimmed().isEmpty()) return false;
+
+        // scalarcfd.build_coop_close takes amounts in sats (qint64); collect TSC and convert.
+        QList<QPair<QString, qint64>> outputs;
+        for (const QString& rawLine : text.split('\n', Qt::SkipEmptyParts)) {
+            const QString line = rawLine.trimmed();
+            if (line.isEmpty()) continue;
+            const QStringList parts = line.split(QRegularExpression("\\s+"), Qt::SkipEmptyParts);
+            bool amtOk = false;
+            const double amt = parts.size() == 2 ? parts[1].toDouble(&amtOk) : 0.0;
+            if (parts.size() != 2 || !amtOk || !std::isfinite(amt) || amt <= 0.0 || amt > 21000000.0) {
+                QMessageBox::warning(parent, tr("Invalid Output"),
+                    tr("Each line must be '<address> <amount>' with 0 < amount ≤ 21,000,000:\n\n%1").arg(line));
+                return false;
+            }
+            outputs.append({parts[0], static_cast<qint64>(qRound64(amt * 100000000.0))});
+        }
+        if (outputs.isEmpty()) return false;
+
+        WalletModel::ScalarCfdCoopCloseResult built = walletModel->scalarCfdBuildCoopClose(contractId, isShort, outputs);
+        if (!built.success) {
+            QMessageBox::critical(parent, tr("Cooperative Close Failed"),
+                tr("Failed to build the cooperative-close PSBT:\n\n%1").arg(built.error));
+            return false;
+        }
+        WalletModel::ScalarCfdSignCoopResult half = walletModel->scalarCfdSignCoop(contractId, isShort, built.psbt);
+        if (!half.success) {
+            QMessageBox::critical(parent, tr("Cooperative Close Failed"),
+                tr("Failed to sign your half of the cooperative close:\n\n%1").arg(half.error));
+            return false;
+        }
+        if (half.complete && !half.hex.isEmpty()) {
+            return coopBroadcast(half.hex);  // single-party controls both cosign keys
+        }
+        QMessageBox box(parent);
+        box.setWindowTitle(tr("Cooperative Close — Your Half Signed"));
+        box.setIcon(QMessageBox::Information);
+        box.setText(tr("Your half of the 2-of-2 is signed. Send this PSBT to the counterparty; they Co-sign it "
+                       "and broadcast."));
+        box.setDetailedText(half.psbt);
+        QPushButton* copyBtn = box.addButton(tr("Copy PSBT"), QMessageBox::ActionRole);
+        box.addButton(QMessageBox::Close);
+        box.exec();
+        if (box.clickedButton() == copyBtn) {
+            QClipboard* cb = QApplication::clipboard();
+            if (cb) cb->setText(half.psbt);
+        }
+        return false;
+    }
+
+    bool scalarCoopCosign(const QString& contractId, bool isShort, const QString& leg) const
+    {
+        QWidget* parent = qobject_cast<QWidget*>(QApplication::activeWindow());
+        bool ok = false;
+        const QString psbt = QInputDialog::getMultiLineText(parent, tr("Co-sign Cooperative Close"),
+            tr("Paste the counterparty's cooperative-close PSBT for the %1 leg:").arg(leg), QString(), &ok).trimmed();
+        if (!ok || psbt.isEmpty()) return false;
+        WalletModel::ScalarCfdSignCoopResult done = walletModel->scalarCfdSignCoop(contractId, isShort, psbt);
+        if (!done.success) {
+            QMessageBox::critical(parent, tr("Cooperative Close Failed"),
+                tr("Failed to add your signature:\n\n%1").arg(done.error));
+            return false;
+        }
+        if (!done.complete || done.hex.isEmpty()) {
+            QMessageBox::warning(parent, tr("Not Fully Signed"),
+                tr("The PSBT is still not complete after adding your half. Both parties must sign the same PSBT."));
+            return false;
+        }
+        return coopBroadcast(done.hex);
     }
 
     void handleRepay(const QString& contractId, const QString& contractRole) const

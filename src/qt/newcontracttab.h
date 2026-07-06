@@ -43,6 +43,7 @@ private Q_SLOTS:
     void onContractTypeChanged();
     void onCreateContract();
     void onImportOffer();
+    void onImportScalarCfdAcceptance();
 
 private:
     void setupUI();
@@ -51,7 +52,12 @@ private:
     void launchOptionsWizard();
     void launchSpotWizard();
     void launchDifficultyWizard();
+    void launchScalarCfdWizard();
     void showImportOfferDialog();
+    // Proposer-side step: import the counterparty's acceptance JSON for a scalar-feed CFD offer this wallet
+    // proposed, which registers the contract locally so it appears in the Book. Reachable both right after
+    // propose and later via the persistent "Import Scalar Acceptance" button.
+    void showScalarCfdImportAcceptanceDialog(const QString& prefillOfferJson = QString());
 
     WalletModel* walletModel{nullptr};
     BridgeSessionManager* sessionManager{nullptr};
@@ -63,9 +69,11 @@ private:
     QRadioButton* optionsRadio{nullptr};
     QRadioButton* spotRadio{nullptr};
     QRadioButton* difficultyRadio{nullptr};
+    QRadioButton* scalarCfdRadio{nullptr};
     QLabel* descriptionLabel{nullptr};
     QPushButton* createButton{nullptr};
     QPushButton* importButton{nullptr};
+    QPushButton* importScalarAcceptanceButton{nullptr};
 };
 
 #endif // BITCOIN_QT_NEWCONTRACTTAB_H
