@@ -272,7 +272,9 @@ TreasuryPage::TreasuryPage(const PlatformStyle* platformStyle, QWidget* parent)
     setupRegistrationTab();
     setupOptionSeriesTab();
     setupCfdSeriesTab();
-    setupBilateralCfdTab();
+    // setupBilateralCfdTab() intentionally NOT called: the bilateral scalar-feed CFD moved to the Exchange
+    // Structuring→Book flow. The method + its onScfd* handlers/members are retained but dormant (unwired),
+    // so the feature can be revived or fully removed later without a risky bulk deletion now.
     setupVerifyOptionTab();
     setupMintTab();
     setupBurnTab();
@@ -315,7 +317,9 @@ TreasuryPage::TreasuryPage(const PlatformStyle* platformStyle, QWidget* parent)
         tabWidget->addTab(governanceTab, tr("Governance"));
         tabWidget->addTab(optionSeriesTab, tr("Option Series"));
         tabWidget->addTab(cfdSeriesTab, tr("CFD Asset Series"));
-        tabWidget->addTab(scfdTab, tr("Bilateral CFD"));
+        // NOTE: the bilateral scalar-feed CFD ("Bilateral CFD") moved to the Exchange Structuring→Book flow
+        // (it shares the difficulty CFD's propose/manage/settle surface). Its Treasury tab is unwired here;
+        // the setupBilateralCfdTab()/onScfd* code is retained but dormant.
         tabWidget->addTab(verifyOptionTab, tr("Verify Option"));
 
         // Issuer mode table headers
@@ -328,9 +332,8 @@ TreasuryPage::TreasuryPage(const PlatformStyle* platformStyle, QWidget* parent)
     } else {
         tabWidget->addTab(dashboardTab, tr("My Assets"));
         tabWidget->addTab(verifyOptionTab, tr("Verify Option"));
-        // The bilateral CFD is a two-party lifecycle — the acceptor/counterparty (a non-issuer) needs
-        // accept/import/open/sign/settle/price too, so the tab is available in holder mode as well.
-        tabWidget->addTab(scfdTab, tr("Bilateral CFD"));
+        // The bilateral scalar-feed CFD moved to the Exchange Structuring→Book flow (reachable by holders
+        // too, as the acceptor/counterparty). Its Treasury tab is unwired here.
         tabWidget->addTab(zkComplianceTab, tr("Compliance"));
         tabWidget->addTab(governanceTab, tr("Governance"));
 
@@ -2854,7 +2857,9 @@ void TreasuryPage::setupVerifyOptionTab()
         "<b>Verify an option series before you buy.</b> Enter a series ticker (ROOT.SUFFIX) or its asset id. "
         "This re-derives the N backing vaults from the descriptor published in the series' ICU and scans the "
         "UTXO set — confirming the series is authentic AND fully collateralized on chain. No wallet record is "
-        "needed; this works for ANY series, not just ones you issued."));
+        "needed; this works for ANY series, not just ones you issued.<br/><br/>"
+        "<b>Hold units of a matured series?</b> Verify it, then use <b>Settle → Redeem</b> below to exercise a "
+        "lot end-to-end (no issuer record required)."));
     intro->setWordWrap(true);
     layout->addWidget(intro);
 
@@ -2871,29 +2876,39 @@ void TreasuryPage::setupVerifyOptionTab()
     verifyOptResult->setReadOnly(true);
     layout->addWidget(verifyOptResult, 1);
 
-    // Holder redeem: once a series verifies, its terms are recovered from the on-chain descriptor, so a buyer
-    // who holds units (but never recorded the series) can redeem a settlement pot here — no issuer record.
-    QGroupBox* redeemGroup = new QGroupBox(tr("Redeem a settlement pot (for units you hold)"));
+    // Holder exercise: once a series verifies, its terms are recovered from the on-chain descriptor, so a
+    // buyer who holds units (but never recorded the series) can exercise an ITM lot end-to-end here — no
+    // issuer record. Two steps, mirroring the issuer Option Series tab: (1) Settle lot builds the keeper
+    // settlement (signatureless covenant; permissionless) and, if the lot is ITM, funds its pot; on success
+    // the pot outpoint is auto-filled below. (2) Redeem pot retires one of your units and sweeps that pot.
+    QGroupBox* redeemGroup = new QGroupBox(tr("Exercise a lot you hold (settle → redeem)"));
     QHBoxLayout* rg = new QHBoxLayout();
     rg->addWidget(new QLabel(tr("Lot:")));
     verifyOptLotSpin = new QSpinBox();
     verifyOptLotSpin->setRange(0, 0);
     rg->addWidget(verifyOptLotSpin);
+    verifyOptSettleButton = new QPushButton(tr("1. Settle lot"));
+    verifyOptSettleButton->setToolTip(tr("Build and broadcast the keeper settlement for this lot (permissionless). "
+                                         "Once the fixing height is buried and the settle-lock is open; if the lot is "
+                                         "ITM the funded pot is filled in below for you to redeem."));
+    rg->addWidget(verifyOptSettleButton);
     rg->addWidget(new QLabel(tr("Pot:")));
     verifyOptPotEdit = new QLineEdit();
-    verifyOptPotEdit->setPlaceholderText(tr("settlement pot outpoint  txid:vout"));
+    verifyOptPotEdit->setPlaceholderText(tr("settlement pot outpoint  txid:vout  (auto-filled by Settle, or paste one)"));
     rg->addWidget(verifyOptPotEdit, 1);
-    verifyOptRedeemButton = new QPushButton(tr("Redeem pot"));
+    verifyOptRedeemButton = new QPushButton(tr("2. Redeem pot"));
     rg->addWidget(verifyOptRedeemButton);
     redeemGroup->setLayout(rg);
     layout->addWidget(redeemGroup);
 
     verifyOptLotSpin->setEnabled(false);
+    verifyOptSettleButton->setEnabled(false);
     verifyOptPotEdit->setEnabled(false);
     verifyOptRedeemButton->setEnabled(false);
 
     connect(verifyOptButton, &QPushButton::clicked, this, &TreasuryPage::onVerifyOptionById);
     connect(verifyOptIdEdit, &QLineEdit::returnPressed, this, &TreasuryPage::onVerifyOptionById);
+    connect(verifyOptSettleButton, &QPushButton::clicked, this, &TreasuryPage::onVerifyOptionSettle);
     connect(verifyOptRedeemButton, &QPushButton::clicked, this, &TreasuryPage::onVerifyOptionRedeem);
 }
 
@@ -2906,6 +2921,7 @@ void TreasuryPage::onVerifyOptionById()
     m_verifyOptTermsJson.clear();
     verifyOptPotEdit->clear();
     verifyOptLotSpin->setEnabled(false);
+    verifyOptSettleButton->setEnabled(false);
     verifyOptPotEdit->setEnabled(false);
     verifyOptRedeemButton->setEnabled(false);
 
@@ -2937,8 +2953,42 @@ void TreasuryPage::onVerifyOptionById()
     const bool canRedeem = r.authentic && !r.terms_json.isEmpty();
     if (canRedeem && r.lot_count > 0) verifyOptLotSpin->setRange(0, r.lot_count - 1);
     verifyOptLotSpin->setEnabled(canRedeem);
+    verifyOptSettleButton->setEnabled(canRedeem);
     verifyOptPotEdit->setEnabled(canRedeem);
     verifyOptRedeemButton->setEnabled(canRedeem);
+}
+
+void TreasuryPage::onVerifyOptionSettle()
+{
+    if (!walletModel) { showError(tr("Wallet not ready")); return; }
+    if (m_verifyOptTermsJson.isEmpty()) { showError(tr("Verify a series first to recover its terms.")); return; }
+    const int lot = verifyOptLotSpin->value();
+
+    QMessageBox box(TopLevelDialogParent(this));
+    box.setWindowTitle(tr("Confirm Settlement"));
+    box.setText(tr("Settle lot %1 of this series?\n\nThis builds the keeper settlement and broadcasts it — anyone "
+                   "may do it, no issuer record needed. It only succeeds once the fixing height is buried and the "
+                   "settle-lock CLTV is open. If the lot is in-the-money, the funded pot is filled in below so you "
+                   "can redeem it with the units you hold.").arg(lot));
+    box.setIcon(QMessageBox::Question);
+    box.setStandardButtons(QMessageBox::Yes | QMessageBox::No);
+    box.setDefaultButton(QMessageBox::No);
+    if (box.exec() != QMessageBox::Yes) return;
+
+    WalletModel::UnlockContext ctx(walletModel->requestUnlock());
+    if (!ctx.isValid()) { showError(tr("Wallet locked. Please unlock to settle.")); return; }
+
+    // Same model call the issuer Option Series tab uses: build_settlement -> difficulty.finalize_settlement
+    // -> broadcast, returning the funded pot outpoint on an ITM settlement.
+    WalletModel::OptionSeriesActionResult r = walletModel->optionSeriesSettle(m_verifyOptTermsJson, lot);
+    if (!r.success) { verifyOptResult->append(tr("✗ Settle failed: %1").arg(r.error)); showError(r.error); return; }
+    verifyOptResult->append(tr("✓ %1 (txid %2)").arg(r.detail).arg(r.txid));
+    if (!r.pot_outpoint.isEmpty()) {
+        verifyOptPotEdit->setText(r.pot_outpoint);
+        verifyOptResult->append(tr("  → ITM: funded pot %1 filled in; click '2. Redeem pot' to claim it.").arg(r.pot_outpoint));
+    } else {
+        verifyOptResult->append(tr("  → Lot settled OTM (no pot for the holder — collateral returned to the writer)."));
+    }
 }
 
 void TreasuryPage::onVerifyOptionRedeem()
@@ -10425,7 +10475,7 @@ void TreasuryPage::updateVisibilityForMode()
         tabWidget->addTab(governanceTab, tr("Governance"));
         tabWidget->addTab(optionSeriesTab, tr("Option Series"));
         tabWidget->addTab(cfdSeriesTab, tr("CFD Asset Series"));
-        tabWidget->addTab(scfdTab, tr("Bilateral CFD"));
+        // Bilateral scalar-feed CFD moved to Exchange (Structuring→Book); Treasury tab unwired.
         tabWidget->addTab(verifyOptionTab, tr("Verify Option"));
 
         // Update dashboard table headers for issuer view
@@ -10512,7 +10562,7 @@ void TreasuryPage::updateVisibilityForMode()
         // Add holder tabs
         tabWidget->addTab(dashboardTab, tr("My Assets"));
         tabWidget->addTab(verifyOptionTab, tr("Verify Option"));
-        tabWidget->addTab(scfdTab, tr("Bilateral CFD")); // two-party lifecycle — the acceptor/holder needs it too
+        // Bilateral scalar-feed CFD moved to Exchange (Structuring→Book), reachable by holders too; unwired.
         tabWidget->addTab(zkComplianceTab, tr("Compliance"));
         tabWidget->addTab(governanceTab, tr("Governance"));
 

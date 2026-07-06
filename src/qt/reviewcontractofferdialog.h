@@ -140,6 +140,15 @@ private:
     // maker session is needed): generate the taker's payout address(es), call difficulty.accept[_option],
     // persist the contract in this wallet, and surface the acceptance to hand back to the maker.
     void acceptDifficultyOffer();
+
+    // Scalar-feed CFD fields (schema scalarcfd_term_sheet_v1); the difficulty sibling. As with difficulty,
+    // display and accept bind to the embedded SIGNED offer, never the outer (spoofable) term sheet.
+    QString m_scalarCfdOfferJson;    // the maker's embedded signed offer JSON (consumed by scalarcfd.accept)
+    QJsonObject m_scalarCfdOfferObj; // the same offer parsed, used as the source of truth for display
+
+    // Accept a scalar-feed CFD offer locally: generate the taker's owner/cp payout addresses, call
+    // scalarcfd.accept (confirmed), persist the contract, and surface the acceptance to hand back.
+    void acceptScalarCfdOffer();
 };
 
 #endif // BITCOIN_QT_REVIEWCONTRACTOFFERDIALOG_H

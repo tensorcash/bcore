@@ -10,6 +10,7 @@
 #include <qt/forwardcontractbuilder.h>
 #include <qt/spotcontractbuilder.h>
 #include <qt/difficultycontractbuilder.h>
+#include <qt/scalarcfdcontractbuilder.h>
 #include <qt/guiutil.h>
 #include <qt/importofferdialog.h>
 #include <qt/opencontractdialog.h>
@@ -25,6 +26,10 @@
 #include <QPushButton>
 #include <QButtonGroup>
 #include <QMessageBox>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QFormLayout>
+#include <QPlainTextEdit>
 
 namespace {
 QWidget* TopLevelDialogParent(QWidget* widget)
@@ -141,6 +146,22 @@ void NewContractTab::setupUI()
     difficultyDesc->setStyleSheet("QLabel { margin-left: 25px; color: #666; font-size: 11px; }");
     typeLayout->addWidget(difficultyDesc);
 
+    typeLayout->addSpacing(15);
+
+    // Scalar-feed bilateral CFD (the difficulty sibling, keyed by a published scalar feed)
+    scalarCfdRadio = new QRadioButton(tr("Scalar CFD"), this);
+    buttonGroup->addButton(scalarCfdRadio);
+    typeLayout->addWidget(scalarCfdRadio);
+
+    QLabel* scalarCfdDesc = new QLabel(
+        tr("A bilateral CFD on a published scalar feed (e.g. an oracle value) at a chosen fixing epoch. "
+           "Each party posts initial margin in the collateral's units (native TSC for now) and settles "
+           "unilaterally as a clamped-linear function of the realized scalar vs the agreed strike (leverage "
+           "= lambda). The difficulty CFD's sibling — same escrow/settle/coop machinery, different reference."), this);
+    scalarCfdDesc->setWordWrap(true);
+    scalarCfdDesc->setStyleSheet("QLabel { margin-left: 25px; color: #666; font-size: 11px; }");
+    typeLayout->addWidget(scalarCfdDesc);
+
     typeGroup->setLayout(typeLayout);
     mainLayout->addWidget(typeGroup);
 
@@ -150,6 +171,7 @@ void NewContractTab::setupUI()
     connect(optionsRadio, &QRadioButton::toggled, this, &NewContractTab::onContractTypeChanged);
     connect(spotRadio, &QRadioButton::toggled, this, &NewContractTab::onContractTypeChanged);
     connect(difficultyRadio, &QRadioButton::toggled, this, &NewContractTab::onContractTypeChanged);
+    connect(scalarCfdRadio, &QRadioButton::toggled, this, &NewContractTab::onContractTypeChanged);
 
     mainLayout->addSpacing(20);
 
@@ -187,6 +209,16 @@ void NewContractTab::setupUI()
     importButton->setToolTip(tr("Import an existing offer from JSON or cosign session"));
     connect(importButton, &QPushButton::clicked, this, &NewContractTab::onImportOffer);
     buttonLayout->addWidget(importButton);
+
+    // Proposer's step for a scalar-feed CFD they offered: paste the counterparty's acceptance to register
+    // the contract locally (it then shows up in the Book). Kept persistent so a proposer who closed the app
+    // between offer and acceptance can still complete it.
+    importScalarAcceptanceButton = new QPushButton(tr("Import Scalar Acceptance"), this);
+    importScalarAcceptanceButton->setToolTip(
+        tr("Import a counterparty's acceptance JSON for a scalar-feed CFD you proposed, registering the "
+           "contract so it appears in the Book"));
+    connect(importScalarAcceptanceButton, &QPushButton::clicked, this, &NewContractTab::onImportScalarCfdAcceptance);
+    buttonLayout->addWidget(importScalarAcceptanceButton);
 
     buttonLayout->addStretch();
 
@@ -259,6 +291,20 @@ void NewContractTab::onContractTypeChanged()
                "keeper) can settle<br>"
                "• <b>Cooperative Close:</b> a 2-of-2 cosign leaf lets both parties close early to an agreed split<br>"
                "• <b>Technical implementation:</b> Taproot v1, NUMS internal key, OP_DIFFCFD_SETTLE covenant leaf"));
+    } else if (scalarCfdRadio->isChecked()) {
+        descriptionLabel->setText(
+            tr("<b>Scalar-feed CFD Features:</b><br>"
+               "• <b>Parties:</b> Long and Short<br>"
+               "• <b>Underlying:</b> a published scalar feed value (feed id + fixing epoch), with a fallback "
+               "scalar if the fixing is not published by the deadline<br>"
+               "• <b>Initial Margin:</b> posted per leg in the collateral's units (native TSC for now); settled "
+               "unilaterally as a clamped-linear function of the realized scalar vs the agreed strike K "
+               "(leverage = lambda)<br>"
+               "• <b>Payoff mode:</b> STRIKE (denominated in K) or REALIZED (denominated in the realized X)<br>"
+               "• <b>Settlement:</b> signatureless covenant after the settle-lock height; either party (or a "
+               "keeper) can settle<br>"
+               "• <b>Cooperative Close:</b> a 2-of-2 cosign leaf lets both parties close early to an agreed split<br>"
+               "• <b>Technical implementation:</b> Taproot v1, NUMS internal key, per-leg scalar-CFD settle leaf"));
     }
 }
 
@@ -279,7 +325,18 @@ void NewContractTab::onCreateContract()
         launchSpotWizard();
     } else if (difficultyRadio->isChecked()) {
         launchDifficultyWizard();
+    } else if (scalarCfdRadio->isChecked()) {
+        launchScalarCfdWizard();
     }
+}
+
+void NewContractTab::onImportScalarCfdAcceptance()
+{
+    if (!walletModel) {
+        QMessageBox::warning(TopLevelDialogParent(this), tr("Error"), tr("Wallet model not available"));
+        return;
+    }
+    showScalarCfdImportAcceptanceDialog();
 }
 
 void NewContractTab::onImportOffer()
@@ -745,6 +802,108 @@ void NewContractTab::launchDifficultyWizard()
             GUIUtil::setClipboard(termSheetJson);
         }
     }
+}
+
+void NewContractTab::launchScalarCfdWizard()
+{
+    // Narrow scope: build the proposer's scalar-feed CFD offer JSON and let the user copy/share it (and,
+    // once the counterparty returns an acceptance, import it to register the contract into the Book).
+    ScalarCfdContractBuilder wizard(walletModel, TopLevelDialogParent(this));
+
+    if (wizard.exec() == QDialog::Accepted) {
+        QWidget* dialog_parent = TopLevelDialogParent(this);
+        const QString offerJson = wizard.getOfferJson();
+        if (offerJson.isEmpty()) {
+            QMessageBox::critical(dialog_parent, tr("Error"), tr("Failed to create the scalar-feed CFD offer."));
+            return;
+        }
+
+        Q_EMIT contractCreated("scalarcfd", QString());
+
+        const QString termSheetJson = wizard.getTermSheetJson();
+
+        QMessageBox shareDialog(dialog_parent);
+        shareDialog.setWindowTitle(tr("Scalar CFD Offer Created"));
+        shareDialog.setIcon(QMessageBox::Information);
+        shareDialog.setText(tr("Your scalar-feed CFD offer was created.\n\n"
+                               "Send the counterparty the Term Sheet below and have them accept it via "
+                               "'Import Offer' — that opens the review + accept dialog and produces an "
+                               "acceptance JSON. Then use 'Import Acceptance' here to register the contract into "
+                               "the Book, and both parties open and settle.\n\n"
+                               "(The raw offer JSON also works with 'Import Offer', but the term sheet is the "
+                               "richer artifact for review.)"));
+        shareDialog.setDetailedText(termSheetJson.isEmpty() ? offerJson : termSheetJson);
+        QPushButton* copyTermSheetButton = termSheetJson.isEmpty()
+            ? nullptr : shareDialog.addButton(tr("Copy Term Sheet"), QMessageBox::ActionRole);
+        QPushButton* copyButton = shareDialog.addButton(tr("Copy Raw Offer JSON"), QMessageBox::ActionRole);
+        QPushButton* importAcceptanceButton = shareDialog.addButton(tr("Import Acceptance…"), QMessageBox::ActionRole);
+        shareDialog.addButton(QMessageBox::Close);
+        if (copyTermSheetButton) shareDialog.setDefaultButton(copyTermSheetButton);
+        shareDialog.exec();
+
+        if (copyTermSheetButton && shareDialog.clickedButton() == copyTermSheetButton) {
+            GUIUtil::setClipboard(termSheetJson);
+        } else if (shareDialog.clickedButton() == copyButton) {
+            GUIUtil::setClipboard(offerJson);
+        } else if (shareDialog.clickedButton() == importAcceptanceButton) {
+            showScalarCfdImportAcceptanceDialog(offerJson);
+        }
+    }
+}
+
+void NewContractTab::showScalarCfdImportAcceptanceDialog(const QString& prefillOfferJson)
+{
+    QWidget* dialog_parent = TopLevelDialogParent(this);
+
+    QDialog dialog(dialog_parent);
+    dialog.setWindowTitle(tr("Import Scalar CFD Acceptance"));
+    dialog.setMinimumWidth(560);
+
+    QVBoxLayout* layout = new QVBoxLayout(&dialog);
+    QLabel* intro = new QLabel(
+        tr("Paste the offer you proposed and the counterparty's acceptance JSON. This registers the contract "
+           "locally so it appears in the Book, ready to open and settle."), &dialog);
+    intro->setWordWrap(true);
+    layout->addWidget(intro);
+
+    QFormLayout* form = new QFormLayout();
+    QPlainTextEdit* offerEdit = new QPlainTextEdit(&dialog);
+    offerEdit->setPlaceholderText(tr("your offer JSON"));
+    offerEdit->setPlainText(prefillOfferJson);
+    offerEdit->setMinimumHeight(90);
+    form->addRow(tr("Offer:"), offerEdit);
+    QPlainTextEdit* acceptanceEdit = new QPlainTextEdit(&dialog);
+    acceptanceEdit->setPlaceholderText(tr("the counterparty's acceptance JSON"));
+    acceptanceEdit->setMinimumHeight(90);
+    form->addRow(tr("Acceptance:"), acceptanceEdit);
+    layout->addLayout(form);
+
+    QDialogButtonBox* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    buttons->button(QDialogButtonBox::Ok)->setText(tr("Import"));
+    layout->addWidget(buttons);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+
+    if (dialog.exec() != QDialog::Accepted) return;
+
+    const QString offer = offerEdit->toPlainText().trimmed();
+    const QString acceptance = acceptanceEdit->toPlainText().trimmed();
+    if (offer.isEmpty() || acceptance.isEmpty()) {
+        QMessageBox::warning(dialog_parent, tr("Missing Input"),
+            tr("Both the offer and the acceptance JSON are required."));
+        return;
+    }
+
+    WalletModel::ScalarCfdImportResult r = walletModel->scalarCfdImportAcceptance(offer, acceptance);
+    if (!r.success) {
+        QMessageBox::critical(dialog_parent, tr("Import Failed"),
+            tr("Failed to import the acceptance:\n\n%1").arg(r.error));
+        return;
+    }
+
+    Q_EMIT contractCreated("scalarcfd", r.contract_id);
+    QMessageBox::information(dialog_parent, tr("Acceptance Imported"),
+        tr("Contract %1 is now %2 and appears in the Book, ready to open.").arg(r.contract_id, r.state));
 }
 
 void NewContractTab::showImportOfferDialog()

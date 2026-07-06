@@ -24,6 +24,7 @@
 #include <QTextEdit>
 #include <QMessageBox>
 #include <QJsonDocument>
+#include <QRegularExpression>
 #include <QJsonObject>
 #include <QDateTime>
 #include <QApplication>
@@ -343,6 +344,28 @@ void ReviewContractOfferDialog::parseOfferPayload()
         } else {
             // No embedded offer: keep outer kind only so the UI can show a clear "cannot accept".
             m_difficultyKind = root.value("kind").toString().toLower();
+            makerRole = root.value("maker_role").toString().toLower();
+        }
+    } else if (schema == QLatin1String("scalarcfd_term_sheet_v1")) {
+        payloadIsTermSheet = true;
+        m_contractType = QStringLiteral("scalarcfd");
+        // Advisory metrics from the outer sheet (informational only, NOT part of the signed offer).
+        termSheetMetrics = root.value("metrics").toObject().toVariantMap();
+        // SECURITY: as with difficulty, both render and accept bind to the embedded SIGNED offer, never the
+        // outer term sheet — a market post could otherwise show benign economics over a different offer.
+        // The offer is embedded as the EXACT raw JSON string (offer_raw) so the uint64 fixing_ref survives
+        // to scalarcfd.accept losslessly (Qt JSON would round it); we parse a copy for DISPLAY only. Fall back
+        // to a legacy embedded object if offer_raw is absent.
+        if (root.contains("offer_raw") && root.value("offer_raw").isString()) {
+            m_scalarCfdOfferJson = root.value("offer_raw").toString();  // exact bytes -> accept
+            m_scalarCfdOfferObj = QJsonDocument::fromJson(m_scalarCfdOfferJson.toUtf8()).object();  // display copy
+            makerRole = m_scalarCfdOfferObj.value("proposer_role").toString().toLower();
+        } else if (root.contains("offer") && root.value("offer").isObject()) {
+            m_scalarCfdOfferObj = root.value("offer").toObject();
+            m_scalarCfdOfferJson = QString::fromUtf8(
+                QJsonDocument(m_scalarCfdOfferObj).toJson(QJsonDocument::Compact));
+            makerRole = m_scalarCfdOfferObj.value("proposer_role").toString().toLower();
+        } else {
             makerRole = root.value("maker_role").toString().toLower();
         }
     } else {
@@ -744,10 +767,10 @@ void ReviewContractOfferDialog::setupUI()
         mainLayout->addSpacing(10);
     }
 
-    // Difficulty derivatives generate the taker's payout address(es) internally during accept and
-    // have no repo/forward-style manual address inputs, so they skip the advanced address group
-    // entirely (otherwise difficulty would fall into the repo-terminology else branch below).
-    if (m_contractType != QLatin1String("difficulty")) {
+    // Bilateral CFDs (difficulty and scalar-feed) generate the taker's payout address(es) internally
+    // during accept and have no repo/forward-style manual address inputs, so they skip the advanced
+    // address group entirely (otherwise they would fall into the repo-terminology else branch below).
+    if (m_contractType != QLatin1String("difficulty") && m_contractType != QLatin1String("scalarcfd")) {
     QGroupBox* addressGroup = new QGroupBox(tr("Your Addresses (Advanced)"), this);
     addressGroup->setCheckable(true);
     addressGroup->setChecked(false);  // Hidden by default
@@ -1013,7 +1036,7 @@ void ReviewContractOfferDialog::setupUI()
     addressGroup->setMaximumHeight(40);
 
     mainLayout->addWidget(addressGroup);
-    } // end non-difficulty advanced address group
+    } // end non-bilateral-CFD advanced address group
 
     mainLayout->addSpacing(20);
 
@@ -1026,10 +1049,13 @@ void ReviewContractOfferDialog::setupUI()
     buttonLayout->addWidget(showJsonButton);
 
     // Script preview / Greeks describe repo + forward/option leaves and pricing; they have no
-    // difficulty-specific variant, so hide them for difficulty term sheets.
+    // difficulty-specific variant, so hide them for difficulty term sheets. Scalar-feed CFDs have no
+    // pre-open inline pricer at all (scalarcfd.price needs an opened contract), so they hide the
+    // script/pricing/greeks buttons entirely — MTM shows in the Book once opened.
     const bool isDifficulty = (m_contractType == QLatin1String("difficulty"));
+    const bool isScalarCfd = (m_contractType == QLatin1String("scalarcfd"));
 
-    if (!isDifficulty) {
+    if (!isDifficulty && !isScalarCfd) {
         showScriptButton = new QPushButton(tr("Show Script Preview"), this);
         showScriptButton->setToolTip(tr("Preview the Bitcoin script for this contract (if available)"));
         connect(showScriptButton, &QPushButton::clicked, this, &ReviewContractOfferDialog::onShowScriptPreview);
@@ -1047,8 +1073,8 @@ void ReviewContractOfferDialog::setupUI()
     }
 
     // Add Greeks button (Repo: collateral-option Greeks; Forward/Option: spread Greeks;
-    // Difficulty: delta/vega/theta to difficulty).
-    {
+    // Difficulty: delta/vega/theta to difficulty). Skipped for scalar-feed CFDs (no pre-open pricer).
+    if (!isScalarCfd) {
         showGreeksButton = new QPushButton(tr("View Greeks"), this);
         showGreeksButton->setStyleSheet("QPushButton { background-color: #7c3aed; color: white; font-weight: bold; }");
         showGreeksButton->setToolTip(isDifficulty ? tr("View difficulty Greeks (delta, vega, theta)")
@@ -1061,7 +1087,7 @@ void ReviewContractOfferDialog::setupUI()
 
     rejectButton = new QPushButton(tr("Cancel"), this);
     acceptButton = new QPushButton(
-        m_contractType == QLatin1String("difficulty") ? tr("Accept Offer") : tr("Send Trade Request"), this);
+        (isDifficulty || isScalarCfd) ? tr("Accept Offer") : tr("Send Trade Request"), this);
     acceptButton->setStyleSheet(QStringLiteral("QPushButton { background-color: %1; color: white; font-weight: bold; padding: 8px 16px; }").arg(ThemeHelpers::accentTextColor()));
 
     buttonLayout->addWidget(rejectButton);
@@ -1178,6 +1204,68 @@ QString ReviewContractOfferDialog::formatOfferTerms() const
                 .arg(note.isEmpty() ? tr("Not priced") : note);
         }
         html += "</table>";
+        return html;
+    }
+
+    // Handle scalar-feed bilateral CFDs (the difficulty sibling, keyed by a published scalar feed).
+    // SECURITY: render strictly from the embedded SIGNED offer, never the outer term sheet.
+    if (m_contractType == QLatin1String("scalarcfd")) {
+        if (m_scalarCfdOfferObj.isEmpty()) {
+            html += tr("<p style='color:red;'><b>Warning:</b> This term sheet has no embedded signed "
+                       "offer; it cannot be accepted in-app.</p>");
+            return html;
+        }
+
+        const QJsonObject offer = m_scalarCfdOfferObj;
+        const QJsonObject oterms = offer.value("terms").toObject();
+        const double lambdaScale = 65536.0;  // Q16: lambda = lambda_q / 2^16
+        const int payoffMode = static_cast<int>(oterms.value("payoff_mode").toDouble());
+        const int sourceType = static_cast<int>(oterms.value("source_type").toDouble());
+        const QString underlying = oterms.value("underlying_asset_id").toString();
+        // A chain-intrinsic source commits a zero U (source_type==1, or an all-zero/empty underlying hex).
+        static const QRegularExpression allZeroRe(QStringLiteral("^0*$"));
+        const bool chainIntrinsic = (sourceType == 1) || underlying.isEmpty() || allZeroRe.match(underlying).hasMatch();
+
+        html += "<table border='0' cellpadding='4' cellspacing='0'>";
+        html += tr("<tr><td><b>Contract Type:</b></td><td>Scalar-feed CFD</td></tr>");
+        html += tr("<tr><td><b>Maker Role:</b></td><td>%1</td></tr>").arg(makerRole.toUpper());
+        html += tr("<tr><td><b>Source:</b></td><td>%1</td></tr>")
+            .arg(chainIntrinsic ? tr("chain-intrinsic metric") : tr("issuer-published feed"));
+        html += tr("<tr><td><b>Payoff mode:</b></td><td>%1</td></tr>")
+            .arg(payoffMode == 1 ? tr("REALIZED (denom X)") : tr("STRIKE (denom K)"));
+        html += tr("<tr><td><b>Underlying (U):</b></td><td>%1</td></tr>")
+            .arg(chainIntrinsic ? tr("(none — chain-intrinsic)") : underlying);
+        html += tr("<tr><td><b>Feed id:</b></td><td>%1</td></tr>")
+            .arg(static_cast<qlonglong>(oterms.value("feed_id").toDouble()));
+        html += tr("<tr><td><b>Fixing ref (epoch):</b></td><td>%1</td></tr>")
+            .arg(static_cast<qlonglong>(oterms.value("fixing_ref").toDouble()));
+        html += tr("<tr><td><b>Strike (K):</b></td><td><span style='font-family:monospace;'>%1</span></td></tr>")
+            .arg(oterms.value("strike").toString());
+        html += tr("<tr><td><b>Fallback scalar:</b></td><td><span style='font-family:monospace;'>%1</span></td></tr>")
+            .arg(oterms.value("fallback_scalar").toString());
+        html += tr("<tr><td><b>Publication deadline:</b></td><td>H%1</td></tr>")
+            .arg(static_cast<qlonglong>(oterms.value("publication_deadline_height").toDouble()));
+        html += tr("<tr><td><b>Settle-lock height:</b></td><td>H%1</td></tr>")
+            .arg(static_cast<qlonglong>(oterms.value("settle_lock_height").toDouble()));
+        html += "</table>";
+
+        // Per-leg IM is a decimal string (collateral units) in the offer; render it verbatim.
+        const QJsonObject lo = oterms.value("long").toObject();
+        const QJsonObject so = oterms.value("short").toObject();
+        html += tr("<h3 style='color:#1976d2;'>Long Leg</h3>");
+        html += "<table border='0' cellpadding='4' cellspacing='0'>";
+        html += tr("<tr><td><b>Initial margin:</b></td><td>%1</td></tr>").arg(lo.value("im").toString());
+        html += tr("<tr><td><b>Leverage (&lambda;):</b></td><td>%1</td></tr>")
+            .arg(QString::number(lo.value("lambda_q").toDouble() / lambdaScale, 'f', 2));
+        html += "</table>";
+        html += tr("<h3 style='color:#c62828;'>Short Leg</h3>");
+        html += "<table border='0' cellpadding='4' cellspacing='0'>";
+        html += tr("<tr><td><b>Initial margin:</b></td><td>%1</td></tr>").arg(so.value("im").toString());
+        html += tr("<tr><td><b>Leverage (&lambda;):</b></td><td>%1</td></tr>")
+            .arg(QString::number(so.value("lambda_q").toDouble() / lambdaScale, 'f', 2));
+        html += "</table>";
+        html += tr("<p style='color:#9e9e9e;'>Mark-to-market is available in the Book once the contract is "
+                   "opened (scalar-feed CFDs have no pre-open pricer).</p>");
         return html;
     }
 
@@ -1546,6 +1634,11 @@ void ReviewContractOfferDialog::onAccept()
     // trade-request round-trip), so they take a dedicated path.
     if (m_contractType == QLatin1String("difficulty")) {
         acceptDifficultyOffer();
+        return;
+    }
+    // Scalar-feed CFDs accept the same way — locally off the embedded signed offer.
+    if (m_contractType == QLatin1String("scalarcfd")) {
+        acceptScalarCfdOffer();
         return;
     }
 
@@ -2024,6 +2117,69 @@ void ReviewContractOfferDialog::acceptDifficultyOffer()
     accept();  // close the review dialog
 }
 
+void ReviewContractOfferDialog::acceptScalarCfdOffer()
+{
+    if (!walletModel) {
+        QMessageBox::critical(this, tr("Error"), tr("Wallet model not available."));
+        return;
+    }
+    if (m_scalarCfdOfferJson.isEmpty()) {
+        QMessageBox::critical(this, tr("Cannot Accept"),
+            tr("This scalar-feed CFD term sheet does not embed the maker's signed offer, so it "
+               "cannot be accepted from the app."));
+        return;
+    }
+
+    // The taker is the opposite side of the maker.
+    const QString takerRole = (makerRole == QLatin1String("long")) ? tr("short") : tr("long");
+
+    const QMessageBox::StandardButton confirm = QMessageBox::question(this, tr("Accept Scalar CFD Offer"),
+        tr("Accept this scalar-feed CFD as the %1 side?\n\n"
+           "This generates your payout addresses, registers the contract in this wallet, and produces an "
+           "acceptance to send back to the maker so both legs can be funded.").arg(takerRole),
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+    if (confirm != QMessageBox::Yes) return;
+
+    // The acceptor supplies two of their own P2TR payout addresses (owner = the leg they post / IM return;
+    // cp = their claim on the proposer's leg).
+    const QString owner = walletModel->getNewAddress(tr("Scalar CFD IM return"), "bech32m");
+    const QString cp = walletModel->getNewAddress(tr("Scalar CFD counterparty claim"), "bech32m");
+    if (owner.isEmpty() || cp.isEmpty()) {
+        QMessageBox::critical(this, tr("Error"), tr("Failed to generate payout addresses."));
+        return;
+    }
+
+    WalletModel::ScalarCfdAcceptResult res =
+        walletModel->scalarCfdAccept(m_scalarCfdOfferJson, owner, cp, /*confirmed=*/true);
+    if (!res.success) {
+        QMessageBox::critical(this, tr("Accept Failed"),
+            tr("Could not accept the offer:\n%1").arg(res.error));
+        return;
+    }
+
+    // The contract is now registered locally (it appears in the Book as "accepted"). Hand the acceptance
+    // back to the maker so they can import it (Import Scalar Acceptance) and both legs can be funded.
+    QMessageBox done(this);
+    done.setIcon(QMessageBox::Information);
+    done.setWindowTitle(tr("Offer Accepted"));
+    done.setText(tr("Scalar-feed CFD accepted.\n\nContract ID: %1\n\n"
+                    "Send the acceptance below back to the maker (Import Scalar Acceptance), then both "
+                    "parties fund their legs from the Book.").arg(res.contract_id));
+    if (!res.acceptance_json.isEmpty()) {
+        done.setDetailedText(res.acceptance_json);
+    } else if (!res.action_required.isEmpty()) {
+        done.setInformativeText(tr("Next: %1").arg(res.action_required));
+    }
+    QPushButton* copyBtn = done.addButton(tr("Copy Acceptance"), QMessageBox::ActionRole);
+    done.addButton(QMessageBox::Ok);
+    done.exec();
+    if (done.clickedButton() == copyBtn && !res.acceptance_json.isEmpty()) {
+        QApplication::clipboard()->setText(res.acceptance_json);
+    }
+
+    accept();  // close the review dialog
+}
+
 void ReviewContractOfferDialog::onReject()
 {
     reject();
@@ -2056,8 +2212,9 @@ void ReviewContractOfferDialog::onGenerateLenderAddress()
 QString ReviewContractOfferDialog::getOfferRawJson() const
 {
     // Difficulty term sheets carry their own schema + embedded signed offer; reconstructing them
-    // as repo would drop both, so return the original payload verbatim.
-    if (m_contractType == QLatin1String("difficulty")) {
+    // as repo would drop both, so return the original payload verbatim. Scalar-feed CFDs carry the same
+    // schema-plus-embedded-offer shape and need the identical verbatim treatment.
+    if (m_contractType == QLatin1String("difficulty") || m_contractType == QLatin1String("scalarcfd")) {
         QString payload = offerData.value("contract_payload").toString();
         if (payload.isEmpty()) payload = offerData.value("term_sheet_json").toString();
         const QJsonDocument doc = QJsonDocument::fromJson(payload.toUtf8());

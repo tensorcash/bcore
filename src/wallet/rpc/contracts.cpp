@@ -7478,6 +7478,80 @@ static void AppendDifficultyFields(const CWallet& wallet, const DifficultyContra
     }
 }
 
+// ---- Scalar-feed bilateral CFD list helpers (mirror the difficulty ones above) ----------------------
+// The local wallet's role, derived from KEY OWNERSHIP (never the proposer side): a scalar CFD funds two
+// legs; owner_key of a leg is that leg's party, cp_key is its counterparty. There is no option variant.
+static std::string ScalarCfdRole(const ScalarCfdContractRecord& rec, const CWallet& wallet)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    const ScalarCfdContractTerms& t = rec.terms;
+    auto mine = [&](const XOnlyPubKey& k) {
+        return !k.IsNull() && (wallet.IsMine(GetScriptForDestination(WitnessV1Taproot{k})) & ISMINE_SPENDABLE);
+    };
+    if (mine(t.long_leg.owner_key) || mine(t.short_leg.cp_key)) return "long";
+    if (mine(t.short_leg.owner_key) || mine(t.long_leg.cp_key)) return "short";
+    return "unknown";
+}
+
+// True iff this leg is funded (has a vault outpoint) AND that vault has been spent — settled or coop-closed.
+static bool ScalarCfdLegSettled(const CWallet& wallet, const ScalarCfdContractRecord& rec, bool is_short)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    const COutPoint& op = rec.VaultOutpoint(is_short);
+    return !op.IsNull() && wallet.IsSpent(op);
+}
+
+// Lifecycle derived from the record + the wallet's spend view. Persisted scalar records begin at
+// "accepted" (there is no proposed-offer registry state), so this never returns "proposed":
+// "accepted" (no open tx) -> "opened" -> "partially_settled"/"settled" as the two funded vaults are spent.
+static std::string ScalarCfdStatus(const CWallet& wallet, const ScalarCfdContractRecord& rec)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    if (rec.open_txid.IsNull()) return "accepted";
+    const bool long_settled = ScalarCfdLegSettled(wallet, rec, /*is_short=*/false);
+    const bool short_settled = ScalarCfdLegSettled(wallet, rec, /*is_short=*/true);
+    if (long_settled && short_settled) return "settled";
+    if (long_settled || short_settled) return "partially_settled";
+    return "opened";
+}
+
+// Push the common scalar-feed term/lifecycle fields (mirrors AppendDifficultyFields). Requires cs_wallet
+// for the per-leg settled flags.
+static void AppendScalarCfdFields(const CWallet& wallet, const ScalarCfdContractRecord& rec, UniValue& e)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    const ScalarCfdContractTerms& t = rec.terms;
+    e.pushKV("kind", "cfd");                       // scalar-feed CFD has no option variant
+    e.pushKV("payoff_mode", static_cast<uint64_t>(t.payoff_mode));
+    e.pushKV("underlying_asset_id", t.underlying_asset_id.GetHex());
+    e.pushKV("feed_id", static_cast<uint64_t>(t.feed_id));
+    e.pushKV("fixing_ref", static_cast<uint64_t>(t.fixing_ref));
+    e.pushKV("publication_deadline_height", static_cast<uint64_t>(t.publication_deadline_height));
+    e.pushKV("settle_lock_height", static_cast<uint64_t>(t.settle_lock_height));
+    e.pushKV("scalar_format_id", static_cast<uint64_t>(t.scalar_format_id));
+    e.pushKV("strike", t.strike.GetHex());
+    e.pushKV("fallback_scalar", t.fallback_scalar.GetHex());
+    if (!t.collateral_asset_id.IsNull()) e.pushKV("collateral_asset_id", t.collateral_asset_id.GetHex());
+
+    auto leg_json = [](const ScalarCfdLegTerms& L) {
+        UniValue o(UniValue::VOBJ);
+        o.pushKV("im", static_cast<uint64_t>(L.im));  // collateral units (sats if native), not TSC
+        o.pushKV("lambda_q", static_cast<uint64_t>(L.lambda_q));
+        o.pushKV("lambda", L.lambda_q / 65536.0);
+        return o;
+    };
+    e.pushKV("long_leg", leg_json(t.long_leg));
+    e.pushKV("short_leg", leg_json(t.short_leg));
+
+    if (!rec.long_vault.IsNull()) e.pushKV("long_vault", rec.long_vault.ToString());
+    if (!rec.short_vault.IsNull()) e.pushKV("short_vault", rec.short_vault.ToString());
+    if (!rec.open_txid.IsNull()) {
+        e.pushKV("open_txid", rec.open_txid.GetHex());
+        e.pushKV("long_settled", ScalarCfdLegSettled(wallet, rec, /*is_short=*/false));
+        e.pushKV("short_settled", ScalarCfdLegSettled(wallet, rec, /*is_short=*/true));
+    }
+}
+
 RPCHelpMan contract_status()
 {
     return RPCHelpMan(
@@ -7680,24 +7754,24 @@ RPCHelpMan contract_list()
 {
     return RPCHelpMan(
         "contract.list",
-        "List all contracts in the wallet registry (repo, spot, forward, difficulty).",
+        "List all contracts in the wallet registry (repo, spot, forward, difficulty, scalarcfd).",
         {
             {"filter", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "Optional filters",
                 {
-                    {"type", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "Filter by contract type: 'repo', 'spot', 'forward', 'difficulty'"},
-                    {"state", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "Filter by state: 'proposed', 'accepted', 'opened', 'repaid', 'defaulted', 'closed'; difficulty also emits 'partially_settled' and 'settled'"},
+                    {"type", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "Filter by contract type: 'repo', 'spot', 'forward', 'difficulty', 'scalarcfd'"},
+                    {"state", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "Filter by state: 'proposed', 'accepted', 'opened', 'repaid', 'defaulted', 'closed'; difficulty and scalarcfd also emit 'partially_settled' and 'settled'"},
                     {"role", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "Filter by role: 'lender', 'borrower', 'alice', 'bob', 'long', 'short', 'writer', 'buyer'"},
                 }
             }
         },
         RPCResult{
             RPCResult::Type::ARR, "", "Array of contract summaries", {
-                // Each contract type (repo/spot/forward/difficulty) adds its own type-specific fields on top
-                // of the common ones below, so the per-entry object is intentionally not strictly typed.
+                // Each contract type (repo/spot/forward/difficulty/scalarcfd) adds its own type-specific fields
+                // on top of the common ones below, so the per-entry object is intentionally not strictly typed.
                 {RPCResult::Type::OBJ, "", "",
                     {
                         {RPCResult::Type::STR_HEX, "id", "Contract identifier"},
-                        {RPCResult::Type::STR, "type", "Contract type (repo, spot, forward, difficulty)"},
+                        {RPCResult::Type::STR, "type", "Contract type (repo, spot, forward, difficulty, scalarcfd)"},
                         {RPCResult::Type::STR, "role", "User role in this contract"},
                         {RPCResult::Type::STR, "status", "Contract status"},
                         {RPCResult::Type::NUM, "maturity_height", /*optional=*/true, "Maturity block height (repo/forward)"},
@@ -8053,6 +8127,29 @@ RPCHelpMan contract_list()
                     entry.pushKV("status", status);
                     entry.pushKV("created_height", 0); // difficulty records do not track a creation height
                     AppendDifficultyFields(*pwallet, diff, entry);
+                    results.push_back(entry);
+                }
+            }
+
+            // List all scalar-feed bilateral CFDs (the difficulty sibling; direct bilateral, no order book)
+            if (!filter_type || *filter_type == "scalarcfd") {
+                for (const auto& scfd : pwallet->ListScalarCfdContracts()) {
+                    const std::string status = ScalarCfdStatus(*pwallet, scfd);
+                    if (filter_state && *filter_state != status) {
+                        continue;
+                    }
+                    const std::string role = ScalarCfdRole(scfd, *pwallet);
+                    if (filter_role && *filter_role != role) {
+                        continue;
+                    }
+
+                    UniValue entry(UniValue::VOBJ);
+                    entry.pushKV("id", scfd.contract_id.GetHex());
+                    entry.pushKV("type", "scalarcfd");
+                    entry.pushKV("role", role);
+                    entry.pushKV("status", status);
+                    entry.pushKV("created_height", 0); // scalar-feed records do not track a creation height
+                    AppendScalarCfdFields(*pwallet, scfd, entry);
                     results.push_back(entry);
                 }
             }

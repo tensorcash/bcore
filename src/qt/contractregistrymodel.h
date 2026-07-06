@@ -120,6 +120,21 @@ private:
         QString shortVault;
         QString openTxid;
 
+        // Scalar-feed bilateral CFD fields (type == "scalarcfd"); the difficulty sibling, keyed by a
+        // published scalar feed rather than the on-chain difficulty target. Vault/open fields reuse
+        // longVault/shortVault/openTxid above (shared bilateral covenant shape).
+        int scfdFeedId{0};
+        quint64 scfdFixingRef{0};
+        QString scfdStrike;             // K, 32-hex scalar
+        int scfdFixingDeadline{0};      // publication_deadline_height
+        int scfdSettleLockHeight{0};
+        double scfdLongIm{0.0};
+        double scfdLongLambda{0.0};
+        double scfdShortIm{0.0};
+        double scfdShortLambda{0.0};
+        bool scfdLongSettled{false};
+        bool scfdShortSettled{false};
+
         // MTM pricing fields
         double mtmMarks{0.0};       // MTM using internal curves
         double mtmMarket{0.0};      // MTM using market-calibrated curves

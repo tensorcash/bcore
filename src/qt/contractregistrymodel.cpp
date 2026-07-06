@@ -65,6 +65,9 @@ QVariant ContractRegistryModel::data(const QModelIndex& index, int role) const
             if (contract.type == "difficulty") {
                 return contract.diffProduct == "option" ? tr("Difficulty Option") : tr("Difficulty CFD");
             }
+            if (contract.type == "scalarcfd") {
+                return tr("Scalar CFD");
+            }
             return contract.type;
         case Role:
             return contract.role;
@@ -98,6 +101,11 @@ QVariant ContractRegistryModel::data(const QModelIndex& index, int role) const
                 return tr("L IM: %1 ⇄ S IM: %2 TSC")
                     .arg(contract.diffLongIm, 0, 'f', 8)
                     .arg(contract.diffShortIm, 0, 'f', 8);
+            } else if (contract.type == "scalarcfd") {
+                // IMs are in the collateral's units (sats if native); show raw units.
+                return tr("L IM: %1 ⇄ S IM: %2")
+                    .arg(contract.scfdLongIm, 0, 'f', 0)
+                    .arg(contract.scfdShortIm, 0, 'f', 0);
             }
             return tr("N/A");
         case SecondaryValue:
@@ -123,6 +131,10 @@ QVariant ContractRegistryModel::data(const QModelIndex& index, int role) const
                 return tr("L λ %1 | S λ %2")
                     .arg(contract.diffLongLambda, 0, 'f', 2)
                     .arg(contract.diffShortLambda, 0, 'f', 2);
+            } else if (contract.type == "scalarcfd") {
+                return tr("L λ %1 | S λ %2")
+                    .arg(contract.scfdLongLambda, 0, 'f', 2)
+                    .arg(contract.scfdShortLambda, 0, 'f', 2);
             }
             return tr("N/A");
         case KeyMetric:
@@ -147,6 +159,10 @@ QVariant ContractRegistryModel::data(const QModelIndex& index, int role) const
                 return tr("-");
             } else if (contract.type == "difficulty") {
                 return tr("Strike %1 @ H%2").arg(contract.strikeNbits).arg(contract.fixingHeight);
+            } else if (contract.type == "scalarcfd") {
+                return tr("Feed %1 | Strike %2…")
+                    .arg(contract.scfdFeedId)
+                    .arg(contract.scfdStrike.left(10));
             }
             return tr("N/A");
         case Status:
@@ -162,6 +178,10 @@ QVariant ContractRegistryModel::data(const QModelIndex& index, int role) const
                 return tr("-");
             } else if (contract.type == "difficulty") {
                 return tr("Settle @ H%1").arg(contract.settleLockHeight);
+            } else if (contract.type == "scalarcfd") {
+                return tr("Fix by H%1 | Settle @ H%2")
+                    .arg(contract.scfdFixingDeadline)
+                    .arg(contract.scfdSettleLockHeight);
             }
             return tr("N/A");
         case Actions:
@@ -213,6 +233,28 @@ QVariant ContractRegistryModel::data(const QModelIndex& index, int role) const
                 if (!contract.openTxid.isEmpty()) d += tr("Open txid: %1").arg(contract.openTxid);
                 return d;
             }
+            // Scalar-feed CFD rows carry an analogous detail summary.
+            if (contract.type == "scalarcfd") {
+                QString d = tr("<b>Scalar-feed CFD</b><br>");
+                d += tr("ID: %1<br>").arg(contract.id);
+                d += tr("Role: %1 &nbsp;|&nbsp; Status: %2<br>").arg(contract.role, contract.status);
+                d += tr("Feed: %1 &nbsp;|&nbsp; Fixing ref: %2<br>").arg(contract.scfdFeedId).arg(contract.scfdFixingRef);
+                d += tr("Strike: %1<br>").arg(contract.scfdStrike);
+                d += tr("Fixing deadline: H%1<br>").arg(contract.scfdFixingDeadline);
+                d += tr("Settle-lock height: H%1<br>").arg(contract.scfdSettleLockHeight);
+                d += tr("Long IM: %1, λ %2<br>").arg(contract.scfdLongIm, 0, 'f', 0).arg(contract.scfdLongLambda, 0, 'f', 2);
+                d += tr("Short IM: %1, λ %2<br>").arg(contract.scfdShortIm, 0, 'f', 0).arg(contract.scfdShortLambda, 0, 'f', 2);
+                const bool opened = !contract.openTxid.isEmpty();
+                if (opened) {
+                    d += tr("Long settled: %1 &nbsp;|&nbsp; Short settled: %2<br>")
+                             .arg(contract.scfdLongSettled ? tr("yes") : tr("no"),
+                                  contract.scfdShortSettled ? tr("yes") : tr("no"));
+                }
+                if (!contract.longVault.isEmpty()) d += tr("Long vault: %1<br>").arg(contract.longVault);
+                if (!contract.shortVault.isEmpty()) d += tr("Short vault: %1<br>").arg(contract.shortVault);
+                if (!contract.openTxid.isEmpty()) d += tr("Open txid: %1").arg(contract.openTxid);
+                return d;
+            }
             break;
         case PrimaryValue:
             if (contract.type == "repo") {
@@ -223,6 +265,8 @@ QVariant ContractRegistryModel::data(const QModelIndex& index, int role) const
                 return tr("Atomic swap: Alice delivers first asset, Bob delivers second asset");
             } else if (contract.type == "difficulty") {
                 return tr("Initial margin posted per leg (CFD) or by the writer (Option), in native TSC");
+            } else if (contract.type == "scalarcfd") {
+                return tr("Initial margin posted per leg, in the collateral's units (sats if native)");
             }
             break;
         case SecondaryValue:
@@ -234,6 +278,8 @@ QVariant ContractRegistryModel::data(const QModelIndex& index, int role) const
                 return tr("Exchange rate: Bob's delivery / Alice's delivery");
             } else if (contract.type == "difficulty") {
                 return tr("Leverage (lambda) per leg; for an option, also the premium");
+            } else if (contract.type == "scalarcfd") {
+                return tr("Leverage (lambda) per leg");
             }
             break;
         case KeyMetric:
@@ -245,6 +291,8 @@ QVariant ContractRegistryModel::data(const QModelIndex& index, int role) const
                 return tr("Option premium paid by one party to the other");
             } else if (contract.type == "difficulty") {
                 return tr("Strike difficulty (compact nBits) and the fixing block height");
+            } else if (contract.type == "scalarcfd") {
+                return tr("Scalar feed id and the strike level (K) the payoff references");
             }
             break;
         case Timeline:
@@ -254,6 +302,8 @@ QVariant ContractRegistryModel::data(const QModelIndex& index, int role) const
                 return tr("Exercise/Settlement deadlines");
             } else if (contract.type == "difficulty") {
                 return tr("Settle-lock height (fixing height + maturity depth)");
+            } else if (contract.type == "scalarcfd") {
+                return tr("Publication deadline for the fixing, and the settle-lock height");
             }
             break;
         }
@@ -556,6 +606,23 @@ QList<ContractRegistryModel::ContractEntry> ContractRegistryModel::buildSnapshot
         entry.shortVault = contractData.value("short_vault").toString();
         entry.openTxid = contractData.value("open_txid").toString();
 
+        // Scalar-feed bilateral CFD fields (collateral units; legs flattened to scfd_* in listContracts()
+        // to avoid colliding with the difficulty diff_* / forward long_margin_* keys). long_vault/
+        // short_vault/open_txid/long_settled/short_settled share the keys parsed above.
+        if (entry.type == "scalarcfd") {
+            entry.scfdFeedId = contractData.value("scfd_feed_id", 0).toInt();
+            entry.scfdFixingRef = contractData.value("scfd_fixing_ref", 0).toULongLong();
+            entry.scfdStrike = contractData.value("scfd_strike").toString();
+            entry.scfdFixingDeadline = contractData.value("scfd_publication_deadline_height", 0).toInt();
+            entry.scfdSettleLockHeight = contractData.value("settle_lock_height", 0).toInt();
+            entry.scfdLongIm = contractData.value("scfd_long_im", 0.0).toDouble();
+            entry.scfdLongLambda = contractData.value("scfd_long_lambda", 0.0).toDouble();
+            entry.scfdShortIm = contractData.value("scfd_short_im", 0.0).toDouble();
+            entry.scfdShortLambda = contractData.value("scfd_short_lambda", 0.0).toDouble();
+            entry.scfdLongSettled = contractData.value("long_settled", false).toBool();
+            entry.scfdShortSettled = contractData.value("short_settled", false).toBool();
+        }
+
         // Store resolved asset labels in fullData for dialogs
         QVariantMap enrichedData = contractData;
         enrichedData["collateral_asset_label"] = entry.collateralAsset;
@@ -785,6 +852,33 @@ void ContractRegistryModel::computeMTM(WalletModel* walletModel, ContractEntry& 
                             entry.mtmMarks = result.expected_long_mtm;
                             entry.mtmMarket = result.expected_long_mtm;
                         }
+                    }
+                    entry.mtmComputed = true;
+                } else {
+                    entry.mtmComputed = false;
+                }
+            }
+        } else if (entry.type == "scalarcfd") {
+            // Scalar-feed bilateral CFD: only priced once opened (a funded pair exists to mark).
+            if (entry.status != "opened" && entry.status != "partially_settled") {
+                entry.mtmComputed = false;
+            } else {
+                LogPrintf("ContractRegistryModel::computeMTM scalarcfd.price start id=%s\n",
+                          entry.id.toStdString().c_str());
+                auto result = walletModel->scalarCfdPrice(entry.id);
+                LogPrintf("ContractRegistryModel::computeMTM scalarcfd.price done id=%s success=%d elapsed_ms=%lld\n",
+                          entry.id.toStdString().c_str(),
+                          result.success,
+                          timer.elapsed());
+
+                if (result.success && !result.model_unreliable) {
+                    // No separate mark/market curve for scalar-feed yet: expected MTM for both columns.
+                    if (entry.role == "short") {
+                        entry.mtmMarks = result.expected_short_mtm;
+                        entry.mtmMarket = result.expected_short_mtm;
+                    } else {
+                        entry.mtmMarks = result.expected_long_mtm;
+                        entry.mtmMarket = result.expected_long_mtm;
                     }
                     entry.mtmComputed = true;
                 } else {

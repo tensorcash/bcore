@@ -424,6 +424,7 @@ private:
     // Holder redeem (no wallet record): terms recovered from the verified on-chain descriptor.
     QSpinBox* verifyOptLotSpin{nullptr};
     QLineEdit* verifyOptPotEdit{nullptr};
+    QPushButton* verifyOptSettleButton{nullptr};   // holder settle a matured lot (keeper-driven) -> fills the pot
     QPushButton* verifyOptRedeemButton{nullptr};
     QString m_verifyOptTermsJson;
 
@@ -726,6 +727,7 @@ private Q_SLOTS:
     void onScfdSignCoop();            // scalarcfd.sign_coop (2-of-2)
     void onScfdPrice();               // scalarcfd.price -> MTM
     void onVerifyOptionById();        // pre-purchase fraud check by ticker / asset id (holder + issuer)
+    void onVerifyOptionSettle();      // holder settle a matured lot (keeper-driven); auto-fills the pot to redeem
     void onVerifyOptionRedeem();      // holder redeem a pot using terms recovered from verify (no record)
     void onRegChildPreviewUpdate();   // refresh the ROOT.SUFFIX preview label
     void onMintAmountChanged();
