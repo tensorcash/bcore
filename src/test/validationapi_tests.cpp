@@ -885,7 +885,7 @@ BOOST_AUTO_TEST_CASE(public_error_backoff_gate_blocks_polling)
     BOOST_CHECK(!blocked);
 }
 
-// Option-2 (PROMPT BINDING.md §6): BlockValidation.difficulty is advertised to
+// Option-2 (TIP-0003): BlockValidation.difficulty is advertised to
 // the verification service as BOTH the admission-target input AND the v3-active
 // signal, so it is nonzero ONLY when v3 rules are active at the block's OWN
 // height. This pins the pure decision SendApiRequest routes through.
@@ -928,7 +928,7 @@ BOOST_AUTO_TEST_CASE(v3_activation_config_soundness)
     BOOST_CHECK(IsV3ActivationConfigSound(DISABLED, true, false));
 
     // v3 active on a real (non-mockable) chain: sound ONLY with red-block
-    // enforcement (external_api). This is the PROMPT BINDING.md §5 invariant.
+    // enforcement (external_api). This is the TIP-0003 invariant.
     BOOST_CHECK(!IsV3ActivationConfigSound(ACTIVE, /*external_api=*/false, /*mockable=*/false));
     BOOST_CHECK(IsV3ActivationConfigSound(ACTIVE, /*external_api=*/true, /*mockable=*/false));
 

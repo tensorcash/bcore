@@ -1835,7 +1835,7 @@ static RPCHelpMan submit_mining_response()
 
     // QuickVerify before submission, mirroring SolutionReceiverLoop:452-458.
     QuickVerifier quick_verifier;
-    // V3 prompt binding (PROMPT BINDING.md §7): a nonce-bearing v3 proof folds
+    // V3 prompt binding (TIP-0003): a nonce-bearing v3 proof folds
     // the admission nonce into every u; without the v3 context this pre-check
     // recomputes u WITHOUT the nonce and spuriously rejects a consensus-valid
     // proof. Mirror validation.cpp's pre-check context (height = next_height,

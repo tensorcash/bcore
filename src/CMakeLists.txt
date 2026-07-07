@@ -34,7 +34,7 @@ if(WIN32)
 endif()
 
 # libargon2 — required for the vendored v3 admission-puzzle verification
-# (verification/pow_v3.cpp, PROMPT BINDING.md §6/§9). Required unconditionally
+# (verification/pow_v3.cpp, TIP-0003). Required unconditionally
 # for v3.0: consensus code must never ship without the ability to verify a
 # claimed admission nonce (a node that cannot run Argon2id could not validate
 # v3 blocks after activation). libargon2 provides no CMake package, so detect

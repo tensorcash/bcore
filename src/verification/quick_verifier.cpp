@@ -34,7 +34,7 @@ VerificationResult QuickVerifier::QuickVerify(const CProofBlob& proof, bool enfo
         m_intermediates = IntermediateValues();
     }
 
-    // V3 setup (PROMPT BINDING.md): decide applicability and extract the
+    // V3 setup (TIP-0003): decide applicability and extract the
     // claimed admission nonce BEFORE any hashing — the nonce enters every u
     // and the final hash (§7). No-op (byte-identical v2 behavior) unless a
     // chain context was provided, proof.version >= 3 and the height is at or
@@ -263,7 +263,7 @@ bool QuickVerifier::VerifyParameters(const CProofBlob& proof) {
         }
     }
 
-    // V3 (PROMPT BINDING.md §2): the sampler profile is a consensus-fixed
+    // V3 (TIP-0003): the sampler profile is a consensus-fixed
     // constant, enforced by exact equality on top of the global bounds above
     // (which stay enforced as a second line for every version).
     if (m_v3Active && !VerifyV3SamplerProfile(proof)) {
@@ -274,7 +274,7 @@ bool QuickVerifier::VerifyParameters(const CProofBlob& proof) {
 }
 
 bool QuickVerifier::VerifyV3SamplerProfile(const CProofBlob& proof) {
-    // Consensus invariant (PROMPT BINDING.md §2): v3.0 accepts EXACTLY
+    // Consensus invariant (TIP-0003): v3.0 accepts EXACTLY
     // temperature=1.0, top_p=1.0, top_k=50, repetition_penalty=1.0 — the
     // profile is consensus-fixed, never miner- or model-chosen, so
     // enforcement is exact equality against the proof's existing sampler
@@ -425,7 +425,7 @@ bool QuickVerifier::VerifySequenceLightVectorized(const CProofBlob& proof, bool 
         }
     }
 
-    // V3 (PROMPT BINDING.md §4/§5/§6): recompute conservative B_cred from the
+    // V3 (TIP-0003): recompute conservative B_cred from the
     // bounds produced above, apply the tier rule and verify a present
     // admission nonce. Runs BEFORE the reuse-entropy gate so v3 failures are
     // attributed precisely; both are enforced.
@@ -444,7 +444,7 @@ bool QuickVerifier::PrepareV3(const CProofBlob& proof) {
     m_v3Active = false;
     m_v3Nonce.reset();
 
-    // Consensus invariant (PROMPT BINDING.md §1): the v3 rules bind ONLY when
+    // Consensus invariant (TIP-0003): the v3 rules bind ONLY when
     // proof.version >= 3 AND height >= V3ActivationHeight, read from the chain
     // params active for this block — pre-activation heights and pre-v3 proof
     // versions validate byte-identically to today (v2 untouched).
@@ -673,7 +673,7 @@ std::vector<uint8_t> QuickVerifier::BuildStepMessage(const std::vector<uint32_t>
     auto precision_bytes = StringToBytes(proof.compute_precision);
     message.insert(message.end(), precision_bytes.begin(), precision_bytes.end());
 
-    // 7. V3 (PROMPT BINDING.md §7): when an admission nonce is claimed, its 32
+    // 7. V3 (TIP-0003): when an admission nonce is claimed, its 32
     // raw bytes are appended to EVERY step preimage (all 256 u draws and the
     // final target-critical hash) — the layout mirror of
     // pow_v3::build_step_message. Absent nonce (or include_nonce=false, the
@@ -1136,7 +1136,7 @@ bool QuickVerifier::VerifyFinalHash(const CProofBlob& proof) {
     }
 
     // Use the SAME message builder as ComputeUValue (step = 0 for the final
-    // hash). V3 (PROMPT BINDING.md §7): the claimed admission nonce is
+    // hash). V3 (TIP-0003): the claimed admission nonce is
     // appended here too, so the proof hash — and therefore the derived header
     // nonce and the short-hash target check — commits to it transitively; no
     // separate post-admission grind field exists, and none may be introduced.

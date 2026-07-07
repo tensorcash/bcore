@@ -556,7 +556,7 @@ ValidationAPI::ValidationAPI(ChainstateManager& chainman, const Consensus::Param
 ValidationResponseValue ValidationAPI::RunLocalQuick(const CBlock& block)
 {
     QuickVerifier verifier;
-    // V3 prompt binding (PROMPT BINDING.md): a nonce-bearing v3 proof folds the
+    // V3 prompt binding (TIP-0003): a nonce-bearing v3 proof folds the
     // admission nonce into every u (§7); without the v3 context the local quick
     // check would recompute u WITHOUT the nonce and spuriously fail the block
     // (U-value mismatch) even though it is consensus-valid. Mirror the same
@@ -2606,7 +2606,7 @@ int64_t V3AdvertisedDifficulty(int height, const Consensus::Params& params,
 
 bool IsV3ActivationConfigSound(int v3_activation_height, bool external_api,
                                bool is_mockable_chain) {
-    // PROMPT BINDING.md §5/§9: B_cred tiering is consensus-fast-path evidence
+    // TIP-0003: B_cred tiering is consensus-fast-path evidence
     // computed from the proof's SUBMITTED top-k, so its free tier is only sound
     // when the full-replay / red-block enforcement path (external_api) rejects
     // forged high-entropy evidence. The plan is explicit: "v3 MUST NOT activate
@@ -2657,7 +2657,7 @@ void ValidationAPI::SendApiRequest(const uint256 &req_id, const CBlock& block, c
 
     // Registered model difficulty from the record active at this block's
     // height (modeldb is undo/reorg-safe), so the verification service can
-    // derive the v3 admission target (PROMPT BINDING.md §6) without its own
+    // derive the v3 admission target (TIP-0003) without its own
     // registry mirror. 0 = not provided (appended, wire-compatible field);
     // bcore consensus remains authoritative for the admission check itself.
     //

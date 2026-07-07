@@ -46,7 +46,7 @@ static const uint16_t MAX_CHALLENGE_VALIDATION_REQUEST_ATTEMPTS{15}; // Before f
 // static const uint16_t MAX_MODEL_VALIDATION_REQUEST_ATTEMPTS{2}; // Before failing
 // static const uint16_t MAX_FULL_VALIDATION_REQUEST_ATTEMPTS{5}; // Before failing
 
-/** Option-2 advertised-difficulty decision (PROMPT BINDING.md §6), factored
+/** Option-2 advertised-difficulty decision (TIP-0003), factored
  *  out of ValidationAPI::SendApiRequest as a pure function for testability.
  *  The verification service reads BlockValidation.difficulty as BOTH the
  *  admission-target input AND the v3-active signal, so bcore advertises the
@@ -56,7 +56,7 @@ static const uint16_t MAX_CHALLENGE_VALIDATION_REQUEST_ATTEMPTS{15}; // Before f
 int64_t V3AdvertisedDifficulty(int height, const Consensus::Params& params,
                                int64_t registered_difficulty);
 
-/** Startup soundness check for the v3 activation config (PROMPT BINDING.md
+/** Startup soundness check for the v3 activation config (TIP-0003
  *  §5/§9): a finite V3ActivationHeight is only valid when red-block enforcement
  *  (external_api full replay) is on, since v3's fast-path B_cred free tier is
  *  unsound without it. Mockable/regtest chains are exempt (they test the fast

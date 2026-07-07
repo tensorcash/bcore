@@ -84,7 +84,7 @@ TOP_P = 1.0
 TOP_K = 8
 REPETITION_PENALTY = 1.0
 
-# --- v3 (PROMPT BINDING.md) sampler profile + B_cred tier constants -------- #
+# --- v3 (TIP-0003) sampler profile + B_cred tier constants -------- #
 # The v3 sampler profile is FIXED and enforced by QuickVerifier when a proof
 # is v3-active (pow_v3::SAMPLER_V3_TOP_K etc.); any deviation is rejected.
 V3_PROOF_VERSION = 3
@@ -182,7 +182,7 @@ def _digest_to_u(digest):
 def _pow_message(header_prefix, vdf, tick, step, context, admission_nonce=None):
     """The SHA256 preimage shared by ComputeUValue and VerifyFinalHash.
 
-    v3 (PROMPT BINDING.md §7): when ``admission_nonce`` (32 raw bytes) is given
+    v3 (TIP-0003): when ``admission_nonce`` (32 raw bytes) is given
     it is appended AFTER the precision string, so it perturbs every u draw and
     the final hash. Mirrors pow_v3.build_step_message(admission_nonce=...).
     """

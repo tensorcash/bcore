@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Functional test for the mandatory v3 activation height (PROMPT BINDING.md §9).
+"""Functional test for the mandatory v3 activation height (TIP-0003).
 
 Drives real block submission (create_mining_work_unit -> solve -> submit) on a
 regtest node with -v3activationheight set to a small height X, asserting the

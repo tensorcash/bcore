@@ -4068,7 +4068,7 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             // Version-keyed reuse-entropy gate: a no-op for legacy (v1) proofs,
             // enforces the q32 reuse-score gate for v2+ proofs.
             QuickVerifier verifier;
-            // V3 prompt binding (PROMPT BINDING.md): height-gated; dormant
+            // V3 prompt binding (TIP-0003): height-gated; dormant
             // until height >= V3ActivationHeight AND pb.version >= 3. The
             // registered difficulty for the admission target comes from the
             // model record active at this height (same record the nAdjBits
@@ -4096,7 +4096,7 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                                      "bad-proof-version",
                                      "legacy proof version not allowed after reuse-entropy activation");
             }
-            // V3 activation (PROMPT BINDING.md §9): at/after V3ActivationHeight,
+            // V3 activation (TIP-0003): at/after V3ActivationHeight,
             // v3 is MANDATORY — every mining proof must be version >= 3 so the
             // prompt-binding admission / anti-grind rules apply network-wide. A
             // pre-v3 proof at/after activation is a consensus violation.
@@ -8627,7 +8627,7 @@ static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& stat
             // Version-keyed reuse-entropy gate: no-op for legacy (v1) proofs,
             // enforces the q32 reuse-score gate for v2+ proofs.
             QuickVerifier verifier;
-            // V3 prompt binding (PROMPT BINDING.md): height-gated; dormant
+            // V3 prompt binding (TIP-0003): height-gated; dormant
             // until height >= V3ActivationHeight AND pb.version >= 3. Same
             // model-record difficulty plumbing as the nAdjBits ratio check
             // below (modeldb is undo/reorg-safe at this block's parent).
@@ -8654,7 +8654,7 @@ static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& stat
                                      "bad-proof-version",
                                      "legacy proof version not allowed after reuse-entropy activation");
             }
-            // V3 activation (PROMPT BINDING.md §9): at/after V3ActivationHeight,
+            // V3 activation (TIP-0003): at/after V3ActivationHeight,
             // v3 is MANDATORY — every mining proof must be version >= 3 so the
             // prompt-binding admission / anti-grind rules apply network-wide. A
             // pre-v3 proof at/after activation is a consensus violation.
@@ -9326,7 +9326,7 @@ bool ChainstateManager::ProcessNewSampledBlock(const std::shared_ptr<const CBloc
 
             if (has_quick_fields) {
                 QuickVerifier verifier;
-                // V3 prompt binding (PROMPT BINDING.md): the block's height is
+                // V3 prompt binding (TIP-0003): the block's height is
                 // its parent's + 1. If the parent is unknown yet, the v3 rules
                 // stay dormant HERE (height = -1 never activates); the block is
                 // still fully v3-checked in ContextualCheckBlock, which always

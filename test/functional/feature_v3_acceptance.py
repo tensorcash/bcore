@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Functional acceptance test for v3 prompt-binding admission (PROMPT BINDING.md).
+"""Functional acceptance test for v3 prompt-binding admission (TIP-0003).
 
 feature_v3_activation.py pins the mandatory-version *rejection* boundary. This
 test drives the v3 *acceptance* path end-to-end through real block submission
