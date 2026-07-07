@@ -111,8 +111,8 @@ static_assert(sizeof(ARGON2_SALT) == ARGON2_SALT_LEN + 1,
 
 // Reference timings in integer microseconds (§1) — integer so the target
 // derivation is exact in every language.
-constexpr uint64_t ARGON_REF_US = 8000;               // CALIBRATION
-constexpr uint64_t DECODE_US_AT_NORMALIZER = 10000000;// CALIBRATION
+constexpr uint64_t ARGON_REF_US = 4000;               // CALIBRATION: 4010us EPYC 7R13
+constexpr uint64_t DECODE_US_AT_NORMALIZER = 6000000; // CALIBRATION: B=1 5.97s L40S -> tries=60
 constexpr uint64_t MODEL_DIFFICULTY_NORMALIZER = 1000000;  // consensus/params.h
 
 // ------------------------------------------------------------------------- //

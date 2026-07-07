@@ -297,8 +297,8 @@ struct Params {
     // Reference timings in integer microseconds (§6 target derivation):
     // expected_tries = alpha * (decode_us_at_normalizer * normalizer /
     // difficulty) / argon_ref_us, exact integer arithmetic.
-    uint64_t V3ArgonRefUs{8000};
-    uint64_t V3DecodeUsAtNormalizer{10000000};
+    uint64_t V3ArgonRefUs{4000};            // CALIBRATION: 4010us EPYC 7R13 (2026-07-07)
+    uint64_t V3DecodeUsAtNormalizer{6000000}; // CALIBRATION: B=1 5.97s L40S -> tries=60
     // Consensus parser bounds for the v3 extra_flags nonce carrier (§3);
     // violations mean "no nonce claimed", never a parse failure.
     uint64_t V3ExtraFlagsMaxBytes{4096};
