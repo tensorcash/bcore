@@ -64,6 +64,23 @@ int64_t V3AdvertisedDifficulty(int height, const Consensus::Params& params,
 bool IsV3ActivationConfigSound(int v3_activation_height, bool external_api,
                                bool is_mockable_chain);
 
+/** Startup capability check: a finite V3ActivationHeight requires a binary
+ *  whose pow_v3::argon2id_digest() is functional (built with libargon2) —
+ *  an argonless node at a v3-active height rejects every consensus-valid
+ *  admission-band block and forks off. No mockable exemption: argonless
+ *  regtest with v3 active would misbehave identically. Returns false for a
+ *  config that must fail startup. */
+bool IsV3AdmissionVerifyCapable(int v3_activation_height, bool argon2_compiled);
+
+/** Startup cross-language contract check: with a finite V3ActivationHeight,
+ *  the chain's V3BFloorBits/V3BFreeBits must equal the compiled pow_v3
+ *  constants the external Python verifier scores with — a params-only
+ *  recalibration would silently split bcore from the verification fleet.
+ *  Enforced at startup (not per-proof) so unit tests can parameterize the
+ *  thresholds. Returns false for a config that must fail startup. */
+bool IsV3TierParamsVendored(int v3_activation_height,
+                            uint64_t v3_bfloor_bits, uint64_t v3_bfree_bits);
+
 struct Hasher {
     std::size_t operator()(const uint256& val) const noexcept {
         return std::hash<std::string_view>()(

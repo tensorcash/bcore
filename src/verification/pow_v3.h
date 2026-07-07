@@ -216,6 +216,13 @@ std::vector<uint8_t> admission_message(const std::vector<uint8_t>& msg_w,
 // std::runtime_error (paths that never grind/verify admission stay buildable).
 std::array<uint8_t, 32> argon2id_digest(const std::vector<uint8_t>& message);
 
+// True iff argon2id_digest() above is functional in this binary (pow_v3.cpp
+// compiled with POW_V3_HAVE_ARGON2). Startup capability guards use this to
+// refuse a finite V3ActivationHeight on a binary that cannot verify
+// admission — an argonless full node at a v3-active height would reject
+// every consensus-valid admission-band block and fork off.
+bool argon2_compiled() noexcept;
+
 // Integer-exact §6 derivation (mirror of pow_v3.admission_expected_tries):
 //     expected_tries = floor((alpha_num * decode_us_at_normalizer * normalizer)
 //                            / (alpha_den * argon_ref_us * difficulty))

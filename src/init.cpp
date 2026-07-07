@@ -97,6 +97,7 @@
 #include <validationapi.h>
 #include <validationapi_mock.h>
 #include <validationinterface.h>
+#include <verification/pow_v3.h>
 #include <wallet/rpc/api_model_registration.h>
 #include <walletinitinterface.h>
 
@@ -1012,6 +1013,34 @@ bool AppInitParameterInteraction(const ArgsManager& args)
             "(external_api full validation) is disabled; the v3 free-tier "
             "B_cred is unsound without it (TIP-0003). Enable "
             "external_api or unset the activation height."));
+    }
+
+    // A finite V3ActivationHeight also requires Argon2 admission verification
+    // in THIS binary: pow_v3::argon2id_digest() throws in an argonless build
+    // and the throw maps to proof-invalid, so such a node would reject every
+    // consensus-valid admission-band block after activation and fork off.
+    if (!IsV3AdmissionVerifyCapable(chainparams.GetConsensus().V3ActivationHeight,
+                                    pow_v3::argon2_compiled())) {
+        return InitError(Untranslated(
+            "V3ActivationHeight is set on this chain but this binary was built "
+            "without libargon2 (POW_V3_HAVE_ARGON2), so it cannot verify v3 "
+            "admission nonces and would reject valid admission-band blocks "
+            "after activation. Rebuild with libargon2 (libargon2-dev / "
+            "brew install argon2) or unset the activation height."));
+    }
+
+    // The tier thresholds must match the compiled pow_v3 constants (which the
+    // external Python verifier also scores with): a params-only recalibration
+    // would silently split this node from the verification fleet. Ship
+    // recalibrations as a coordinated constants change in both languages.
+    if (!IsV3TierParamsVendored(chainparams.GetConsensus().V3ActivationHeight,
+                                chainparams.GetConsensus().V3BFloorBits,
+                                chainparams.GetConsensus().V3BFreeBits)) {
+        return InitError(Untranslated(
+            "V3ActivationHeight is set but this chain's V3BFloorBits/"
+            "V3BFreeBits differ from the compiled pow_v3 tier constants; "
+            "recalibration must ship as a coordinated constants change "
+            "(pow_v3 + verifier), not a chain-params edit."));
     }
 
     // Testnet3 deprecation warning

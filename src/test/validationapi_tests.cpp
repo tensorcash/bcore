@@ -7,6 +7,7 @@
 #define private public
 #define protected public
 #include <validationapi.h>
+#include <verification/pow_v3.h>
 #include <net.h>
 #undef private
 #undef protected
@@ -939,6 +940,52 @@ BOOST_AUTO_TEST_CASE(v3_activation_config_soundness)
     // Activation-from-genesis (height 0) still requires the safety net.
     BOOST_CHECK(!IsV3ActivationConfigSound(0, false, false));
     BOOST_CHECK(IsV3ActivationConfigSound(0, true, false));
+}
+
+BOOST_AUTO_TEST_CASE(v3_admission_verify_capability)
+{
+    const int DISABLED = std::numeric_limits<int>::max();
+    const int ACTIVE = 100;
+
+    // v3 disabled: an argonless binary is fine (never sees v3 rules).
+    BOOST_CHECK(IsV3AdmissionVerifyCapable(DISABLED, /*argon2_compiled=*/false));
+    BOOST_CHECK(IsV3AdmissionVerifyCapable(DISABLED, true));
+
+    // Finite activation height: only sound when argon2id_digest is functional.
+    // No mockable exemption — an argonless binary cannot verify a claimed
+    // nonce on any chain.
+    BOOST_CHECK(!IsV3AdmissionVerifyCapable(ACTIVE, /*argon2_compiled=*/false));
+    BOOST_CHECK(IsV3AdmissionVerifyCapable(ACTIVE, true));
+    BOOST_CHECK(!IsV3AdmissionVerifyCapable(0, false));
+    BOOST_CHECK(IsV3AdmissionVerifyCapable(0, true));
+
+    // This test binary itself must be argon2-capable: CI images install
+    // libargon2 and the functional acceptance test grinds real nonces.
+    BOOST_CHECK(pow_v3::argon2_compiled());
+}
+
+BOOST_AUTO_TEST_CASE(v3_tier_params_vendored)
+{
+    const int DISABLED = std::numeric_limits<int>::max();
+    const int ACTIVE = 100;
+    const uint64_t FLOOR = pow_v3::B_FLOOR_BITS;
+    const uint64_t FREE = pow_v3::B_FREE_BITS;
+
+    // v3 disabled: tier params are irrelevant.
+    BOOST_CHECK(IsV3TierParamsVendored(DISABLED, FLOOR + 1, FREE + 1));
+
+    // Finite activation height: both thresholds must equal the compiled
+    // pow_v3 constants the Python verifier scores with.
+    BOOST_CHECK(IsV3TierParamsVendored(ACTIVE, FLOOR, FREE));
+    BOOST_CHECK(!IsV3TierParamsVendored(ACTIVE, FLOOR + 1, FREE));
+    BOOST_CHECK(!IsV3TierParamsVendored(ACTIVE, FLOOR, FREE + 1));
+    BOOST_CHECK(IsV3TierParamsVendored(0, FLOOR, FREE));
+    BOOST_CHECK(!IsV3TierParamsVendored(0, FLOOR - 1, FREE));
+
+    // The default-constructed consensus params must themselves be vendored —
+    // the real chains inherit these defaults.
+    Consensus::Params defaults{};
+    BOOST_CHECK(IsV3TierParamsVendored(ACTIVE, defaults.V3BFloorBits, defaults.V3BFreeBits));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

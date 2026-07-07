@@ -3,6 +3,7 @@
 #include <common/args.h>
 #include <consensus/merkle.h>
 #include <interfaces/mining.h>
+#include <modeldb.h>
 #include <node/context.h>
 #include <node/extapi.h>
 #include <node/miner.h>
@@ -462,6 +463,28 @@ void ExtAPI::SolutionReceiverLoop() {
     while (mining_on.load() && !chainman.m_interrupt) {
         uint32_t request_id = 0;
         if (GetApiAnswer(blockToProcess, false, &request_id)) {
+            // V3 prompt binding (TIP-0003): a nonce-bearing v3 proof
+            // folds the admission nonce into every u (§7); without the v3
+            // context this advisory check would recompute u WITHOUT the nonce
+            // and log a false "Quick verification FAILED" for every valid
+            // admission-band own-solution. Mirror RunLocalQuick / the submit
+            // RPC: height = parent + 1 (dormant at -1 when the parent is
+            // unknown), registered difficulty from modeldb.
+            {
+                const auto& pb = blockToProcess.pow;
+                const int proof_height = WITH_LOCK(::cs_main, {
+                    const CBlockIndex* pprev = chainman.m_blockman.LookupBlockIndex(blockToProcess.hashPrevBlock);
+                    return pprev ? pprev->nHeight + 1 : -1;
+                });
+                int64_t v3_difficulty{0};
+                if (pb.version >= 3 && g_modeldb && !pb.model_identifier.empty()) {
+                    ModelRecord rec;
+                    if (g_modeldb->ReadModel(pb.GetModelHash(), rec)) {
+                        v3_difficulty = rec.metadata.difficulty;
+                    }
+                }
+                quickVerifier.SetV3Context(chainman.GetConsensus(), proof_height, v3_difficulty);
+            }
             // Run quick verification on the mining solution before submitting
             // Version-keyed: enforces the reuse gate iff pow.version >= REUSE_GATE_VERSION.
             VerificationResult qvResult = quickVerifier.QuickVerify(blockToProcess.pow);

@@ -11,6 +11,7 @@
 #include <util/signalinterrupt.h>
 #include <util/string.h>
 #include <validation.h>
+#include <verification/pow_v3.h>
 #include <functional>
 #include <verification/quick_verifier.h>
 #include <boost/beast/core.hpp>
@@ -2620,6 +2621,40 @@ bool IsV3ActivationConfigSound(int v3_activation_height, bool external_api,
     if (v3_activation_height == std::numeric_limits<int>::max()) return true;  // v3 disabled
     if (is_mockable_chain) return true;                                        // test harness
     return external_api;
+}
+
+bool IsV3TierParamsVendored(int v3_activation_height,
+                            uint64_t v3_bfloor_bits, uint64_t v3_bfree_bits) {
+    // The tier thresholds are part of the cross-language golden-vector
+    // contract: the external Python verifier scores tiers with the compiled
+    // pow_v3 defaults (proof_verifier.py tier_for_b_cred_units), so chain
+    // params that diverge from B_FLOOR_BITS/B_FREE_BITS would silently split
+    // bcore consensus from the verification fleet. Recalibration must ship as
+    // a coordinated constants change in BOTH languages, never a params edit.
+    //
+    // Enforced at startup (not per-proof in PrepareV3) so unit tests remain
+    // free to parameterize the thresholds when steering B_cred tiers.
+    if (v3_activation_height == std::numeric_limits<int>::max()) return true;  // v3 disabled
+    return v3_bfloor_bits == pow_v3::B_FLOOR_BITS &&
+           v3_bfree_bits == pow_v3::B_FREE_BITS;
+}
+
+bool IsV3AdmissionVerifyCapable(int v3_activation_height, bool argon2_compiled) {
+    // libargon2 is an optional build dependency (desktop cross/depends
+    // toolchains lack it), and pow_v3::argon2id_digest() throws at runtime in
+    // an argonless build. That is fine for a binary that never sees v3 rules —
+    // but at a v3-active height every claimed admission nonce must be
+    // Argon2-verified, and the throw is mapped to proof-invalid, so an
+    // argonless full node would reject every consensus-valid admission-band
+    // block and fork off the network. Refuse the config at startup instead.
+    //
+    // Unlike IsV3ActivationConfigSound there is NO mockable exemption: an
+    // argonless binary cannot verify a claimed nonce on regtest either, and
+    // every test image installs libargon2 — an argonless regtest run with a
+    // finite activation height would only produce confusing admission-band
+    // rejections, so failing fast is correct there too.
+    if (v3_activation_height == std::numeric_limits<int>::max()) return true;  // v3 disabled
+    return argon2_compiled;
 }
 
 void ValidationAPI::SendApiRequest(const uint256 &req_id, const CBlock& block, const ValidationReqType& type) {
