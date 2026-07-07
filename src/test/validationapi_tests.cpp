@@ -74,6 +74,40 @@ BOOST_AUTO_TEST_CASE(start_amber_flow_skips_nothing_behavior)
     BOOST_CHECK(api.amber_requests_.empty());
 }
 
+BOOST_AUTO_TEST_CASE(start_amber_flow_reentry_preserves_in_flight_request)
+{
+    auto api = MakeValidationApi(m_node);
+    const uint256 id = DeterministicId();
+    BOOST_CHECK(api.SetRequestStatus(id, ValidationReqType::Full, ValidationResponseValue::Full_Amber));
+    api.StartAmberFlow(id, MakeDummyBlock(), ValidationResponseBehavior::AcceptBlock);
+
+    auto& request = api.amber_requests_[id];
+    // Advance the ladder as if several dispatch attempts already happened.
+    request.attempts = kAmberRetryCount - 1;
+    request.finalize_deadline = std::chrono::steady_clock::now();
+    const auto first_seen = request.first_seen;
+    const auto next_send = request.next_send;
+
+    // Re-delivery of the same (cached) Amber status must not reset the
+    // in-flight request: a reset here let a pending block that kept being
+    // re-submitted hold its height wedged for the validator's cache TTL.
+    api.StartAmberFlow(id, MakeDummyBlock(), ValidationResponseBehavior::ProcessNewBlock);
+
+    BOOST_CHECK_EQUAL(api.amber_requests_.count(id), 1U);
+    const auto& after = api.amber_requests_[id];
+    BOOST_CHECK_EQUAL(after.attempts, kAmberRetryCount - 1);
+    BOOST_CHECK(after.first_seen == first_seen);
+    BOOST_CHECK(after.next_send == next_send);
+    BOOST_CHECK(after.finalize_deadline.has_value());
+    BOOST_CHECK_EQUAL(static_cast<int>(after.behavior), static_cast<int>(ValidationResponseBehavior::AcceptBlock));
+
+    // Once the flow finalizes (entry erased), a fresh flow starts cleanly.
+    api.amber_requests_.erase(id);
+    api.StartAmberFlow(id, MakeDummyBlock(), ValidationResponseBehavior::AcceptBlock);
+    BOOST_CHECK_EQUAL(api.amber_requests_.count(id), 1U);
+    BOOST_CHECK_EQUAL(api.amber_requests_[id].attempts, 0);
+}
+
 BOOST_AUTO_TEST_CASE(record_peer_status_updates)
 {
     auto api = MakeValidationApi(m_node);
@@ -133,6 +167,8 @@ BOOST_AUTO_TEST_CASE(amber_finalization_conditions)
 
     api.behaviors.clear();
     api.amber_requests_.clear();
+    // Amber no longer overwrites a finalized terminal; reset like revalidateblock does.
+    BOOST_CHECK(api.RemoveRes_Full(id));
     BOOST_CHECK(api.SetRequestStatus(id, ValidationReqType::Full, ValidationResponseValue::Full_Amber));
     api.StartAmberFlow(id, MakeDummyBlock(7), ValidationResponseBehavior::ProcessNewBlock);
     auto& red_request = api.amber_requests_[id];
@@ -152,6 +188,7 @@ BOOST_AUTO_TEST_CASE(amber_finalization_conditions)
 
     api.behaviors.clear();
     api.amber_requests_.clear();
+    BOOST_CHECK(api.RemoveRes_Full(id));
     BOOST_CHECK(api.SetRequestStatus(id, ValidationReqType::Full, ValidationResponseValue::Full_Amber));
     api.StartAmberFlow(id, MakeDummyBlock(11), ValidationResponseBehavior::AcceptBlock);
     auto& amber_only = api.amber_requests_[id];
@@ -168,6 +205,7 @@ BOOST_AUTO_TEST_CASE(amber_finalization_conditions)
 
     api.behaviors.clear();
     api.amber_requests_.clear();
+    BOOST_CHECK(api.RemoveRes_Full(id));
     BOOST_CHECK(api.SetRequestStatus(id, ValidationReqType::Full, ValidationResponseValue::Full_Amber));
     api.StartAmberFlow(id, MakeDummyBlock(21), ValidationResponseBehavior::ProcessNewBlock);
     auto& forced = api.amber_requests_[id];
@@ -403,6 +441,30 @@ BOOST_AUTO_TEST_CASE(block_validation_db_boundaries)
     for (size_t i = 0; i < ValidationAPI::BlockValidationDB::MAX_RECORDS + 5; ++i) {
         BOOST_CHECK(db.UpdateRes_Full(DeterministicId(), ValidationResponseValue::Full_Green));
     }
+}
+
+BOOST_AUTO_TEST_CASE(update_res_full_amber_never_downgrades_terminal)
+{
+    auto& consensus = Params().GetConsensus();
+    ValidationAPI::BlockValidationDB db(consensus);
+    const uint256 id = DeterministicId();
+
+    BOOST_CHECK(db.UpdateRes_Full(id, ValidationResponseValue::Full_Amber));
+    BOOST_CHECK(db.UpdateRes_Full(id, ValidationResponseValue::Full_Red));
+
+    // A re-delivered cached Amber must not clobber the finalized verdict
+    // (it would restart the amber flow and re-wedge the height).
+    BOOST_CHECK(!db.UpdateRes_Full(id, ValidationResponseValue::Full_Amber));
+    ValidationAPI::BlockValidationDB::BlockValidationRecord_Full rec(id);
+    BOOST_CHECK(db.ReadRes(id, rec));
+    BOOST_CHECK_EQUAL(static_cast<int>(rec.getFull(true)), static_cast<int>(ValidationResponseValue::Full_Red));
+
+    // Terminal-to-terminal transitions stay allowed (peer-review revalidation).
+    BOOST_CHECK(db.UpdateRes_Full(id, ValidationResponseValue::Full_Green));
+    ValidationAPI::BlockValidationDB::BlockValidationRecord_Full rec2(id);
+    BOOST_CHECK(db.ReadRes(id, rec2));
+    BOOST_CHECK_EQUAL(static_cast<int>(rec2.getFull(true)), static_cast<int>(ValidationResponseValue::Full_Green));
+    BOOST_CHECK(!db.UpdateRes_Full(id, ValidationResponseValue::Full_Amber));
 }
 
 BOOST_AUTO_TEST_CASE(block_validation_db_prune_and_serialization)
