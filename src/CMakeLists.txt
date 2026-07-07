@@ -33,26 +33,36 @@ if(WIN32)
   )
 endif()
 
-# libargon2 — required for the vendored v3 admission-puzzle verification
-# (verification/pow_v3.cpp, TIP-0003). Required unconditionally
-# for v3.0: consensus code must never ship without the ability to verify a
-# claimed admission nonce (a node that cannot run Argon2id could not validate
-# v3 blocks after activation). libargon2 provides no CMake package, so detect
-# the header + library directly (Debian/Ubuntu: libargon2-dev; Homebrew: argon2).
+# libargon2 — backs the vendored v3 admission-puzzle verification
+# (verification/pow_v3.cpp, TIP-0003). pow_v3.cpp is written to
+# degrade gracefully: argon2id_digest() is compiled only under
+# POW_V3_HAVE_ARGON2 and otherwise throws at runtime, so a binary can build
+# without libargon2 and simply cannot verify a v3 admission nonce until it is
+# rebuilt with it. That matters only after v3 activation; test images and the
+# release toolchain install libargon2 so verification is fully exercised there.
+# The cross/depends desktop toolchains (macOS x86_64, Windows, static Linux)
+# have no argon2 package, so detection is best-effort here — a hard requirement
+# would break every desktop build for a not-yet-activated feature. libargon2
+# provides no CMake package, so detect the header + library directly
+# (Debian/Ubuntu: libargon2-dev; Homebrew: argon2).
 find_path(ARGON2_INCLUDE_DIR NAMES argon2.h)
 find_library(ARGON2_LIBRARY NAMES argon2)
-if(NOT ARGON2_INCLUDE_DIR OR NOT ARGON2_LIBRARY)
-  message(FATAL_ERROR "libargon2 not found (argon2.h / libargon2). It is required for v3 admission verification; install libargon2-dev (or `brew install argon2`).")
+if(ARGON2_INCLUDE_DIR AND ARGON2_LIBRARY)
+  add_library(argon2_argon2 UNKNOWN IMPORTED)
+  set_target_properties(argon2_argon2 PROPERTIES
+    IMPORTED_LOCATION "${ARGON2_LIBRARY}"
+    INTERFACE_INCLUDE_DIRECTORIES "${ARGON2_INCLUDE_DIR}"
+  )
+  add_library(Argon2::Argon2 ALIAS argon2_argon2)
+  # Compiled globally (not per-target) so pow_v3.cpp, its consumers and the unit
+  # tests all agree on whether argon2id_digest is available.
+  add_compile_definitions(POW_V3_HAVE_ARGON2)
+  message(STATUS "libargon2 found: v3 admission verification enabled (${ARGON2_LIBRARY})")
+else()
+  message(WARNING "libargon2 not found (argon2.h / libargon2): building WITHOUT v3 admission verification. "
+                  "argon2id_digest() will throw if called; rebuild with libargon2-dev (or `brew install argon2`) "
+                  "before enabling v3. Fine for pre-activation / desktop builds.")
 endif()
-add_library(argon2_argon2 UNKNOWN IMPORTED)
-set_target_properties(argon2_argon2 PROPERTIES
-  IMPORTED_LOCATION "${ARGON2_LIBRARY}"
-  INTERFACE_INCLUDE_DIRECTORIES "${ARGON2_INCLUDE_DIR}"
-)
-add_library(Argon2::Argon2 ALIAS argon2_argon2)
-# Compiled globally (not per-target) so pow_v3.cpp, its consumers and the unit
-# tests all agree on whether argon2id_digest is available.
-add_compile_definitions(POW_V3_HAVE_ARGON2)
 
 add_subdirectory(univalue)
 if (ENABLE_IPC AND NOT WITH_EXTERNAL_LIBMULTIPROCESS)
@@ -464,7 +474,7 @@ target_link_libraries(bitcoin_node
     $<$<BOOL:${WITH_ZMQ}>:zeromq>
     OpenSSL::SSL
     OpenSSL::Crypto
-    Argon2::Argon2
+    $<TARGET_NAME_IF_EXISTS:Argon2::Argon2>
     $<$<PLATFORM_ID:Windows>:ws2_32>
     $<$<PLATFORM_ID:Windows>:wsock32>
     $<$<PLATFORM_ID:Windows>:crypt32>
