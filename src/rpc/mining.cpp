@@ -1625,7 +1625,8 @@ static RPCHelpMan create_mining_work_unit()
     // Mutate the coinbase scriptSig: BlockAssembler emits "<height> OP_0"
     // (miner.cpp:200). Replace OP_0 with extranonce_bytes when provided so
     // distinct extranonce_tags rotate the coinbase txid -> merkle root ->
-    // header_prefix. This is the fanout primitive (see COMPUTE_BROKER_IMPROV.md).
+    // header_prefix. This is the fanout primitive that lets a broker hand
+    // distinct work units to many workers off one template.
     {
         CMutableTransaction coinbase_mut(*block.vtx[0]);
         CScript new_scriptsig = CScript() << height;
