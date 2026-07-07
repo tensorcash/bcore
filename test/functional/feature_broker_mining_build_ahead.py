@@ -131,6 +131,14 @@ class BrokerMiningBuildAheadTest(BitcoinTestFramework):
         node.validationmockset(a_hash, "quick", "quick_ok_smell_ok")
         assert_equal(self._advertised_parent(node), a_hash)
 
+        self.log.info("own Full_Amber excludes A (borderline verdict: fleet reverts to confirmed tip)")
+        node.validationmockset(a_hash, "full", "full_amber")
+        assert self._advertised_parent(node) is None, node.getmininginfo()
+        assert_raises_rpc_error(
+            -8, "not the current build-ahead target",
+            node.create_mining_work_unit, REGTEST_NETWORK, P2_OP_TRUE_HEX, "", a_hash,
+        )
+
         self.log.info("own Full_Red excludes A (not advertised, child mint fails closed)")
         node.validationmockset(a_hash, "full", "full_red")
         assert self._advertised_parent(node) is None, node.getmininginfo()
@@ -138,9 +146,6 @@ class BrokerMiningBuildAheadTest(BitcoinTestFramework):
             -8, "not the current build-ahead target",
             node.create_mining_work_unit, REGTEST_NETWORK, P2_OP_TRUE_HEX, "", a_hash,
         )
-        # Full_Amber (in-progress) is NOT excluded -> eligible again.
-        node.validationmockset(a_hash, "full", "full_amber")
-        assert_equal(self._advertised_parent(node), a_hash)
 
         self.log.info("A bogus / non-target parent fails closed")
         assert_raises_rpc_error(

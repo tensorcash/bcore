@@ -136,6 +136,7 @@ BASE_SCRIPTS = [
     'feature_assets_ticker_reorg.py',
     'feature_assets_ticker_reorg_adv.py',
     'feature_validation_amber.py',
+    'feature_validation_amber_http.py',
     'feature_full_validation_tip_window.py',
     'feature_covenant_outputmatch.py',
     'feature_covenant_repo.py',

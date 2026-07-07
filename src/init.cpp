@@ -744,6 +744,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-mockval-default-full=<VALUE>", "Default Full mock response (Full_Green | Full_Amber | Full_Red)", ArgsManager::ALLOW_ANY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-mockval-default-model=<VALUE>", "Default Model mock response (Model_OK | Model_Fail)", ArgsManager::ALLOW_ANY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-mockval-force-external", "Treat mock validation backend as requiring external flow (for functional tests)", ArgsManager::ALLOW_ANY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-validationapi-force-external", "Force the external full-validation flow with the real validation backend on chains that do not enable it by consensus (for functional tests)", ArgsManager::ALLOW_ANY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-mockval-preapprove-genesis", "If set, pre-approve genesis Quick/Smell in mock backend", ArgsManager::ALLOW_ANY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-minermodel=<name@commit>", "Override model identifier used by the miner when building blocks (default: consensus defaults)", ArgsManager::ALLOW_ANY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-validatorhttpurl=<url>", "Gateway verification service base URL for desktop/HTTP mode (e.g., https://verify.tensorcash.io)", ArgsManager::ALLOW_ANY, OptionsCategory::DEBUG_TEST);
@@ -1419,7 +1420,7 @@ static ChainstateLoadResult InitAndLoadChainstate(
     const std::string api_mode = to_lower(args.GetArg("-validationapi", "real"));
     // On mockable/testing chains, default to mock unless explicitly overridden
     const bool is_mockable_chain = chainparams.IsMockableChain();
-    if (api_mode == "mock" || is_mockable_chain) {
+    if (api_mode == "mock" || (is_mockable_chain && !args.IsArgSet("-validationapi"))) {
         auto mock = std::make_unique<ValidationAPIMock>();
         // Apply defaults if provided
         if (args.IsArgSet("-mockval-default-quick")) {
@@ -2142,10 +2143,6 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
                                               rng.rand64(),
                                               *node.addrman, *node.netgroupman, chainparams, args.GetBoolArg("-networkactive", true));
 
-    if (auto* validation_api = dynamic_cast<ValidationAPI*>(g_ValidationApi.get())) {
-        validation_api->SetConnman(node.connman.get());
-    }
-
     assert(!node.fee_estimator);
     // Don't initialize fee estimation with old data if we don't relay transactions,
     // as they would never get updated.
@@ -2384,6 +2381,14 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     }
 
     ChainstateManager& chainman = *Assert(node.chainman);
+
+    // g_ValidationApi is constructed inside InitAndLoadChainstate, so the
+    // connman hookup must happen after it returns — wiring it next to the
+    // CConnman construction above silently no-ops on a null g_ValidationApi
+    // and leaves amber peer corroboration permanently disabled.
+    if (auto* validation_api = dynamic_cast<ValidationAPI*>(g_ValidationApi.get())) {
+        validation_api->SetConnman(node.connman.get());
+    }
 
     if (g_modeldb) {
         bilingual_str modeldb_error;

@@ -255,13 +255,23 @@ bool ValidationAPI::BlockValidationDB::UpdateRes_Full(const uint256& pid, const 
     if (existed_before) {
         db_full->Read(pid, record);
     }
+    // Amber never downgrades a terminal verdict. The validator caches its
+    // Amber and re-serves it for as long as the block keeps being re-polled,
+    // so a late redelivery would otherwise clobber the Green/Red the local
+    // amber flow already finalized and restart the flow from scratch.
+    if (existed_before &&
+        value == ValidationResponseValue::Full_Amber &&
+        (record.FullValidation == static_cast<uint8_t>(ValidationResponseValue::Full_Green) ||
+         record.FullValidation == static_cast<uint8_t>(ValidationResponseValue::Full_Red))) {
+        return false;
+    }
     switch (value){
     case ValidationResponseValue::Full_Amber:
     case ValidationResponseValue::Full_Green:
     case ValidationResponseValue::Full_Red:
         record.FullValidation = static_cast<uint8_t>(value);
         break;
-    default: 
+    default:
         return false;
         break;
     }
@@ -2983,7 +2993,15 @@ void ValidationAPI::StartAmberFlow(const uint256& id, const CBlock& block, Valid
 
     {
         std::lock_guard<std::mutex> lock(amber_mutex_);
-        amber_requests_[id] = std::move(request);
+        // A follow-up flow for this id may already be in flight: while the
+        // block stays pending, every re-submission re-polls the validator,
+        // whose cached Amber is re-delivered here. Overwriting the tracked
+        // request would reset attempts/first_seen/finalize_deadline, so the
+        // no-peer fallback ladder in ProcessAmberRequests() never completes
+        // and the height stays wedged until the validator cache expires.
+        if (!amber_requests_.try_emplace(id, std::move(request)).second) {
+            return;
+        }
     }
     LogPrintf("VALIDATOR: Full validation amber for %s, awaiting peer corroboration%s\n",
               id.ToString(), m_connman ? "" : " (connman unavailable)");
@@ -3207,6 +3225,9 @@ void ValidationAPI::FinalizeAmber(const uint256& id, AmberRequest&& request)
 void ValidationAPI::SetConnman(CConnman* connman)
 {
     m_connman = connman;
+    if (connman) {
+        LogPrintf("VALIDATOR: connman attached; amber peer corroboration enabled\n");
+    }
 }
 
 bool ValidationAPI::GetRequestStatus(const uint256 &id, const ValidationReqType& type, ValidationResponseValue& status, bool async) const {

@@ -8889,9 +8889,11 @@ bool ChainstateManager::EarlyPropagation(const std::shared_ptr<const CBlock>& pb
 static bool IsFullValidationActive(const CChainParams& params)
 {
     if (params.GetConsensus().external_api) return true;
-    return g_ValidationApi &&
-           g_ValidationApi->UsesRequestStatusForBlockProcessing() &&
-           gArgs.GetBoolArg("-mockval-force-external", false);
+    if (!g_ValidationApi) return false;
+    if (g_ValidationApi->UsesRequestStatusForBlockProcessing()) {
+        return gArgs.GetBoolArg("-mockval-force-external", false);
+    }
+    return gArgs.GetBoolArg("-validationapi-force-external", false);
 }
 
 static bool IsFullValidationLiveNode(const ChainstateManager& chainman)
@@ -9152,7 +9154,9 @@ bool ChainstateManager::ProcessNewBlock(const std::shared_ptr<const CBlock>& blo
         bool ret = CheckBlock(*block, state, GetConsensus());
         const bool has_mock_validation = g_ValidationApi && g_ValidationApi->UsesRequestStatusForBlockProcessing();
         const bool force_mock_external = has_mock_validation && gArgs.GetBoolArg("-mockval-force-external", false);
-        const bool use_external_validation = GetConsensus().external_api || force_mock_external;
+        const bool force_real_external = g_ValidationApi && !has_mock_validation &&
+                                         gArgs.GetBoolArg("-validationapi-force-external", false);
+        const bool use_external_validation = GetConsensus().external_api || force_mock_external || force_real_external;
         if (use_external_validation && ret) {
             // Store to disk
             // ret = AcceptBlock(block, state, &pindex, force_processing, nullptr, new_block, min_pow_checked);

@@ -90,11 +90,13 @@ using util::ToString;
 //     accepted_pending_connect, where the chain already advanced past us, and
 //     bounds speculative depth to 1);
 //   * not BLOCK_FAILED_MASK;
-//   * its OWN Full verdict is not Full_Red (GetOwnFullStatus; locally
-//     zero-work / penalised — NOT a BLOCK_FAILED, so the mask check alone is
-//     insufficient). An in-progress own verdict (Not_Checked/Amber) stays
-//     eligible; the peer-aggregate getFull(false) is deliberately NOT used, as
-//     it maps own-Amber-with-no-peers to Red and would drop A mid-window;
+//   * its OWN Full verdict is neither Full_Red nor Full_Amber (GetOwnFullStatus;
+//     Red = locally zero-work / penalised, Amber = borderline verdict that
+//     almost always finalizes Red — either way a doomed parent). Only a
+//     still-unanswered verdict (Not_Checked) stays eligible; the peer-aggregate
+//     getFull(false) is deliberately NOT used, as it maps
+//     own-Amber-with-no-peers to Red via a different code path and would blur
+//     this distinction;
 //   * its Quick_Smell status is Quick_OK_Smell_OK — so EarlyPropagation already
 //     fired (validation.cpp:9184) and peers have A; building A's child is not a
 //     private branch. Smell_Fail blocks are deliberately excluded.
@@ -167,14 +169,22 @@ bool IsBuildAheadEligible(ChainstateManager& chainman, const uint256& hash)
     if (pindex->pprev != chainman.ActiveChain().Tip()) return false;
     if (pindex->nStatus & BLOCK_FAILED_MASK) return false;
     if (g_ValidationApi == nullptr) return false;
-    // Exclude only our OWN Full_Red verdict (GetOwnFullStatus == getFull(own=true),
-    // the raw own status). An in-progress (Not_Checked/Amber) parent — the normal
-    // build-ahead state — stays eligible. The aggregate GetRequestStatus(Full)
-    // uses getFull(own=false), which maps own-Amber-with-no-peers to Full_Red
-    // (validationapi.cpp:135) and would wrongly drop A during its own validation
-    // window.
-    if (g_ValidationApi->GetOwnFullStatus(hash) ==
-        static_cast<uint8_t>(ValidationResponseValue::Full_Red)) {
+    // Exclude our OWN Full_Red AND Full_Amber verdicts (GetOwnFullStatus ==
+    // getFull(own=true), the raw own status — NOT the peer-aggregate
+    // getFull(own=false), which maps own-Amber-with-no-peers to Full_Red and
+    // would conflate the two cases below). Only Not_Checked — the validator has
+    // not answered yet, the normal build-ahead window — stays eligible:
+    //   * Full_Red: locally zero-work / penalised; NOT a BLOCK_FAILED, so the
+    //     mask check alone is insufficient.
+    //   * Full_Amber: the validator HAS answered, and answered borderline. An
+    //     amber parent almost always finalizes RED (the amber follow-up needs
+    //     independent peer corroboration to go GREEN), so chaining the fleet
+    //     onto it wastes the whole window on a doomed branch — observed live
+    //     2026-07-07: every solution of a 69-min mainnet stall was a child of
+    //     one amber'd parent. Conservatively revert to the confirmed tip.
+    const uint8_t own_full = g_ValidationApi->GetOwnFullStatus(hash);
+    if (own_full == static_cast<uint8_t>(ValidationResponseValue::Full_Red) ||
+        own_full == static_cast<uint8_t>(ValidationResponseValue::Full_Amber)) {
         return false;
     }
     ValidationResponseValue st;
@@ -1575,7 +1585,7 @@ static RPCHelpMan create_mining_work_unit()
                 throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf(
                     "prev_block_hash %s is not the current build-ahead target "
                     "(must equal getmininginfo.build_ahead_parent_hash; not own-pending / "
-                    "not the best pending sibling / smell-fail / Full_Red / failed / tip moved)",
+                    "not the best pending sibling / smell-fail / Full_Red / Full_Amber / failed / tip moved)",
                     build_ahead_parent->ToString()));
             }
         }
@@ -1882,8 +1892,11 @@ static RPCHelpMan submit_mining_response()
         g_ValidationApi && g_ValidationApi->UsesRequestStatusForBlockProcessing();
     const bool force_mock_external =
         has_mock_validation && gArgs.GetBoolArg("-mockval-force-external", false);
+    const bool force_real_external =
+        g_ValidationApi && !has_mock_validation &&
+        gArgs.GetBoolArg("-validationapi-force-external", false);
     const bool use_external_validation =
-        chainman.GetConsensus().external_api || force_mock_external;
+        chainman.GetConsensus().external_api || force_mock_external || force_real_external;
     const bool async_validation_in_flight = !sc->found && use_external_validation;
 
     // Build-ahead: the moment our own block is accepted-but-pending (header in
