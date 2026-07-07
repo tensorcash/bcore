@@ -2,9 +2,9 @@
 # Copyright (c) 2024-present The TensorCash developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
-"""Phase 2a — broker-driven mining RPCs.
+"""Broker-driven mining RPCs.
 
-Covers the parts of COMPUTE_BROKER_IMPROV.md Phase 2a that don't require
+Covers the broker-driven mining RPC surface that doesn't require
 constructing a valid `proof::MiningResponse` FlatBuffer in Python:
 
 - `create_mining_work_unit` rejects bad args (network mismatch, empty payout,

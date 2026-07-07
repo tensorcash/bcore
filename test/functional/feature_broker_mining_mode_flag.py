@@ -2,16 +2,13 @@
 # Copyright (c) 2024-present The TensorCash developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
-"""Phase 2a hard guard — -miningbrokermode flag.
+"""Broker-mode hard guard — the -miningbrokermode flag.
 
 When a node is started with -miningbrokermode=1, the sovereign mining entry
 points (startmining, startminingwithrotation) must be refused so that
 solutions cannot bypass the compute broker's lease index. The
 broker-driven RPCs (create_mining_work_unit, submit_mining_response) and
 read-only RPCs (getmininginfo) must continue to work.
-
-See COMPUTE_BROKER_IMPROV.md, Phase 2a "remaining" item:
-mining.broker_mode config flag.
 """
 
 from test_framework.address import ADDRESS_BCRT1_UNSPENDABLE
