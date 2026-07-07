@@ -219,12 +219,17 @@ BOOST_AUTO_TEST_CASE(target_derivation_golden_vectors)
         uint64_t expected_tries;
         const char* target_hex_be; // big-endian, as in the vectors
     };
+    // Goldens derive from the §1 calibration constants (ARGON_REF_US=4000,
+    // DECODE_US_AT_NORMALIZER=6000000 -> 60 tries at normalizer). Regenerate
+    // with: python -c "import pow_v3; [print(d, pow_v3.admission_expected_tries(d),
+    // format((2**256-1)//pow_v3.admission_expected_tries(d), '064x')) for d in
+    // (1,100000,500000,1000000,3000000)]" whenever the calibration changes.
     const Case cases[] = {
-        {1, 50000000, "00000055e63b88c230e77e7ee106959b5d3e1e9ea69ebac0b0b4be383479da36"},
-        {100000, 500, "0083126e978d4fdf3b645a1cac083126e978d4fdf3b645a1cac083126e978d4f"},
-        {500000, 100, "028f5c28f5c28f5c28f5c28f5c28f5c28f5c28f5c28f5c28f5c28f5c28f5c28f"},
-        {1000000, 50, "051eb851eb851eb851eb851eb851eb851eb851eb851eb851eb851eb851eb851e"},
-        {3000000, 16, "0fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},
+        {1, 60000000, "0000004795319ca1d36b941466302756cdb3c42ee02ef0f5e8969e842bbae082"},
+        {100000, 600, "006d3a06d3a06d3a06d3a06d3a06d3a06d3a06d3a06d3a06d3a06d3a06d3a06d"},
+        {500000, 120, "0222222222222222222222222222222222222222222222222222222222222222"},
+        {1000000, 60, "0444444444444444444444444444444444444444444444444444444444444444"},
+        {3000000, 20, "0ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},
         {1000000000000LL, 1, "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},
         {1000000000000000LL, 1, "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},
     };
