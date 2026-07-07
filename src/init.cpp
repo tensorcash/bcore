@@ -999,6 +999,21 @@ bool AppInitParameterInteraction(const ArgsManager& args)
         return InitError(errors);
     }
 
+    // PROMPT BINDING.md §5/§9: refuse to run a chain that activates v3 without
+    // red-block enforcement (external_api full replay). v3's fast-path B_cred
+    // free tier is only sound when forged high-entropy evidence is caught by
+    // full validation; without it the free tier is exploitable. Mockable
+    // (regtest) chains are exempt — they test the fast path in isolation.
+    if (!IsV3ActivationConfigSound(chainparams.GetConsensus().V3ActivationHeight,
+                                   chainparams.GetConsensus().external_api,
+                                   chainparams.IsMockableChain())) {
+        return InitError(Untranslated(
+            "V3ActivationHeight is set on this chain but red-block enforcement "
+            "(external_api full validation) is disabled; the v3 free-tier "
+            "B_cred is unsound without it (PROMPT BINDING.md §5). Enable "
+            "external_api or unset the activation height."));
+    }
+
     // Testnet3 deprecation warning
     if (chain == ChainType::TESTNET) {
         LogInfo("Warning: Support for testnet3 is deprecated and will be removed in an upcoming release. Consider switching to testnet4.\n");

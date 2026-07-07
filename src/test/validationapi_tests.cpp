@@ -917,4 +917,28 @@ BOOST_AUTO_TEST_CASE(v3_advertised_difficulty_option2)
     BOOST_CHECK_EQUAL(V3AdvertisedDifficulty(1000000, inactive, D), 0);
 }
 
+BOOST_AUTO_TEST_CASE(v3_activation_config_soundness)
+{
+    const int DISABLED = std::numeric_limits<int>::max();
+    const int ACTIVE = 100;
+
+    // v3 disabled: always sound regardless of external_api / mockability.
+    BOOST_CHECK(IsV3ActivationConfigSound(DISABLED, /*external_api=*/false, /*mockable=*/false));
+    BOOST_CHECK(IsV3ActivationConfigSound(DISABLED, false, true));
+    BOOST_CHECK(IsV3ActivationConfigSound(DISABLED, true, false));
+
+    // v3 active on a real (non-mockable) chain: sound ONLY with red-block
+    // enforcement (external_api). This is the PROMPT BINDING.md §5 invariant.
+    BOOST_CHECK(!IsV3ActivationConfigSound(ACTIVE, /*external_api=*/false, /*mockable=*/false));
+    BOOST_CHECK(IsV3ActivationConfigSound(ACTIVE, /*external_api=*/true, /*mockable=*/false));
+
+    // Mockable (regtest / mock testnet) chains are exempt: the functional
+    // acceptance test activates v3 via -v3activationheight without external_api.
+    BOOST_CHECK(IsV3ActivationConfigSound(ACTIVE, /*external_api=*/false, /*mockable=*/true));
+
+    // Activation-from-genesis (height 0) still requires the safety net.
+    BOOST_CHECK(!IsV3ActivationConfigSound(0, false, false));
+    BOOST_CHECK(IsV3ActivationConfigSound(0, true, false));
+}
+
 BOOST_AUTO_TEST_SUITE_END()

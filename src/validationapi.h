@@ -56,6 +56,14 @@ static const uint16_t MAX_CHALLENGE_VALIDATION_REQUEST_ATTEMPTS{15}; // Before f
 int64_t V3AdvertisedDifficulty(int height, const Consensus::Params& params,
                                int64_t registered_difficulty);
 
+/** Startup soundness check for the v3 activation config (PROMPT BINDING.md
+ *  §5/§9): a finite V3ActivationHeight is only valid when red-block enforcement
+ *  (external_api full replay) is on, since v3's fast-path B_cred free tier is
+ *  unsound without it. Mockable/regtest chains are exempt (they test the fast
+ *  path in isolation). Returns false for a config that must fail startup. */
+bool IsV3ActivationConfigSound(int v3_activation_height, bool external_api,
+                               bool is_mockable_chain);
+
 struct Hasher {
     std::size_t operator()(const uint256& val) const noexcept {
         return std::hash<std::string_view>()(
