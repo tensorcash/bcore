@@ -1813,9 +1813,11 @@ static RPCHelpMan submit_mining_response()
     // (extapi.cpp:349-377). We MUST regenerate these before ProcessNewBlock,
     // otherwise the stored block carries stale (zero) values.
     int next_height = 0;
+    bool parent_known = false;
     {
         LOCK(::cs_main);
         const CBlockIndex* prev_index = chainman.m_blockman.LookupBlockIndex(block.hashPrevBlock);
+        parent_known = prev_index != nullptr;
         next_height = prev_index ? prev_index->nHeight + 1 : 0;
         const bool use_merkle = chainman.GetConsensus().IsVdfSpvActive(next_height);
         block.hashPoW = block.pow.GetCommitment(use_merkle);
@@ -1838,9 +1840,12 @@ static RPCHelpMan submit_mining_response()
     // V3 prompt binding (TIP-0003): a nonce-bearing v3 proof folds
     // the admission nonce into every u; without the v3 context this pre-check
     // recomputes u WITHOUT the nonce and spuriously rejects a consensus-valid
-    // proof. Mirror validation.cpp's pre-check context (height = next_height,
-    // computed above under cs_main; registered difficulty from modeldb).
+    // proof. Mirror validation.cpp's pre-check context (height = parent + 1,
+    // DORMANT at -1 when the parent is unknown — the same convention as
+    // ProcessNewSampledBlock and RunLocalQuick; next_height's 0-fallback is
+    // kept for the VdfSpv/cumulative-tick logic above only).
     {
+        const int v3_proof_height = parent_known ? next_height : -1;
         int64_t v3_difficulty{0};
         if (block.pow.version >= 3 && g_modeldb && !block.pow.model_identifier.empty()) {
             ModelRecord rec;
@@ -1848,7 +1853,7 @@ static RPCHelpMan submit_mining_response()
                 v3_difficulty = rec.metadata.difficulty;
             }
         }
-        quick_verifier.SetV3Context(chainman.GetConsensus(), next_height, v3_difficulty);
+        quick_verifier.SetV3Context(chainman.GetConsensus(), v3_proof_height, v3_difficulty);
     }
     // Version-keyed: enforces the reuse gate iff block.pow.version >= REUSE_GATE_VERSION.
     const VerificationResult qv = quick_verifier.QuickVerify(block.pow);

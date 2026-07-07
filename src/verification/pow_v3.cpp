@@ -652,6 +652,18 @@ std::vector<uint8_t> admission_message(const std::vector<uint8_t>& msg_w,
     return msg;
 }
 
+bool argon2_compiled() noexcept {
+    // Deliberately a function in THIS translation unit (not a header
+    // constexpr): POW_V3_HAVE_ARGON2 may be defined per-target, and the only
+    // definition that matters is the one argon2id_digest() below was compiled
+    // under. Startup capability guards must see that value, not the caller's.
+#ifdef POW_V3_HAVE_ARGON2
+    return true;
+#else
+    return false;
+#endif
+}
+
 std::array<uint8_t, 32> argon2id_digest(const std::vector<uint8_t>& message) {
 #ifdef POW_V3_HAVE_ARGON2
     std::array<uint8_t, 32> out{};

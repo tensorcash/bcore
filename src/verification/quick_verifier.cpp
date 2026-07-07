@@ -468,6 +468,11 @@ bool QuickVerifier::PrepareV3(const CProofBlob& proof) {
                       "cannot verify v3 proofs for this chain";
         return false;
     }
+    // The tier thresholds (V3BFloorBits/V3BFreeBits) are deliberately NOT
+    // checked here: unit tests steer the genesis blob across tiers by
+    // parameterizing them. Production agreement with the compiled pow_v3
+    // constants (which the external Python verifier scores with) is enforced
+    // fail-closed at STARTUP instead — IsV3TierParamsVendored / init.cpp.
 
     m_v3Active = true;
 
