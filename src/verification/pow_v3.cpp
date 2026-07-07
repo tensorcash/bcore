@@ -1,7 +1,7 @@
 // vendored from shared-utils/pow-utils — keep byte-identical; the golden
 // vectors in shared-utils/pow-utils/tests/vectors are the contract.
 
-// V3 prompt-binding / admission helpers (PROMPT BINDING.md) — see pow_v3.h.
+// V3 prompt-binding / admission helpers (TIP-0003) — see pow_v3.h.
 //
 // Must remain semantically identical to pow_v3.py; the golden vectors in
 // tests/vectors/v3_vectors.json are the contract, exercised by

@@ -3,7 +3,7 @@
 // vendored from shared-utils/pow-utils — keep byte-identical; the golden
 // vectors in shared-utils/pow-utils/tests/vectors are the contract.
 
-// V3 prompt-binding / admission helpers (PROMPT BINDING.md).
+// V3 prompt-binding / admission helpers (TIP-0003).
 //
 // C++ mirror of pow_v3.py — the two implementations must stay semantically
 // IDENTICAL (the golden vectors in tests/vectors/v3_vectors.json are the
@@ -11,7 +11,7 @@
 // and (optionally) libargon2 in the .cpp, so the file compiles standalone in
 // the proof-processor module, in bcore, and in the standalone vector test.
 //
-// Scope (PROMPT BINDING.md sections):
+// Scope (TIP-0003):
 //   §3  extra_flags carrier   — merge_extra_flags_v3 / extract_admission_nonce_hex
 //   §4  conservative B_cred   — mass_q63_for_step / credit_units_for_step /
 //                               b_cred_units_from_bounds  (R=1024 table)

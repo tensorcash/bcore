@@ -1,5 +1,5 @@
 // Copyright (c) 2026 TensorCash
-// QuickVerifier v3 prompt-binding enforcement tests (PROMPT BINDING.md).
+// QuickVerifier v3 prompt-binding enforcement tests (TIP-0003).
 //
 // Fixture strategy: g_genesisBlob is a real, fully valid 256-step proof whose
 // sampler fields happen to equal the consensus-fixed v3.0 profile

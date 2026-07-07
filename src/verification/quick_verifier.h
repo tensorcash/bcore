@@ -57,7 +57,7 @@ public:
     // below REUSE_GATE_VERSION; runs the q32 reuse-score gate for v2+ proofs.
     bool VerifyReuseEntropy(const CProofBlob& proof);
 
-    // V3 prompt-binding chain context (PROMPT BINDING.md §1). The v3 rules —
+    // V3 prompt-binding chain context (TIP-0003). The v3 rules —
     // nonce-bound step hashing (§7), consensus-fixed sampler profile (§2),
     // B_cred tiering (§4/§5) and Argon2id admission (§6) — are enforced ONLY
     // when a context has been provided AND proof.version >= 3 AND
@@ -115,7 +115,7 @@ private:
     // Single builder for the sampler preimage
     // header_prefix | vdf | u32le(tick) | u32le(step) | ctx_window | precision
     // [| admission_nonce32] shared by ComputeUValue, VerifyFinalHash and the
-    // v3 admission msg_w (PROMPT BINDING.md §6/§7). With include_nonce=false,
+    // v3 admission msg_w (TIP-0003). With include_nonce=false,
     // or when no v3 nonce is claimed, the output is byte-identical to the
     // legacy v2 message.
     std::vector<uint8_t> BuildStepMessage(const std::vector<uint32_t>& context,

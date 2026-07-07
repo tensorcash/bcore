@@ -1,6 +1,6 @@
 // Copyright (c) 2026 TensorCash
 // Golden-vector tests for the vendored v3 prompt-binding primitives
-// (verification/pow_v3.{h,cpp}, PROMPT BINDING.md).
+// (verification/pow_v3.{h,cpp}, TIP-0003).
 //
 // The expected values below are LITERAL COPIES of a representative subset of
 // the cross-language contract in

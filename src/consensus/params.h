@@ -261,7 +261,7 @@ struct Params {
         return height >= 0 && reuse_entropy_height >= 0 && height >= reuse_entropy_height;
     }
 
-    // ---- V3 prompt binding / admission (PROMPT BINDING.md §1) ----
+    // ---- V3 prompt binding / admission (TIP-0003) ----
     // First height where the v3 proof rules are enforced for proof.version >= 3:
     // nonce-bound step hashing (§7), consensus-fixed sampler profile (§2),
     // conservative B_cred tiering (§4/§5) and the Argon2id admission puzzle (§6).
