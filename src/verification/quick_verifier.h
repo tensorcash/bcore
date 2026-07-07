@@ -1,10 +1,13 @@
 #ifndef BITCOIN_VERIFICATION_QUICK_VERIFIER_H
 #define BITCOIN_VERIFICATION_QUICK_VERIFIER_H
 
+#include <consensus/params.h>
 #include <primitives/proofblob.h>
 #include <crypto/sha256.h>
 #include <uint256.h>
 
+#include <array>
+#include <optional>
 #include <vector>
 #include <string>
 #include <memory>
@@ -54,6 +57,26 @@ public:
     // below REUSE_GATE_VERSION; runs the q32 reuse-score gate for v2+ proofs.
     bool VerifyReuseEntropy(const CProofBlob& proof);
 
+    // V3 prompt-binding chain context (PROMPT BINDING.md §1). The v3 rules —
+    // nonce-bound step hashing (§7), consensus-fixed sampler profile (§2),
+    // B_cred tiering (§4/§5) and Argon2id admission (§6) — are enforced ONLY
+    // when a context has been provided AND proof.version >= 3 AND
+    // height >= params.V3ActivationHeight. Callers that never set a context
+    // (and all pre-activation heights / pre-v3 proof versions) get behavior
+    // byte-identical to today.
+    //
+    // registered_difficulty is the model record's INVERSE compute difficulty
+    // active at the block height (the same record the nAdjBits ratio check in
+    // ContextualCheckBlock reads; modeldb is undo/reorg-safe). Pass <= 0 to
+    // have the verifier resolve it from g_modeldb at verification time.
+    void SetV3Context(const Consensus::Params& params, int height,
+                      int64_t registered_difficulty = 0)
+    {
+        m_v3ChainParams = &params;
+        m_v3Height = height;
+        m_v3Difficulty = registered_difficulty;
+    }
+
     // Get detailed error message if verification failed
     std::string GetLastError() const { return m_lastError; }
 
@@ -88,6 +111,37 @@ private:
     float ComputeUValue(const std::vector<uint32_t>& context,
                         uint32_t step,
                         const CProofBlob& proof);
+
+    // Single builder for the sampler preimage
+    // header_prefix | vdf | u32le(tick) | u32le(step) | ctx_window | precision
+    // [| admission_nonce32] shared by ComputeUValue, VerifyFinalHash and the
+    // v3 admission msg_w (PROMPT BINDING.md §6/§7). With include_nonce=false,
+    // or when no v3 nonce is claimed, the output is byte-identical to the
+    // legacy v2 message.
+    std::vector<uint8_t> BuildStepMessage(const std::vector<uint32_t>& context,
+                                          uint32_t step,
+                                          const CProofBlob& proof,
+                                          bool include_nonce);
+
+    // Per-verification v3 setup: decides whether the v3 rules apply to this
+    // proof (version + activation height), cross-checks the chain params
+    // against the vendored pow_v3 constants (fail closed on divergence), and
+    // extracts/decodes the claimed admission nonce from extra_flags (§3 —
+    // extraction violations mean "no nonce claimed", never an error). Returns
+    // false (with m_lastError set) only on the params/pow_v3 divergence.
+    bool PrepareV3(const CProofBlob& proof);
+
+    // §2: consensus-fixed v3.0 sampler profile, exact equality. Only called
+    // when the v3 rules apply.
+    bool VerifyV3SamplerProfile(const CProofBlob& proof);
+
+    // §4/§5/§6: recompute conservative B_cred from the per-step bounds, apply
+    // the tier rule, and verify the Argon2id admission puzzle whenever a nonce
+    // is PRESENT (regardless of tier — an unverified nonce would be a free
+    // sampling re-roll lever, §5). Only called when the v3 rules apply.
+    bool VerifyV3TierAndAdmission(const CProofBlob& proof,
+                                  const std::vector<float>& lower_bounds,
+                                  const std::vector<float>& upper_bounds);
 
     // Deduplication: keep max logit per unique token
     void DedupeKeepMax(
@@ -157,6 +211,18 @@ private:
     std::vector<uint32_t> m_promptTokens;
     std::vector<uint32_t> m_chosenTokens;
     std::vector<uint8_t> m_padMask;
+
+    // V3 chain context (SetV3Context). Null params = context never provided =
+    // v3 rules dormant.
+    const Consensus::Params* m_v3ChainParams = nullptr;
+    int m_v3Height = -1;
+    int64_t m_v3Difficulty = 0;
+
+    // Per-verification v3 state (set by PrepareV3).
+    bool m_v3Active = false;
+    // Decoded 32-byte admission nonce when one is claimed via
+    // extra_flags.v3.admission_nonce (§3). nullopt = no admission claimed.
+    std::optional<std::array<uint8_t, 32>> m_v3Nonce;
 };
 
 #endif // BITCOIN_VERIFICATION_QUICK_VERIFIER_H

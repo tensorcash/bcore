@@ -35,35 +35,38 @@ enum ValidationType : uint8_t {
   ValidationType_Full = 2,
   ValidationType_Model = 3,
   ValidationType_Challenge = 4,
+  ValidationType_Logits = 5,
   ValidationType_MIN = ValidationType_Quick,
-  ValidationType_MAX = ValidationType_Challenge
+  ValidationType_MAX = ValidationType_Logits
 };
 
-inline const ValidationType (&EnumValuesValidationType())[5] {
+inline const ValidationType (&EnumValuesValidationType())[6] {
   static const ValidationType values[] = {
     ValidationType_Quick,
     ValidationType_Quick_Smell,
     ValidationType_Full,
     ValidationType_Model,
-    ValidationType_Challenge
+    ValidationType_Challenge,
+    ValidationType_Logits
   };
   return values;
 }
 
 inline const char * const *EnumNamesValidationType() {
-  static const char * const names[6] = {
+  static const char * const names[7] = {
     "Quick",
     "Quick_Smell",
     "Full",
     "Model",
     "Challenge",
+    "Logits",
     nullptr
   };
   return names;
 }
 
 inline const char *EnumNameValidationType(ValidationType e) {
-  if (::flatbuffers::IsOutRange(e, ValidationType_Quick, ValidationType_Challenge)) return "";
+  if (::flatbuffers::IsOutRange(e, ValidationType_Quick, ValidationType_Logits)) return "";
   const size_t index = static_cast<size_t>(e);
   return EnumNamesValidationType()[index];
 }
@@ -83,11 +86,13 @@ enum ResponseValue : uint8_t {
   ResponseValue_Challenge_OK = 11,
   ResponseValue_Challenge_Fail = 12,
   ResponseValue_Model_Pending_Review = 13,
+  ResponseValue_Logits_OK = 14,
+  ResponseValue_Logits_Fail = 15,
   ResponseValue_MIN = ResponseValue_Quick_OK,
-  ResponseValue_MAX = ResponseValue_Model_Pending_Review
+  ResponseValue_MAX = ResponseValue_Logits_Fail
 };
 
-inline const ResponseValue (&EnumValuesResponseValue())[14] {
+inline const ResponseValue (&EnumValuesResponseValue())[16] {
   static const ResponseValue values[] = {
     ResponseValue_Quick_OK,
     ResponseValue_Quick_Fail,
@@ -102,13 +107,15 @@ inline const ResponseValue (&EnumValuesResponseValue())[14] {
     ResponseValue_Model_Fail,
     ResponseValue_Challenge_OK,
     ResponseValue_Challenge_Fail,
-    ResponseValue_Model_Pending_Review
+    ResponseValue_Model_Pending_Review,
+    ResponseValue_Logits_OK,
+    ResponseValue_Logits_Fail
   };
   return values;
 }
 
 inline const char * const *EnumNamesResponseValue() {
-  static const char * const names[15] = {
+  static const char * const names[17] = {
     "Quick_OK",
     "Quick_Fail",
     "Quick_OK_Smell_OK",
@@ -123,13 +130,15 @@ inline const char * const *EnumNamesResponseValue() {
     "Challenge_OK",
     "Challenge_Fail",
     "Model_Pending_Review",
+    "Logits_OK",
+    "Logits_Fail",
     nullptr
   };
   return names;
 }
 
 inline const char *EnumNameResponseValue(ResponseValue e) {
-  if (::flatbuffers::IsOutRange(e, ResponseValue_Quick_OK, ResponseValue_Model_Pending_Review)) return "";
+  if (::flatbuffers::IsOutRange(e, ResponseValue_Quick_OK, ResponseValue_Logits_Fail)) return "";
   const size_t index = static_cast<size_t>(e);
   return EnumNamesResponseValue()[index];
 }
@@ -194,7 +203,8 @@ struct BlockValidation FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
     VT_NONCE = 16,
     VT_POW_BLOB_HASH = 18,
     VT_ADJUSTED_BITS = 20,
-    VT_POW_BLOB = 22
+    VT_POW_BLOB = 22,
+    VT_DIFFICULTY = 24
   };
   uint32_t version() const {
     return GetField<uint32_t>(VT_VERSION, 0);
@@ -226,6 +236,9 @@ struct BlockValidation FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
   const proof::Proof *pow_blob() const {
     return GetPointer<const proof::Proof *>(VT_POW_BLOB);
   }
+  int64_t difficulty() const {
+    return GetField<int64_t>(VT_DIFFICULTY, 0);
+  }
   bool Verify(::flatbuffers::Verifier &verifier) const {
     return VerifyTableStart(verifier) &&
            VerifyField<uint32_t>(verifier, VT_VERSION, 4) &&
@@ -243,6 +256,7 @@ struct BlockValidation FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
            VerifyField<uint32_t>(verifier, VT_ADJUSTED_BITS, 4) &&
            VerifyOffset(verifier, VT_POW_BLOB) &&
            verifier.VerifyTable(pow_blob()) &&
+           VerifyField<int64_t>(verifier, VT_DIFFICULTY, 8) &&
            verifier.EndTable();
   }
 };
@@ -281,6 +295,9 @@ struct BlockValidationBuilder {
   void add_pow_blob(::flatbuffers::Offset<proof::Proof> pow_blob) {
     fbb_.AddOffset(BlockValidation::VT_POW_BLOB, pow_blob);
   }
+  void add_difficulty(int64_t difficulty) {
+    fbb_.AddElement<int64_t>(BlockValidation::VT_DIFFICULTY, difficulty, 0);
+  }
   explicit BlockValidationBuilder(::flatbuffers::FlatBufferBuilder &_fbb)
         : fbb_(_fbb) {
     start_ = fbb_.StartTable();
@@ -303,8 +320,10 @@ inline ::flatbuffers::Offset<BlockValidation> CreateBlockValidation(
     uint32_t nonce = 0,
     ::flatbuffers::Offset<::flatbuffers::Vector<uint8_t>> pow_blob_hash = 0,
     uint32_t adjusted_bits = 0,
-    ::flatbuffers::Offset<proof::Proof> pow_blob = 0) {
+    ::flatbuffers::Offset<proof::Proof> pow_blob = 0,
+    int64_t difficulty = 0) {
   BlockValidationBuilder builder_(_fbb);
+  builder_.add_difficulty(difficulty);
   builder_.add_pow_blob(pow_blob);
   builder_.add_adjusted_bits(adjusted_bits);
   builder_.add_pow_blob_hash(pow_blob_hash);
@@ -329,7 +348,8 @@ inline ::flatbuffers::Offset<BlockValidation> CreateBlockValidationDirect(
     uint32_t nonce = 0,
     const std::vector<uint8_t> *pow_blob_hash = nullptr,
     uint32_t adjusted_bits = 0,
-    ::flatbuffers::Offset<proof::Proof> pow_blob = 0) {
+    ::flatbuffers::Offset<proof::Proof> pow_blob = 0,
+    int64_t difficulty = 0) {
   auto hash__ = hash ? _fbb.CreateVector<uint8_t>(*hash) : 0;
   auto prev_block_hash__ = prev_block_hash ? _fbb.CreateVector<uint8_t>(*prev_block_hash) : 0;
   auto merkle_root__ = merkle_root ? _fbb.CreateVector<uint8_t>(*merkle_root) : 0;
@@ -345,7 +365,8 @@ inline ::flatbuffers::Offset<BlockValidation> CreateBlockValidationDirect(
       nonce,
       pow_blob_hash__,
       adjusted_bits,
-      pow_blob);
+      pow_blob,
+      difficulty);
 }
 
 struct ModelValidation FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {

@@ -885,4 +885,36 @@ BOOST_AUTO_TEST_CASE(public_error_backoff_gate_blocks_polling)
     BOOST_CHECK(!blocked);
 }
 
+// Option-2 (PROMPT BINDING.md §6): BlockValidation.difficulty is advertised to
+// the verification service as BOTH the admission-target input AND the v3-active
+// signal, so it is nonzero ONLY when v3 rules are active at the block's OWN
+// height. This pins the pure decision SendApiRequest routes through.
+BOOST_AUTO_TEST_CASE(v3_advertised_difficulty_option2)
+{
+    Consensus::Params params;              // defaults; only V3ActivationHeight is read
+    params.V3ActivationHeight = 100;
+    const int64_t D = 4242;
+
+    // Below activation: advertise 0 — a version>=3 blob here is judged under v2
+    // rules by consensus, so the verifier must NOT fold the nonce into u.
+    BOOST_CHECK_EQUAL(V3AdvertisedDifficulty(99, params, D), 0);
+    // At activation: advertise the registered difficulty (target + active signal).
+    BOOST_CHECK_EQUAL(V3AdvertisedDifficulty(100, params, D), D);
+    // Above activation: keyed on the block's OWN height, so historical
+    // re-validation after the tip passes activation still resolves by height.
+    BOOST_CHECK_EQUAL(V3AdvertisedDifficulty(500, params, D), D);
+    // Unknown parent (precheck path, height<0): 0; contextual validation stays
+    // authoritative later.
+    BOOST_CHECK_EQUAL(V3AdvertisedDifficulty(-1, params, D), 0);
+    // Active height but the model has no registered difficulty: nothing to
+    // advertise -> 0 (verifier soft-skips; bcore consensus enforces).
+    BOOST_CHECK_EQUAL(V3AdvertisedDifficulty(100, params, 0), 0);
+    // Degenerate negative record value is clamped to 0 (never advertised).
+    BOOST_CHECK_EQUAL(V3AdvertisedDifficulty(100, params, -1), 0);
+
+    // Never active (default V3ActivationHeight == INT_MAX): always 0.
+    Consensus::Params inactive;
+    BOOST_CHECK_EQUAL(V3AdvertisedDifficulty(1000000, inactive, D), 0);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

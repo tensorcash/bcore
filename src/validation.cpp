@@ -7,6 +7,7 @@
 
 #include <validation.h>
 #include <verification/quick_verifier.h>
+#include <verification/pow_v3.h>  // V3_PROOF_VERSION (mandatory-v3 activation gate)
 #include <assets/asset.h>
 #include <assets/icu_acceptance_record.h>
 #include <assets/canonical_vk.h>
@@ -4067,17 +4068,43 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             // Version-keyed reuse-entropy gate: a no-op for legacy (v1) proofs,
             // enforces the q32 reuse-score gate for v2+ proofs.
             QuickVerifier verifier;
+            // V3 prompt binding (PROMPT BINDING.md): height-gated; dormant
+            // until height >= V3ActivationHeight AND pb.version >= 3. The
+            // registered difficulty for the admission target comes from the
+            // model record active at this height (same record the nAdjBits
+            // ratio check reads; modeldb is undo/reorg-safe).
+            {
+                int64_t v3_difficulty{0};
+                if (pb.version >= 3 && g_modeldb && !pb.model_identifier.empty()) {
+                    ModelRecord rec;
+                    if (g_modeldb->ReadModel(pb.GetModelHash(), rec)) {
+                        v3_difficulty = rec.metadata.difficulty;
+                    }
+                }
+                verifier.SetV3Context(params.GetConsensus(), pindex->nHeight, v3_difficulty);
+            }
             if (!verifier.VerifyReuseEntropy(pb)) {
                 return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
                                      "bad-reuse-entropy",
                                      verifier.GetLastError());
             }
-            // Activation: once active, legacy proof versions are no longer accepted.
+            // Reuse-entropy activation: once active, pre-reuse proof versions
+            // are no longer accepted.
             if (params.GetConsensus().IsReuseEntropyActive(pindex->nHeight) &&
                 pb.version < REUSE_GATE_VERSION) {
                 return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
                                      "bad-proof-version",
                                      "legacy proof version not allowed after reuse-entropy activation");
+            }
+            // V3 activation (PROMPT BINDING.md §9): at/after V3ActivationHeight,
+            // v3 is MANDATORY — every mining proof must be version >= 3 so the
+            // prompt-binding admission / anti-grind rules apply network-wide. A
+            // pre-v3 proof at/after activation is a consensus violation.
+            if (params.GetConsensus().IsV3Active(pindex->nHeight) &&
+                pb.version < pow_v3::V3_PROOF_VERSION) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                     "bad-proof-version-v3",
+                                     "proof version < 3 not allowed after v3 activation");
             }
         }
     }
@@ -8600,17 +8627,42 @@ static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& stat
             // Version-keyed reuse-entropy gate: no-op for legacy (v1) proofs,
             // enforces the q32 reuse-score gate for v2+ proofs.
             QuickVerifier verifier;
+            // V3 prompt binding (PROMPT BINDING.md): height-gated; dormant
+            // until height >= V3ActivationHeight AND pb.version >= 3. Same
+            // model-record difficulty plumbing as the nAdjBits ratio check
+            // below (modeldb is undo/reorg-safe at this block's parent).
+            {
+                int64_t v3_difficulty{0};
+                if (pb.version >= 3 && g_modeldb && !pb.model_identifier.empty()) {
+                    ModelRecord rec;
+                    if (g_modeldb->ReadModel(pb.GetModelHash(), rec)) {
+                        v3_difficulty = rec.metadata.difficulty;
+                    }
+                }
+                verifier.SetV3Context(chainman.GetConsensus(), nHeight, v3_difficulty);
+            }
             if (!verifier.VerifyReuseEntropy(pb)) {
                 return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
                                      "bad-reuse-entropy",
                                      verifier.GetLastError());
             }
-            // Activation: once active, legacy proof versions are no longer accepted.
+            // Reuse-entropy activation: once active, pre-reuse proof versions
+            // are no longer accepted.
             if (chainman.GetConsensus().IsReuseEntropyActive(nHeight) &&
                 pb.version < REUSE_GATE_VERSION) {
                 return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
                                      "bad-proof-version",
                                      "legacy proof version not allowed after reuse-entropy activation");
+            }
+            // V3 activation (PROMPT BINDING.md §9): at/after V3ActivationHeight,
+            // v3 is MANDATORY — every mining proof must be version >= 3 so the
+            // prompt-binding admission / anti-grind rules apply network-wide. A
+            // pre-v3 proof at/after activation is a consensus violation.
+            if (chainman.GetConsensus().IsV3Active(nHeight) &&
+                pb.version < pow_v3::V3_PROOF_VERSION) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                     "bad-proof-version-v3",
+                                     "proof version < 3 not allowed after v3 activation");
             }
         }
     }
@@ -9274,6 +9326,26 @@ bool ChainstateManager::ProcessNewSampledBlock(const std::shared_ptr<const CBloc
 
             if (has_quick_fields) {
                 QuickVerifier verifier;
+                // V3 prompt binding (PROMPT BINDING.md): the block's height is
+                // its parent's + 1. If the parent is unknown yet, the v3 rules
+                // stay dormant HERE (height = -1 never activates); the block is
+                // still fully v3-checked in ContextualCheckBlock, which always
+                // has the height — this pre-check never accepts on behalf of
+                // consensus.
+                {
+                    const int proof_height = WITH_LOCK(cs_main, {
+                        const CBlockIndex* pprev = m_blockman.LookupBlockIndex(block->hashPrevBlock);
+                        return pprev ? pprev->nHeight + 1 : -1;
+                    });
+                    int64_t v3_difficulty{0};
+                    if (pb.version >= 3 && g_modeldb && !pb.model_identifier.empty()) {
+                        ModelRecord rec;
+                        if (g_modeldb->ReadModel(pb.GetModelHash(), rec)) {
+                            v3_difficulty = rec.metadata.difficulty;
+                        }
+                    }
+                    verifier.SetV3Context(GetConsensus(), proof_height, v3_difficulty);
+                }
                 // Version-keyed: enforces the reuse gate iff pb.version >= REUSE_GATE_VERSION.
                 const auto res = verifier.QuickVerify(pb);
                 quick_ok = (res == VerificationResult::Quick_OK ||

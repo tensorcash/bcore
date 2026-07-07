@@ -4,6 +4,7 @@
 #include <validationapi.h>
 #include <primitives/block.h>
 #include <primitives/proofblob.h>
+#include <modeldb.h>
 #include <rpc/validation_generated.h>
 #include <rpc/server_util.h>
 #include <thread>
@@ -555,6 +556,27 @@ ValidationAPI::ValidationAPI(ChainstateManager& chainman, const Consensus::Param
 ValidationResponseValue ValidationAPI::RunLocalQuick(const CBlock& block)
 {
     QuickVerifier verifier;
+    // V3 prompt binding (PROMPT BINDING.md): a nonce-bearing v3 proof folds the
+    // admission nonce into every u (§7); without the v3 context the local quick
+    // check would recompute u WITHOUT the nonce and spuriously fail the block
+    // (U-value mismatch) even though it is consensus-valid. Mirror the same
+    // context validation.cpp's pre-check uses: height = parent + 1 (dormant at
+    // -1 if the parent is unknown), registered difficulty from modeldb.
+    {
+        const auto& pb = block.pow;
+        const int proof_height = WITH_LOCK(::cs_main, {
+            const CBlockIndex* pprev = m_chainman.m_blockman.LookupBlockIndex(block.hashPrevBlock);
+            return pprev ? pprev->nHeight + 1 : -1;
+        });
+        int64_t v3_difficulty{0};
+        if (pb.version >= 3 && g_modeldb && !pb.model_identifier.empty()) {
+            ModelRecord rec;
+            if (g_modeldb->ReadModel(pb.GetModelHash(), rec)) {
+                v3_difficulty = rec.metadata.difficulty;
+            }
+        }
+        verifier.SetV3Context(m_chainman.GetConsensus(), proof_height, v3_difficulty);
+    }
     // Version-keyed: enforces the reuse gate iff block.pow.version >= REUSE_GATE_VERSION.
     const auto res = verifier.QuickVerify(block.pow);
     switch (res) {
@@ -2572,6 +2594,16 @@ void ValidationAPI::SendApiRequest(const uint256& req_id, const ModelRecord& mod
     }
 }
 
+int64_t V3AdvertisedDifficulty(int height, const Consensus::Params& params,
+                               int64_t registered_difficulty) {
+    if (height < 0 || !params.IsV3Active(height)) return 0;
+    // Defensive clamp to the documented "no usable difficulty => 0" contract:
+    // only a strictly-positive registered difficulty is a valid admission
+    // target / v3-active signal. A 0/negative value (unregistered or
+    // malformed record) advertises 0, i.e. the verifier replays under v2.
+    return registered_difficulty > 0 ? registered_difficulty : 0;
+}
+
 void ValidationAPI::SendApiRequest(const uint256 &req_id, const CBlock& block, const ValidationReqType& type) {
     if (type != ValidationReqType::Quick && type != ValidationReqType::Quick_Smell &&
         type != ValidationReqType::Full && type != ValidationReqType::Challenge) {
@@ -2604,10 +2636,46 @@ void ValidationAPI::SendApiRequest(const uint256 &req_id, const CBlock& block, c
     auto hashShort_vec = builder.CreateVector(block.GetShortHash().begin(), EXPECTED_HASH_SIZE);
     auto hashLong_vec = builder.CreateVector(req_id.begin(), EXPECTED_HASH_SIZE);
     auto proofBlob_fb = block.pow.ToFlatBuffer(builder);
-    
-    auto req_body = proof::CreateBlockValidation(builder, 
-                                            block.nVersion, hashShort_vec, hashPrevBlock_vec, merkle_vec, 
-                                            block.nTime, block.nBits, block.nNonce, hashPow_vec, block.nAdjBits, proofBlob_fb);
+
+    // Registered model difficulty from the record active at this block's
+    // height (modeldb is undo/reorg-safe), so the verification service can
+    // derive the v3 admission target (PROMPT BINDING.md §6) without its own
+    // registry mirror. 0 = not provided (appended, wire-compatible field);
+    // bcore consensus remains authoritative for the admission check itself.
+    //
+    // Option 2 (no v3_active wire field): difficulty doubles as the
+    // verifier's v3-ACTIVE signal. It must therefore only be advertised
+    // once v3 rules are ACTIVE at this block's height. Pre-activation a
+    // version>=3 blob is judged under v2 rules by consensus (the admission
+    // nonce is NOT folded into the u preimage); if we advertised a nonzero
+    // difficulty the verifier would treat version>=3 && difficulty>0 as v3,
+    // fold the nonce into u, and diverge from consensus. Height is the
+    // block's own height (prev height + 1), so historical re-validation
+    // below V3ActivationHeight stays v2 even when the tip is past it.
+    int64_t model_difficulty{0};
+    if (g_modeldb && !block.pow.model_identifier.empty()) {
+        int height{-1};
+        {
+            LOCK(cs_main);
+            const CBlockIndex* prev =
+                m_chainman.m_blockman.LookupBlockIndex(block.hashPrevBlock);
+            if (prev) height = prev->nHeight + 1;
+        }
+        int64_t registered{0};
+        if (height >= 0) {
+            ModelRecord rec;
+            if (g_modeldb->ReadModel(block.pow.GetModelHash(), rec)) {
+                registered = rec.metadata.difficulty;
+            }
+        }
+        model_difficulty = V3AdvertisedDifficulty(
+            height, m_chainman.GetConsensus(), registered);
+    }
+
+    auto req_body = proof::CreateBlockValidation(builder,
+                                            block.nVersion, hashShort_vec, hashPrevBlock_vec, merkle_vec,
+                                            block.nTime, block.nBits, block.nNonce, hashPow_vec, block.nAdjBits, proofBlob_fb,
+                                            model_difficulty);
 
     auto req_fb = proof::CreateValidationRequest(builder, hashLong_vec, reqtype, proof::ValidationUnion_BlockValidation, req_body.Union());
     

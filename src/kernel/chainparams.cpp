@@ -300,6 +300,12 @@ public:
         consensus.vdf_spv_commitment_height = 0;
         consensus.vdf_spv_vdfverify_height = 0;
         consensus.reuse_entropy_height = 1500;
+        // V3 prompt binding (PROMPT BINDING.md §1): NOT activated on mainnet.
+        // Hardwired (never gArgs) — a coordinated chainparams release sets the
+        // height; until then v3 rules are inert and verification is
+        // byte-identical to v2. The remaining V3* constants keep their
+        // params.h defaults (they only bind at/after activation).
+        consensus.V3ActivationHeight = std::numeric_limits<int>::max();
         // Re-mined genesis (715 TSC + GENESIS_PUBKEY 047acd84..., model Qwen/Qwen3-8B@9c925d64
         // at bf16). nTime/nNonce are the winning values from the genesis grind; the proof blob
         // is g_genesisBlob (kernel/genesis_proof.h). 715 * COIN == GENESIS_REWARD_COINS.
@@ -751,6 +757,10 @@ public:
         // (default disabled). Must be read here too — this is the class the
         // "regtest" chain actually uses (CTensorRegParams reads it separately).
         consensus.reuse_entropy_height = gArgs.GetIntArg("-reuseentropyheight", std::numeric_limits<int>::max());
+        // Regtest-only knob for the v3 prompt-binding activation height
+        // (PROMPT BINDING.md §1; default disabled). Main/test chains hardwire
+        // this: consensus must never depend on node-local configuration.
+        consensus.V3ActivationHeight = gArgs.GetIntArg("-v3activationheight", std::numeric_limits<int>::max());
 
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].bit = 28;
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nStartTime = 0;
@@ -931,6 +941,10 @@ public:
         consensus.vdf_spv_commitment_height = 0;
         consensus.vdf_spv_vdfverify_height = 0;
         consensus.reuse_entropy_height = 5000;
+        // V3 prompt binding (PROMPT BINDING.md §1): NOT yet activated on
+        // tensor-test. Hardwired (never gArgs); a coordinated release sets the
+        // testnet height first, mainnet later.
+        consensus.V3ActivationHeight = std::numeric_limits<int>::max();
         // Scalar-CFD subsystem (ISSUER_SCALAR carrier + OP_SCALAR_CFD_SETTLE opcode + the Slice-6 format
         // catalogue). Coordinated testnet activation. This is a parser RELAXATION with no prior scalar
         // contracts traded, so it only requires the whole tensor-test fleet to run a scalarcfd-capable
@@ -1014,6 +1028,8 @@ public:
         consensus.vdf_spv_commitment_height = 0;  // Merkle commitment active from genesis
         consensus.vdf_spv_vdfverify_height = 0;  // VDF verification active from genesis
         consensus.reuse_entropy_height = gArgs.GetIntArg("-reuseentropyheight", std::numeric_limits<int>::max());
+        // Regtest-only v3 prompt-binding activation knob (see CRegTestParams).
+        consensus.V3ActivationHeight = gArgs.GetIntArg("-v3activationheight", std::numeric_limits<int>::max());
 
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].bit = 28;
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nStartTime = 0;

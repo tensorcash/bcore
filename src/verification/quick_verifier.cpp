@@ -1,5 +1,6 @@
 #include <verification/quick_verifier.h>
 #include <vdf/VdfVerify.h>
+#include <verification/pow_v3.h>
 #include <verification/verification_utils.h>
 #include <util/strencodings.h>
 #include <crypto/sha256.h>
@@ -14,6 +15,7 @@
 #include <iostream>
 #include <iomanip>
 #include <sstream>
+#include <stdexcept>
 
 using namespace verification;
 
@@ -30,6 +32,15 @@ VerificationResult QuickVerifier::QuickVerify(const CProofBlob& proof, bool enfo
     // Clear intermediate capture if enabled
     if (m_captureIntermediates) {
         m_intermediates = IntermediateValues();
+    }
+
+    // V3 setup (PROMPT BINDING.md): decide applicability and extract the
+    // claimed admission nonce BEFORE any hashing — the nonce enters every u
+    // and the final hash (§7). No-op (byte-identical v2 behavior) unless a
+    // chain context was provided, proof.version >= 3 and the height is at or
+    // beyond V3ActivationHeight.
+    if (!PrepareV3(proof)) {
+        return VerificationResult::Quick_Fail;
     }
 
     // Step 1: Verify model registration (critical for SPV path security)
@@ -89,6 +100,14 @@ bool QuickVerifier::VerifyReuseEntropy(const CProofBlob& proof) {
     m_lastError.clear();
     if (m_captureIntermediates) {
         m_intermediates = IntermediateValues();
+    }
+
+    // V3 setup — same applicability rule as QuickVerify, so the consensus
+    // paths that only run this entry (ConnectBlock / ContextualCheckBlock)
+    // enforce the identical v3 tier/admission/profile rules (§5: no
+    // quick-pass/full-fail gap).
+    if (!PrepareV3(proof)) {
+        return false;
     }
 
     if (!VerifyBlockSanity(proof)) {
@@ -244,6 +263,34 @@ bool QuickVerifier::VerifyParameters(const CProofBlob& proof) {
         }
     }
 
+    // V3 (PROMPT BINDING.md §2): the sampler profile is a consensus-fixed
+    // constant, enforced by exact equality on top of the global bounds above
+    // (which stay enforced as a second line for every version).
+    if (m_v3Active && !VerifyV3SamplerProfile(proof)) {
+        return false;
+    }
+
+    return true;
+}
+
+bool QuickVerifier::VerifyV3SamplerProfile(const CProofBlob& proof) {
+    // Consensus invariant (PROMPT BINDING.md §2): v3.0 accepts EXACTLY
+    // temperature=1.0, top_p=1.0, top_k=50, repetition_penalty=1.0 — the
+    // profile is consensus-fixed, never miner- or model-chosen, so
+    // enforcement is exact equality against the proof's existing sampler
+    // fields. Any missing field (FlatBuffer default 0) or divergent value is
+    // invalid; model `extra` profiles are ignored for v3.0.
+    if (proof.temperature != pow_v3::SAMPLER_V3_TEMPERATURE ||
+        proof.top_p != pow_v3::SAMPLER_V3_TOP_P ||
+        proof.top_k != pow_v3::SAMPLER_V3_TOP_K ||
+        proof.repetition_penalty != pow_v3::SAMPLER_V3_REPETITION_PENALTY) {
+        m_lastError = "v3: sampler profile mismatch: temperature=" + std::to_string(proof.temperature) +
+                      " top_p=" + std::to_string(proof.top_p) +
+                      " top_k=" + std::to_string(proof.top_k) +
+                      " repetition_penalty=" + std::to_string(proof.repetition_penalty) +
+                      " (v3 requires exactly temperature=1.0, top_p=1.0, top_k=50, repetition_penalty=1.0)";
+        return false;
+    }
     return true;
 }
 
@@ -378,11 +425,180 @@ bool QuickVerifier::VerifySequenceLightVectorized(const CProofBlob& proof, bool 
         }
     }
 
+    // V3 (PROMPT BINDING.md §4/§5/§6): recompute conservative B_cred from the
+    // bounds produced above, apply the tier rule and verify a present
+    // admission nonce. Runs BEFORE the reuse-entropy gate so v3 failures are
+    // attributed precisely; both are enforced.
+    if (m_v3Active && !VerifyV3TierAndAdmission(proof, lower_bounds, upper_bounds)) {
+        return false;
+    }
+
     if (!enforce_reuse_entropy) {
         return true;
     }
 
     return VerifyEntropy(lower_bounds, upper_bounds);
+}
+
+bool QuickVerifier::PrepareV3(const CProofBlob& proof) {
+    m_v3Active = false;
+    m_v3Nonce.reset();
+
+    // Consensus invariant (PROMPT BINDING.md §1): the v3 rules bind ONLY when
+    // proof.version >= 3 AND height >= V3ActivationHeight, read from the chain
+    // params active for this block — pre-activation heights and pre-v3 proof
+    // versions validate byte-identically to today (v2 untouched).
+    if (m_v3ChainParams == nullptr) return true;
+    if (proof.version < pow_v3::V3_PROOF_VERSION) return true;
+    if (!m_v3ChainParams->IsV3Active(m_v3Height)) return true;
+
+    // The vendored pow_v3 implementation compiles the ARGON2 profile and the
+    // §3 extra_flags parser bounds as constants (they are part of the
+    // cross-language golden-vector contract). If the chain params ever
+    // diverge from them, this binary cannot enforce that chain's v3 rules:
+    // fail closed rather than verify with the wrong profile/bounds.
+    const Consensus::Params& p = *m_v3ChainParams;
+    if (p.V3ArgonTimeCost != pow_v3::ARGON2_TIME_COST ||
+        p.V3ArgonMemoryKiB != pow_v3::ARGON2_MEMORY_KIB ||
+        p.V3ArgonLanes != pow_v3::ARGON2_LANES ||
+        p.V3ExtraFlagsMaxBytes != pow_v3::EXTRA_FLAGS_MAX_BYTES ||
+        p.V3ExtraFlagsMaxDepth != pow_v3::EXTRA_FLAGS_MAX_DEPTH) {
+        m_lastError = "v3: chain params disagree with the vendored pow_v3 constants "
+                      "(argon profile / extra_flags parser bounds); this binary "
+                      "cannot verify v3 proofs for this chain";
+        return false;
+    }
+
+    m_v3Active = true;
+
+    // §3 carrier extraction — never throws. ANY parse failure, size/depth
+    // violation, duplicate key or shape mismatch means "no nonce claimed"
+    // (free tier OK; below B_FREE rejects in VerifyV3TierAndAdmission). A
+    // nonce actually used in sampling but not extracted fails u replay anyway.
+    const std::optional<std::string> nonce_hex =
+        pow_v3::extract_admission_nonce_hex(proof.extra_flags);
+    if (nonce_hex) {
+        // Exactly 64 lowercase hex chars by the extractor's shape rule.
+        std::array<uint8_t, 32> nonce{};
+        const auto nibble = [](char c) -> uint8_t {
+            return static_cast<uint8_t>(c <= '9' ? c - '0' : c - 'a' + 10);
+        };
+        for (size_t i = 0; i < nonce.size(); ++i) {
+            nonce[i] = static_cast<uint8_t>((nibble((*nonce_hex)[2 * i]) << 4) |
+                                            nibble((*nonce_hex)[2 * i + 1]));
+        }
+        m_v3Nonce = nonce;
+    }
+    return true;
+}
+
+bool QuickVerifier::VerifyV3TierAndAdmission(const CProofBlob& proof,
+                                             const std::vector<float>& lower_bounds,
+                                             const std::vector<float>& upper_bounds) {
+    const Consensus::Params& p = *m_v3ChainParams;
+
+    // §4: conservative B_cred over the SAME per-step interval bounds the
+    // sampling check just produced (mass_upper = min(1, max(0, hi-lo) + 2*atol),
+    // Q32 floor per step, exact integer sum — order-independent by construction).
+    uint64_t b_cred_q32 = 0;
+    try {
+        const std::vector<double> lo(lower_bounds.begin(), lower_bounds.end());
+        const std::vector<double> hi(upper_bounds.begin(), upper_bounds.end());
+        b_cred_q32 = pow_v3::b_cred_q32_from_bounds(lo, hi);
+    } catch (const std::invalid_argument& e) {
+        // §4: an invalid/garbage interval never earns bits — proof invalid.
+        m_lastError = std::string("v3: invalid entropy bounds for B_cred: ") + e.what();
+        return false;
+    }
+
+    // §5 tier rule, thresholds from the chain params active at this height (§1).
+    const uint64_t floor_q32 = p.V3BFloorBits * pow_v3::B_Q32_ONE;
+    const uint64_t free_q32 = p.V3BFreeBits * pow_v3::B_Q32_ONE;
+    const pow_v3::Tier tier = pow_v3::tier_for_b_cred_q32(b_cred_q32, floor_q32, free_q32);
+
+    if (tier == pow_v3::Tier::Invalid) {
+        m_lastError = "v3: B_cred below B_FLOOR: q32=" + std::to_string(b_cred_q32) +
+                      " < floor_q32=" + std::to_string(floor_q32);
+        return false;
+    }
+    if (tier == pow_v3::Tier::AdmissionRequired && !m_v3Nonce) {
+        m_lastError = "v3: admission nonce required (B_FLOOR <= B_cred < B_FREE): q32=" +
+                      std::to_string(b_cred_q32) + " < free_q32=" + std::to_string(free_q32) +
+                      " and no valid extra_flags.v3.admission_nonce claimed";
+        return false;
+    }
+    if (!m_v3Nonce) {
+        // Free tier without an admission claim: nothing further to verify.
+        return true;
+    }
+
+    // §5: a PRESENT nonce is verified regardless of tier — the nonce perturbs
+    // every u in the window (§7), so an unverified one would be a free
+    // sampling re-roll lever. Present => valid; this also kills nonce
+    // strip/swap malleability (either breaks u replay).
+
+    // §6 target derivation input: the REGISTERED model difficulty (INVERSE
+    // compute scalar) from the record active at this block height. Either
+    // plumbed by the caller (same record the nAdjBits ratio check reads) or
+    // resolved here from modeldb, which is undo/reorg-safe.
+    int64_t difficulty = m_v3Difficulty;
+    if (difficulty <= 0 && g_modeldb) {
+        const uint256 model_hash = proof.GetModelHash();
+        ModelRecord rec;
+        if (!model_hash.IsNull() && g_modeldb->ReadModel(model_hash, rec)) {
+            difficulty = rec.metadata.difficulty;
+        }
+    }
+    if (difficulty <= 0) {
+        m_lastError = "v3: registered model difficulty unavailable for " + proof.model_identifier +
+                      "; cannot verify claimed admission nonce";
+        return false;
+    }
+
+    // §6 pad_mask canonical shape: omitted means all-false for the prompt;
+    // otherwise it must carry exactly one entry per prompt token. Rederived
+    // from proof fields — never carried separately.
+    std::vector<uint8_t> pad_mask = proof.pad_mask;
+    if (pad_mask.empty()) {
+        pad_mask.assign(proof.prompt_tokens.size(), 0);
+    } else if (pad_mask.size() != proof.prompt_tokens.size()) {
+        m_lastError = "v3: pad_mask size " + std::to_string(pad_mask.size()) +
+                      " != prompt_tokens size " + std::to_string(proof.prompt_tokens.size());
+        return false;
+    }
+
+    try {
+        // §6: msg_w is the sampler preimage at the window's FIRST step
+        // WITHOUT the nonce (the nonce enters the Argon2id message
+        // explicitly). Same builder as u replay => byte-identical layout.
+        const std::vector<uint8_t> msg_w =
+            BuildStepMessage(m_promptTokens, 0, proof, /*include_nonce=*/false);
+        // §6: commitment over the FULL model-visible pre-window prefix
+        // (prompt_tokens already includes previously generated tokens for
+        // later windows) — closes the vary-the-evicted-prefix amortization.
+        const std::vector<int64_t> prompt64(proof.prompt_tokens.begin(), proof.prompt_tokens.end());
+        const std::array<uint8_t, 32> commitment = pow_v3::prompt_commitment(prompt64, pad_mask);
+        const std::array<uint8_t, 32> digest = pow_v3::argon2id_digest(
+            pow_v3::admission_message(msg_w, proof.model_identifier,
+                                      m_v3Nonce->data(), commitment));
+        const std::array<uint8_t, 32> target_le = pow_v3::admission_target_le(
+            difficulty, p.ModelDifficultyNormalizer, p.V3DecodeUsAtNormalizer,
+            p.V3EligAlphaNum, p.V3EligAlphaDen, p.V3ArgonRefUs);
+        if (!pow_v3::admission_valid(digest, target_le)) {
+            m_lastError = "v3: claimed admission nonce is inadmissible: Argon2id digest "
+                          "not below the admission target for model difficulty " +
+                          std::to_string(difficulty);
+            return false;
+        }
+    } catch (const std::exception& e) {
+        // std::invalid_argument (oversized model_identifier/prompt encoding)
+        // or std::runtime_error (libargon2 unavailable/failed): the admission
+        // claim cannot be verified => invalid.
+        m_lastError = std::string("v3: admission verification failed: ") + e.what();
+        return false;
+    }
+
+    return true;
 }
 
 std::vector<float> QuickVerifier::GetUValues(const CProofBlob& proof) {
@@ -403,11 +619,12 @@ std::vector<float> QuickVerifier::GetUValues(const CProofBlob& proof) {
     return u_values;
 }
 
-float QuickVerifier::ComputeUValue(const std::vector<uint32_t>& context,
-                                   uint32_t step,
-                                   const CProofBlob& proof) {
+std::vector<uint8_t> QuickVerifier::BuildStepMessage(const std::vector<uint32_t>& context,
+                                                     uint32_t step,
+                                                     const CProofBlob& proof,
+                                                     bool include_nonce) {
     // Build message for SHA256 following Python's _build_msg order:
-    // header_data, v, T8, j4, ctx_bytes, precision_bytes
+    // header_data, v, T8, j4, ctx_bytes, precision_bytes [, nonce32]
     std::vector<uint8_t> message;
 
 
@@ -454,6 +671,23 @@ float QuickVerifier::ComputeUValue(const std::vector<uint32_t>& context,
     auto precision_bytes = StringToBytes(proof.compute_precision);
     message.insert(message.end(), precision_bytes.begin(), precision_bytes.end());
 
+    // 7. V3 (PROMPT BINDING.md §7): when an admission nonce is claimed, its 32
+    // raw bytes are appended to EVERY step preimage (all 256 u draws and the
+    // final target-critical hash) — the layout mirror of
+    // pow_v3::build_step_message. Absent nonce (or include_nonce=false, the
+    // §6 msg_w case) leaves the message byte-identical to the legacy v2 shape.
+    if (include_nonce && m_v3Active && m_v3Nonce) {
+        message.insert(message.end(), m_v3Nonce->begin(), m_v3Nonce->end());
+    }
+
+    return message;
+}
+
+float QuickVerifier::ComputeUValue(const std::vector<uint32_t>& context,
+                                   uint32_t step,
+                                   const CProofBlob& proof) {
+    const std::vector<uint8_t> message =
+        BuildStepMessage(context, step, proof, /*include_nonce=*/true);
 
     // Compute SHA256 (single, not double)
     uint256 hash;
@@ -899,49 +1133,13 @@ bool QuickVerifier::VerifyFinalHash(const CProofBlob& proof) {
         full_context.insert(full_context.end(), proof.chosen_tokens.begin(), proof.chosen_tokens.end());
     }
 
-    // Use the SAME hash computation as ComputeUValue but build message manually
-    // to get the actual hash bytes (not just U value)
-
-    // Build message for SHA256 following Python's _build_msg order
-    std::vector<uint8_t> message;
-
-    // 1. Header prefix
-    message.insert(message.end(), proof.header_prefix.begin(), proof.header_prefix.end());
-
-    // 2. VDF
-    message.insert(message.end(), proof.vdf.begin(), proof.vdf.end());
-
-    // 3. Tick as u32 little-endian
-    auto tick_bytes = Uint32ToLittleEndian(static_cast<uint32_t>(proof.tick));
-    message.insert(message.end(), tick_bytes.begin(), tick_bytes.end());
-
-    // 4. Step = 0 for final hash
-    auto step_bytes = Uint32ToLittleEndian(0);
-    message.insert(message.end(), step_bytes.begin(), step_bytes.end());
-
-    // 5. Window tokens - use same logic as ComputeUValue
-    size_t window_size = POW_WINDOW_SIZE;
-    std::vector<int64_t> window_tokens(window_size, 0);
-
-    // Fill window_tokens from the end (like Python's window_tokens[-L:] = ctx[-L:])
-    size_t context_len = std::min(full_context.size(), window_size);
-    if (context_len > 0) {
-        size_t start_pos = window_size - context_len;
-        for (size_t i = 0; i < context_len; ++i) {
-            window_tokens[start_pos + i] = static_cast<int64_t>(full_context[full_context.size() - context_len + i]);
-        }
-    }
-
-    // Convert window tokens to bytes (8 bytes each, little-endian)
-    for (int64_t token : window_tokens) {
-        for (int i = 0; i < 8; ++i) {
-            message.push_back((token >> (i * 8)) & 0xFF);
-        }
-    }
-
-    // 6. Precision string
-    auto precision_bytes = StringToBytes(proof.compute_precision);
-    message.insert(message.end(), precision_bytes.begin(), precision_bytes.end());
+    // Use the SAME message builder as ComputeUValue (step = 0 for the final
+    // hash). V3 (PROMPT BINDING.md §7): the claimed admission nonce is
+    // appended here too, so the proof hash — and therefore the derived header
+    // nonce and the short-hash target check — commits to it transitively; no
+    // separate post-admission grind field exists, and none may be introduced.
+    const std::vector<uint8_t> message =
+        BuildStepMessage(full_context, 0, proof, /*include_nonce=*/true);
 
     // Compute SHA256
     uint256 computed_hash;

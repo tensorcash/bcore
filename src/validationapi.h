@@ -46,6 +46,16 @@ static const uint16_t MAX_CHALLENGE_VALIDATION_REQUEST_ATTEMPTS{15}; // Before f
 // static const uint16_t MAX_MODEL_VALIDATION_REQUEST_ATTEMPTS{2}; // Before failing
 // static const uint16_t MAX_FULL_VALIDATION_REQUEST_ATTEMPTS{5}; // Before failing
 
+/** Option-2 advertised-difficulty decision (PROMPT BINDING.md §6), factored
+ *  out of ValidationAPI::SendApiRequest as a pure function for testability.
+ *  The verification service reads BlockValidation.difficulty as BOTH the
+ *  admission-target input AND the v3-active signal, so bcore advertises the
+ *  registered model difficulty ONLY when v3 rules are active at the block's
+ *  OWN height; otherwise 0 (the block is judged under v2 rules, byte-identical
+ *  to consensus). `height < 0` (unknown parent in a precheck path) => 0. */
+int64_t V3AdvertisedDifficulty(int height, const Consensus::Params& params,
+                               int64_t registered_difficulty);
+
 struct Hasher {
     std::size_t operator()(const uint256& val) const noexcept {
         return std::hash<std::string_view>()(

@@ -98,6 +98,8 @@ add_executable(test_bitcoin
   miner_tests.cpp
   pow_adjbits_ratio_tests.cpp
   pow_commitment_tests.cpp
+  pow_v3_vectors_tests.cpp
+  quick_verifier_v3_tests.cpp
   pow_adjbits_behavior_tests.cpp
   difficulty_mixed_models_tests.cpp
   pow_blob_mismatch_tests.cpp
