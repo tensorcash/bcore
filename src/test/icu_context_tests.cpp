@@ -606,11 +606,17 @@ BOOST_AUTO_TEST_CASE(canonical_band_number_grammar)
 
 BOOST_AUTO_TEST_CASE(canonical_band_rejects_duplicate_keys)
 {
-    UniValue o(UniValue::VOBJ);
-    o.pushKV("a", 1);
-    o.pushKV("a", 2); // UniValue permits duplicates; the canonical encoder must refuse them
+    // A genuine duplicate-key object. pushKV() de-duplicates (replaces the
+    // existing value), so it can NOT build one — but untrusted JSON reaches the
+    // canonicalizer via UniValue::read(), whose parser appends keys verbatim,
+    // so duplicates are real on that path and the encoder MUST refuse them.
+    UniValue o;
+    BOOST_REQUIRE(o.read("{\"a\":1,\"a\":2}"));
+    BOOST_REQUIRE(o.isObject());
+    BOOST_REQUIRE_EQUAL(o.getKeys().size(), 2U);   // read() kept both "a" keys
     std::string err;
     BOOST_CHECK(!assets::CanonicalizeIcuBandJson(o, err).has_value());
+    BOOST_CHECK(err.find("duplicate object key") != std::string::npos);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
