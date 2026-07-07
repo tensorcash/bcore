@@ -40,8 +40,8 @@
 namespace pow_v3 {
 
 // ------------------------------------------------------------------------- //
-// Constants (values marked CALIBRATION are placeholders pending PROMPT
-// BINDING.md §12; they must come from consensus chain params at activation).
+// Constants (values marked CALIBRATION are placeholders pending the TIP-0003
+// calibration pass; they must come from consensus chain params at activation).
 // Mirror pow_v3.py names/values exactly.
 // ------------------------------------------------------------------------- //
 
