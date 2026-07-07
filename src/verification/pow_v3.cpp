@@ -781,47 +781,91 @@ std::optional<std::array<uint8_t, 32>> admission_grind(
 // §4 — numerically conservative B_cred
 // ------------------------------------------------------------------------- //
 
-double mass_upper_for_step(double lower, double upper, double atol) {
+uint64_t f64_to_q63_floor(double x) {
+    // floor(x * 2^63), x finite in [0, 1], EXACT integer arithmetic (no
+    // double*2^63, which would round in the 52-bit mantissa). frexp:
+    // x = m * 2^e, m in [0.5, 1), so mant = m * 2^53 is an exact integer in
+    // [2^52, 2^53) and x * 2^63 = mant * 2^(e+10). A right shift truncates
+    // toward zero == floor for a non-negative value.
+    if (x <= 0.0) return 0;
+    if (x >= 1.0) return BCRED_Q_ONE;
+    int e = 0;
+    double m = std::frexp(x, &e);
+    uint64_t mant = static_cast<uint64_t>(std::ldexp(m, 53));  // exact
+    int shift = e + 10;
+    if (shift >= 0) {
+        // mant < 2^53 and shift <= 10 for x < 1, so mant << shift < 2^63.
+        return mant << shift;
+    }
+    return mant >> (-shift);
+}
+
+uint64_t f64_to_q63_ceil(double x) {
+    // ceil(x * 2^63), x finite in [0, 1], EXACT (see f64_to_q63_floor).
+    if (x <= 0.0) return 0;
+    if (x >= 1.0) return BCRED_Q_ONE;
+    int e = 0;
+    double m = std::frexp(x, &e);
+    uint64_t mant = static_cast<uint64_t>(std::ldexp(m, 53));
+    int shift = e + 10;
+    if (shift >= 0) {
+        return mant << shift;                     // exact, no remainder
+    }
+    int s = -shift;
+    return (mant + ((1ULL << s) - 1)) >> s;       // round up
+}
+
+uint64_t mass_q63_for_step(double lower, double upper, uint64_t atol_q63_ceil) {
     if (!std::isfinite(lower) || !std::isfinite(upper)) {
         throw std::invalid_argument("invalid entropy bounds: non-finite");
     }
     if (upper < lower) {
         throw std::invalid_argument("invalid entropy bounds: upper < lower");
     }
-    double mass = upper - lower;
-    if (mass < 0.0) mass = 0.0;
-    mass += 2.0 * atol;
-    return (mass > 1.0) ? 1.0 : mass;
+    uint64_t hi_q = f64_to_q63_ceil(upper);       // in [0, 2^63]
+    uint64_t lo_q = f64_to_q63_floor(lower);      // in [0, 2^63], <= hi_q
+    // (hi_q - lo_q) can be 2^63; widen in unsigned __int128 then clamp.
+    unsigned __int128 mass =
+        static_cast<unsigned __int128>(hi_q - lo_q) +
+        2 * static_cast<unsigned __int128>(atol_q63_ceil);
+    if (mass > static_cast<unsigned __int128>(BCRED_Q_ONE)) return BCRED_Q_ONE;
+    return static_cast<uint64_t>(mass);
 }
 
-uint64_t b_bits_q32_for_step(double mass_upper) {
-    if (mass_upper <= 0.0) {
-        // §4: an invalid/garbage interval never earns bits — reject the
+uint64_t credit_units_for_step(uint64_t mass_q63) {
+    if (mass_q63 == 0) {
+        // §4: an invalid/garbage interval never earns credit — reject the
         // proof (unreachable with atol > 0, defensive).
         throw std::invalid_argument(
-            "mass_upper <= 0: invalid interval never earns bits");
+            "mass_q63 == 0: invalid interval never earns credit");
     }
-    if (mass_upper >= 1.0) return 0;
-    // floor(-log2(m) * 2^32): identical double arithmetic to
-    // pow_v3.b_bits_q32_for_step (m in (0,1) => result > 0; the cap 2^37 is
-    // exactly representable so the comparison below is exact).
-    double q32 = std::floor(-std::log2(mass_upper) * 4294967296.0);
-    if (q32 >= static_cast<double>(B_STEP_MAX_Q32)) return B_STEP_MAX_Q32;
-    return static_cast<uint64_t>(q32);
+    // Largest n in [0, N_MAX] with BCRED_THRESHOLD_Q63[n] >= mass_q63. The
+    // table is non-increasing and threshold[0] == 2^63 >= mass_q63 (clamped),
+    // so n == 0 always qualifies. Binary search on the decreasing table.
+    std::size_t lo = 0, hi = BCRED_N_MAX;
+    while (lo < hi) {
+        std::size_t mid = (lo + hi + 1) >> 1;
+        if (BCRED_THRESHOLD_Q63[mid] >= mass_q63) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return static_cast<uint64_t>(lo);
 }
 
-uint64_t b_cred_q32_from_bounds(const std::vector<double>& lower_bounds,
-                                const std::vector<double>& upper_bounds,
-                                double atol) {
+uint64_t b_cred_units_from_bounds(const std::vector<double>& lower_bounds,
+                                  const std::vector<double>& upper_bounds,
+                                  uint64_t atol_q63_ceil) {
     if (lower_bounds.size() != upper_bounds.size()) {
         throw std::invalid_argument("entropy bounds size mismatch");
     }
-    // Integer sum: exactly order-independent, and bounded by
-    // 256 * B_STEP_MAX_Q32 = 2^45 — no overflow.
+    // Separate integer accumulator: order-independent, bounded by
+    // 256 * N_MAX == 8'388'608 — no overflow.
     uint64_t total = 0;
     for (std::size_t i = 0; i < lower_bounds.size(); ++i) {
-        total += b_bits_q32_for_step(
-            mass_upper_for_step(lower_bounds[i], upper_bounds[i], atol));
+        total += credit_units_for_step(
+            mass_q63_for_step(lower_bounds[i], upper_bounds[i], atol_q63_ceil));
     }
     return total;
 }
@@ -839,10 +883,10 @@ const char* tier_name(Tier tier) {
     return "invalid";  // unreachable
 }
 
-Tier tier_for_b_cred_q32(uint64_t b_cred_q32, uint64_t b_floor_q32,
-                         uint64_t b_free_q32) {
-    if (b_cred_q32 < b_floor_q32) return Tier::Invalid;
-    if (b_cred_q32 < b_free_q32) return Tier::AdmissionRequired;
+Tier tier_for_b_cred_units(uint64_t b_cred_units, uint64_t b_floor_units,
+                           uint64_t b_free_units) {
+    if (b_cred_units < b_floor_units) return Tier::Invalid;
+    if (b_cred_units < b_free_units) return Tier::AdmissionRequired;
     return Tier::Free;
 }
 

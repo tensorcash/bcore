@@ -13,17 +13,18 @@
 //
 // Scope (PROMPT BINDING.md sections):
 //   §3  extra_flags carrier   — merge_extra_flags_v3 / extract_admission_nonce_hex
-//   §4  conservative B_cred   — mass_upper_for_step / b_bits_q32_for_step /
-//                               b_cred_q32_from_bounds
-//   §5  tier rule             — tier_for_b_cred_q32
+//   §4  conservative B_cred   — mass_q63_for_step / credit_units_for_step /
+//                               b_cred_units_from_bounds  (R=1024 table)
+//   §5  tier rule             — tier_for_b_cred_units
 //   §6  Argon2id admission    — admission_message / argon2id_digest /
 //                               admission_expected_tries / admission_target_le /
 //                               admission_valid / admission_grind
 //   §7  v3 step hashing       — build_step_message / step_digest / step_u
 //
 // Consensus-determinism notes (same agreed deviations as pow_v3.py):
-//   * B_cred accumulates in Q32 fixed point (floor per step, integer sum) —
-//     exactly order-independent, and floor() is conservative.
+//   * B_cred accumulates in integer credit units via a checked-in R=1024 Q63
+//     threshold table. Runtime tiering uses no log2/libm path; endpoint and
+//     threshold rounding are conservative.
 //   * expected_tries is integer-only from integer chain constants;
 //     admission_target = (2^256 - 1) / expected_tries.
 
@@ -33,6 +34,8 @@
 #include <optional>
 #include <string>
 #include <vector>
+
+#include "bcred_table_r1024.h"  // R=1024 B_cred credit-threshold table (§4)
 
 namespace pow_v3 {
 
@@ -55,22 +58,27 @@ constexpr char PROMPT_CTX_TAG[] = "TC_V3_PROMPT_CTX";  // 16 bytes, no NUL
 constexpr std::size_t PROMPT_CTX_TAG_LEN = 16;
 constexpr std::size_t PROMPT_COMMITMENT_BYTES = 32;
 
-// Tier thresholds in credited bits (§1, §5). Q32 mirrors REUSE_SCORE_Q32.
-constexpr uint64_t B_Q32_ONE = 1ULL << 32;
-constexpr uint64_t B_FLOOR_BITS = 45;             // CALIBRATION (initial floor)
-constexpr uint64_t B_FREE_BITS = 70;              // CALIBRATION (initial high tier)
-constexpr uint64_t B_FLOOR_Q32 = B_FLOOR_BITS * B_Q32_ONE;
-constexpr uint64_t B_FREE_Q32 = B_FREE_BITS * B_Q32_ONE;
+// B_cred credit units (§4): R units == 1 bit. BCRED_R / BCRED_N_MAX /
+// BCRED_THRESHOLD_Q63 come from bcred_table_r1024.h. Chain params carry the
+// tiers as BITS (V3BFloorBits / V3BFreeBits); the tier comparison * R.
+constexpr uint64_t BCRED_Q_ONE = 1ULL << 63;       // Q63 unit == mass 1.0
+constexpr uint64_t B_FLOOR_BITS = 45;              // CALIBRATION (initial floor)
+constexpr uint64_t B_FREE_BITS = 70;               // CALIBRATION (initial high tier)
+constexpr uint64_t B_FLOOR_UNITS = B_FLOOR_BITS * BCRED_R;
+constexpr uint64_t B_FREE_UNITS = B_FREE_BITS * BCRED_R;
 
-// Per-step clamp on credited bits for tiny positive masses, kept equal to
-// the reuse gate's 32-bit per-step cap (atol > 0 makes mass_upper >= 2*atol
-// in practice, so the clamp is defensive).
-constexpr uint64_t B_STEP_MAX_BITS = 32;
-constexpr uint64_t B_STEP_MAX_Q32 = B_STEP_MAX_BITS * B_Q32_ONE;
+// Per-step credit cap == the table's max index (32 bits worth of units). The
+// 2*ATOL widening floors mass_q well above this (~12 bits), so the cap is
+// purely defensive.
+constexpr uint64_t B_STEP_MAX_UNITS = BCRED_N_MAX;
 
 // Interval-mass tolerance — must equal the verifier's ATOL
-// (services/verification-api/src/config/constants.py).
+// (services/verification-api/src/config/constants.py). ATOL_Q63_CEIL is the
+// EXACT integer ceil(ATOL * 2^63); the mass widening adds 2*ATOL_Q63_CEIL. It
+// is a checked-in constant (identical in pow_v3.py) so no float feeds the Q63
+// arithmetic: ceil(0.0001_f64 * 2^63) == 922337203685478.
 constexpr double ATOL = 0.0001;
+constexpr uint64_t ATOL_Q63_CEIL = 922337203685478ULL;
 
 // Consensus parser bounds for the v3 extra_flags carrier (§3) — identical in
 // Python and C++; violations mean "no nonce claimed", never a parse crash.
@@ -256,25 +264,33 @@ std::optional<std::array<uint8_t, 32>> admission_grind(
 // §4 — numerically conservative B_cred
 // ------------------------------------------------------------------------- //
 
-// min(1, max(0, upper - lower) + 2*atol); throws std::invalid_argument on
-// NaN/Inf/upper < lower — same conservative interval-mass logic as the reuse
-// gate's _reuse_score_q32_from_bounds.
-double mass_upper_for_step(double lower, double upper, double atol = ATOL);
+// EXACT floor/ceil of (x * 2^63) for a finite double x in [0, 1], via mantissa
+// decomposition (frexp) and integer shifts — NOT (uint64)(x * 9.22e18), whose
+// double multiply would round in the 52-bit mantissa and be FMA/platform
+// dependent. Used to quantise interval endpoints for the conservative mass.
+uint64_t f64_to_q63_floor(double x);
+uint64_t f64_to_q63_ceil(double x);
 
-// Credited bits for one step in Q32 fixed point. mass_upper <= 0 throws
-// std::invalid_argument (§4: an invalid/garbage interval never earns bits —
-// unreachable with atol > 0, defensive); >= 1 -> 0 (never negative); else
-// floor(-log2(mass_upper) * 2^32) clamped to the 32-bit per-step cap.
-// floor() keeps the credit conservative (credited <= true bits).
-uint64_t b_bits_q32_for_step(double mass_upper);
+// Conservative interval mass of one step in Q63 fixed point (§4). Quantises
+// the ENDPOINTS (upper via ceil, lower via floor) and adds 2*atol_q63_ceil;
+// every rounding direction OVER-estimates the mass so credit never over-counts.
+// Throws std::invalid_argument on NaN/Inf/upper < lower. Clamped to [0, 2^63].
+uint64_t mass_q63_for_step(double lower, double upper,
+                           uint64_t atol_q63_ceil = ATOL_Q63_CEIL);
 
-// Sum of per-step Q32 credited bits over the window (§4). Integer
-// accumulation: exact, and independent of list order or GPU reduction order
-// by construction. Throws std::invalid_argument on length mismatch or
-// invalid bounds — proof invalid.
-uint64_t b_cred_q32_from_bounds(const std::vector<double>& lower_bounds,
-                                const std::vector<double>& upper_bounds,
-                                double atol = ATOL);
+// Credit units for one step: the largest n in [0, N_MAX] with
+// BCRED_THRESHOLD_Q63[n] >= mass_q63 (§4). n == 0 always qualifies (mass is
+// clamped to <= 2^63 == threshold[0]), so 0 <= credit <= N_MAX (per-step cap).
+// Throws std::invalid_argument on mass_q63 == 0 (invalid interval earns none).
+uint64_t credit_units_for_step(uint64_t mass_q63);
+
+// Sum of per-step credit units over the window (§4). A SEPARATE integer
+// accumulator (<= 256 * N_MAX), exact and reduction-order independent. Both
+// quick and full verification call this on their bounds. Throws
+// std::invalid_argument on length mismatch or invalid bounds — proof invalid.
+uint64_t b_cred_units_from_bounds(const std::vector<double>& lower_bounds,
+                                  const std::vector<double>& upper_bounds,
+                                  uint64_t atol_q63_ceil = ATOL_Q63_CEIL);
 
 // ------------------------------------------------------------------------- //
 // §5 — tier rule
@@ -290,12 +306,12 @@ enum class Tier {
 // "free") for logs and the cross-language vectors.
 const char* tier_name(Tier tier);
 
-// B_cred < B_FLOOR -> invalid; < B_FREE -> admission required; else free.
-// Callers must additionally enforce: a PRESENT admission nonce is verified
-// regardless of tier (present => valid), and absent + admission_required =>
-// invalid (§5).
-Tier tier_for_b_cred_q32(uint64_t b_cred_q32,
-                         uint64_t b_floor_q32 = B_FLOOR_Q32,
-                         uint64_t b_free_q32 = B_FREE_Q32);
+// B_cred < B_FLOOR -> invalid; < B_FREE -> admission required; else free. All
+// comparisons in integer credit units (R units == 1 bit). Callers must also
+// enforce: a PRESENT admission nonce is verified regardless of tier (present
+// => valid), and absent + admission_required => invalid (§5).
+Tier tier_for_b_cred_units(uint64_t b_cred_units,
+                           uint64_t b_floor_units = B_FLOOR_UNITS,
+                           uint64_t b_free_units = B_FREE_UNITS);
 
 }  // namespace pow_v3

@@ -94,9 +94,15 @@ V3_TOP_P = 1.0
 V3_REPETITION_PENALTY = 1.0
 
 # Mirror verification/pow_v3.h §4/§5 so the builder can target a tier exactly.
-V3_ATOL = 0.0001
-V3_B_FLOOR_BITS = 45
-V3_B_FREE_BITS = 70
+# The credit is the REAL consensus computation (R=1024 table via pow_v3), so
+# the builder's tier prediction matches the verifier's bit-for-bit. pow_v3 is
+# vendored beside the functional tests (cwd on sys.path).
+import pow_v3 as _pow_v3
+
+V3_ATOL = _pow_v3.ATOL
+V3_B_FLOOR_BITS = _pow_v3.B_FLOOR_BITS
+V3_B_FREE_BITS = _pow_v3.B_FREE_BITS
+V3_BCRED_R = _pow_v3.BCRED_R
 # A tiny filler logit: prob e^-60 ~ 9e-27 > 0 (kept in the CDF) but far below
 # the chosen interval and pinned to high, non-colliding ids so it can never
 # shift the chosen token's [lower, upper]. 47 fillers perturb the softmax
@@ -105,13 +111,17 @@ _V3_FILLER_LOGIT = -60.0
 _V3_FILLER_ID_BASE = 0x40000000  # 2^30: above any chosen id, below the 2^31 v1 fillers
 
 
+def v3_step_credit_units(mass):
+    """Consensus credit units for one entropic step of interval width ``mass``
+    (R=1024 table via pow_v3; R units == 1 bit). The verifier replays width ==
+    mass, so this equals credit_units_for_step(mass_q63_for_step(0, mass))."""
+    return _pow_v3.credit_units_for_step(
+        _pow_v3.mass_q63_for_step(0.0, float(mass)))
+
+
 def v3_step_bits(mass, atol=V3_ATOL):
-    """Credited bits for one step of interval width ``mass`` (mirrors
-    pow_v3::b_bits_q32_for_step / mass_upper_for_step, without the Q32 floor)."""
-    mass_upper = min(1.0, max(0.0, mass) + 2.0 * atol)
-    if mass_upper >= 1.0:
-        return 0.0
-    return min(32.0, -math.log2(mass_upper))
+    """Float view of v3_step_credit_units for sizing/logging (units / R)."""
+    return v3_step_credit_units(mass) / V3_BCRED_R
 
 
 def _v3_entropic_row(u, chosen_id, mass, top_k=V3_TOP_K):
@@ -293,8 +303,8 @@ def solve_v3_work_unit(header_prefix_hex, target_hex, *, tick=100000,
     step's u uses context that excludes it); every entropic step's u and CDF
     evidence is fixed independently of the grind.
 
-    B_cred == n_entropic * v3_step_bits(mass): with mass=0.25 that is ~2.0
-    bits/step, so n_entropic tunes the tier (>=70 free, [45,70) admission,
+    B_cred == n_entropic * v3_step_credit_units(mass): with mass=0.25 that is
+    ~2.0 bits/step, so n_entropic tunes the tier (>=70 free, [45,70) admission,
     <45 invalid). ``admission_nonce`` (32 bytes), when given, is folded into
     every u and the final hash (§7) and carried in extra_flags.
     """
@@ -365,6 +375,7 @@ def solve_v3_work_unit(header_prefix_hex, target_hex, *, tick=100000,
         "prompt_tokens": prompt_tokens,
         "pad_mask": list(pad_mask) if pad_mask is not None else None,
         "extra_flags": extra_flags,
+        "expected_b_cred_units": n_entropic * v3_step_credit_units(mass),
         "expected_b_cred_bits": n_entropic * v3_step_bits(mass),
     }
 

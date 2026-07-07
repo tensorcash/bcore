@@ -498,32 +498,34 @@ bool QuickVerifier::VerifyV3TierAndAdmission(const CProofBlob& proof,
     const Consensus::Params& p = *m_v3ChainParams;
 
     // §4: conservative B_cred over the SAME per-step interval bounds the
-    // sampling check just produced (mass_upper = min(1, max(0, hi-lo) + 2*atol),
-    // Q32 floor per step, exact integer sum — order-independent by construction).
-    uint64_t b_cred_q32 = 0;
+    // sampling check just produced (mass_q63 = ceil(hi) - floor(lo) + 2*ATOL,
+    // R=1024 table credit per step, exact integer sum — order-independent by
+    // construction). Credit is in units: R units == 1 bit.
+    uint64_t b_cred_units = 0;
     try {
         const std::vector<double> lo(lower_bounds.begin(), lower_bounds.end());
         const std::vector<double> hi(upper_bounds.begin(), upper_bounds.end());
-        b_cred_q32 = pow_v3::b_cred_q32_from_bounds(lo, hi);
+        b_cred_units = pow_v3::b_cred_units_from_bounds(lo, hi);
     } catch (const std::invalid_argument& e) {
-        // §4: an invalid/garbage interval never earns bits — proof invalid.
+        // §4: an invalid/garbage interval never earns credit — proof invalid.
         m_lastError = std::string("v3: invalid entropy bounds for B_cred: ") + e.what();
         return false;
     }
 
     // §5 tier rule, thresholds from the chain params active at this height (§1).
-    const uint64_t floor_q32 = p.V3BFloorBits * pow_v3::B_Q32_ONE;
-    const uint64_t free_q32 = p.V3BFreeBits * pow_v3::B_Q32_ONE;
-    const pow_v3::Tier tier = pow_v3::tier_for_b_cred_q32(b_cred_q32, floor_q32, free_q32);
+    // Chain params carry the tiers as BITS; * R to compare in credit units.
+    const uint64_t floor_units = p.V3BFloorBits * pow_v3::BCRED_R;
+    const uint64_t free_units = p.V3BFreeBits * pow_v3::BCRED_R;
+    const pow_v3::Tier tier = pow_v3::tier_for_b_cred_units(b_cred_units, floor_units, free_units);
 
     if (tier == pow_v3::Tier::Invalid) {
-        m_lastError = "v3: B_cred below B_FLOOR: q32=" + std::to_string(b_cred_q32) +
-                      " < floor_q32=" + std::to_string(floor_q32);
+        m_lastError = "v3: B_cred below B_FLOOR: units=" + std::to_string(b_cred_units) +
+                      " < floor_units=" + std::to_string(floor_units);
         return false;
     }
     if (tier == pow_v3::Tier::AdmissionRequired && !m_v3Nonce) {
-        m_lastError = "v3: admission nonce required (B_FLOOR <= B_cred < B_FREE): q32=" +
-                      std::to_string(b_cred_q32) + " < free_q32=" + std::to_string(free_q32) +
+        m_lastError = "v3: admission nonce required (B_FLOOR <= B_cred < B_FREE): units=" +
+                      std::to_string(b_cred_units) + " < free_units=" + std::to_string(free_units) +
                       " and no valid extra_flags.v3.admission_nonce claimed";
         return false;
     }
