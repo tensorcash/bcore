@@ -848,7 +848,7 @@ def spenders_taproot_active():
                         leaf="s0",
                         key=secs[0],
                         **SINGLE_SIG,
-                        standard=False,
+                        standard=True,
                         failure={"leaf": None, "key": secs[1], "inputs": []},
                         **ERR_TAPROOT_KEYPATH_DISABLED,
                     )
