@@ -2604,6 +2604,24 @@ int64_t V3AdvertisedDifficulty(int height, const Consensus::Params& params,
     return registered_difficulty > 0 ? registered_difficulty : 0;
 }
 
+bool IsV3ActivationConfigSound(int v3_activation_height, bool external_api,
+                               bool is_mockable_chain) {
+    // PROMPT BINDING.md §5/§9: B_cred tiering is consensus-fast-path evidence
+    // computed from the proof's SUBMITTED top-k, so its free tier is only sound
+    // when the full-replay / red-block enforcement path (external_api) rejects
+    // forged high-entropy evidence. The plan is explicit: "v3 MUST NOT activate
+    // unless red-block enforcement is active for v3 proofs." So a finite
+    // V3ActivationHeight is only a valid config when external_api is on.
+    //
+    // Mockable (regtest / mock testnet) chains are exempt: they deliberately
+    // exercise the fast path in isolation — the functional acceptance test
+    // activates v3 via -v3activationheight WITHOUT external_api to pin the
+    // QuickVerifier tier/admission mechanics directly.
+    if (v3_activation_height == std::numeric_limits<int>::max()) return true;  // v3 disabled
+    if (is_mockable_chain) return true;                                        // test harness
+    return external_api;
+}
+
 void ValidationAPI::SendApiRequest(const uint256 &req_id, const CBlock& block, const ValidationReqType& type) {
     if (type != ValidationReqType::Quick && type != ValidationReqType::Quick_Smell &&
         type != ValidationReqType::Full && type != ValidationReqType::Challenge) {
