@@ -33,6 +33,27 @@ if(WIN32)
   )
 endif()
 
+# libargon2 — required for the vendored v3 admission-puzzle verification
+# (verification/pow_v3.cpp, PROMPT BINDING.md §6/§9). Required unconditionally
+# for v3.0: consensus code must never ship without the ability to verify a
+# claimed admission nonce (a node that cannot run Argon2id could not validate
+# v3 blocks after activation). libargon2 provides no CMake package, so detect
+# the header + library directly (Debian/Ubuntu: libargon2-dev; Homebrew: argon2).
+find_path(ARGON2_INCLUDE_DIR NAMES argon2.h)
+find_library(ARGON2_LIBRARY NAMES argon2)
+if(NOT ARGON2_INCLUDE_DIR OR NOT ARGON2_LIBRARY)
+  message(FATAL_ERROR "libargon2 not found (argon2.h / libargon2). It is required for v3 admission verification; install libargon2-dev (or `brew install argon2`).")
+endif()
+add_library(argon2_argon2 UNKNOWN IMPORTED)
+set_target_properties(argon2_argon2 PROPERTIES
+  IMPORTED_LOCATION "${ARGON2_LIBRARY}"
+  INTERFACE_INCLUDE_DIRECTORIES "${ARGON2_INCLUDE_DIR}"
+)
+add_library(Argon2::Argon2 ALIAS argon2_argon2)
+# Compiled globally (not per-target) so pow_v3.cpp, its consumers and the unit
+# tests all agree on whether argon2id_digest is available.
+add_compile_definitions(POW_V3_HAVE_ARGON2)
+
 add_subdirectory(univalue)
 if (ENABLE_IPC AND NOT WITH_EXTERNAL_LIBMULTIPROCESS)
   include(../cmake/libmultiprocess.cmake)
@@ -409,6 +430,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   validationapi_mock.cpp
   validationinterface.cpp
   versionbits.cpp
+  verification/pow_v3.cpp
   verification/quick_verifier.cpp
   verification/verification_utils.cpp
   $<$<TARGET_EXISTS:bitcoin_wallet>:wallet/init.cpp>
@@ -441,6 +463,7 @@ target_link_libraries(bitcoin_node
     $<$<BOOL:${WITH_ZMQ}>:zeromq>
     OpenSSL::SSL
     OpenSSL::Crypto
+    Argon2::Argon2
     $<$<PLATFORM_ID:Windows>:ws2_32>
     $<$<PLATFORM_ID:Windows>:wsock32>
     $<$<PLATFORM_ID:Windows>:crypt32>

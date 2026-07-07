@@ -83,6 +83,7 @@ RUN apt-get update && \
       libzmq3-dev \
       libsqlite3-dev \
       libgmp-dev \
+      libargon2-dev \
       libboost-all-dev \
       libflint-dev \
       autoconf \
@@ -254,8 +255,17 @@ RUN pip3 install --no-cache-dir /tmp/*.whl && rm -rf /tmp/*.whl && \
 # The import guard below fails the image build (fail-fast) if either this or
 # the chiavdf wheel above is ever dropped, so CI can never quietly lose the
 # accepted/rejected submit_mining_response coverage.
-RUN pip3 install --no-cache-dir flatbuffers && \
-    python3 -c "import flatbuffers, chiavdf; print('functional-test deps OK: flatbuffers', flatbuffers.__version__)"
+# argon2-cffi: feature_v3_acceptance.py scenario 4 (positive v3 admission) grinds
+# an admissible Argon2id nonce and rebuilds the transcript with it. Without it
+# that scenario SKIPs (the negative admission legs still run), so the same
+# fail-fast guard below keeps CI from silently losing positive-admission
+# coverage. pow_v3.py is the SINGLE canonical helper (shared-utils/pow-utils);
+# it is vendored into the functional dir (cwd on sys.path) rather than copied
+# into the repo, so there is exactly one source of truth.
+COPY shared-utils/pow-utils/pow_v3.py /build/bcore/test/functional/pow_v3.py
+RUN pip3 install --no-cache-dir flatbuffers argon2-cffi && \
+    python3 -c "import flatbuffers, chiavdf, argon2; print('functional-test deps OK: flatbuffers', flatbuffers.__version__)" && \
+    ( cd /build/bcore/test/functional && python3 -c "import pow_v3; assert pow_v3.V3_PROOF_VERSION == 3; print('pow_v3 vendored OK')" )
 
 # 7) Copy test runner scripts
 COPY services/core-node/bcore/test/run_asset_tests.sh /run_asset_tests.sh

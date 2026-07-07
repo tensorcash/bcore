@@ -260,6 +260,49 @@ struct Params {
     {
         return height >= 0 && reuse_entropy_height >= 0 && height >= reuse_entropy_height;
     }
+
+    // ---- V3 prompt binding / admission (PROMPT BINDING.md §1) ----
+    // First height where the v3 proof rules are enforced for proof.version >= 3:
+    // nonce-bound step hashing (§7), consensus-fixed sampler profile (§2),
+    // conservative B_cred tiering (§4/§5) and the Argon2id admission puzzle (§6).
+    // Defaults to "never" so NOTHING changes on any chain until a chainparams
+    // release sets a coordinated height. Below this height (and for
+    // proof.version < 3 at any height) verification is byte-identical to v2.
+    int V3ActivationHeight{std::numeric_limits<int>::max()};
+    bool IsV3Active(int height) const
+    {
+        return height >= 0 && height >= V3ActivationHeight;
+    }
+
+    // v3 chain constants (§1). Historical verification must always read these
+    // from the chain params active for the block's chain — never from mutable
+    // off-chain policy. Defaults mirror the vendored implementation
+    // (verification/pow_v3.h); the QuickVerifier cross-checks the profile /
+    // parser-bound fields against the compiled-in pow_v3 constants and refuses
+    // to verify v3 proofs on divergence (fail closed, never mis-verify).
+    //
+    // Tier thresholds in credited bits (§5): B_cred < B_FLOOR => invalid;
+    // B_FLOOR <= B_cred < B_FREE => admission required; else free.
+    uint64_t V3BFloorBits{45};
+    uint64_t V3BFreeBits{70};
+    // ELIG_ALPHA (§1): expected Argon2 admission cost as a fraction of decode
+    // cost per 256-token window, as an exact rational (0.04 = 4/100).
+    uint64_t V3EligAlphaNum{4};
+    uint64_t V3EligAlphaDen{100};
+    // ARGON_PROFILE (§1/§6): Argon2id time cost, memory (KiB, the security
+    // parameter — do NOT trade it down for cost), lanes.
+    uint32_t V3ArgonTimeCost{1};
+    uint32_t V3ArgonMemoryKiB{8192};
+    uint32_t V3ArgonLanes{1};
+    // Reference timings in integer microseconds (§6 target derivation):
+    // expected_tries = alpha * (decode_us_at_normalizer * normalizer /
+    // difficulty) / argon_ref_us, exact integer arithmetic.
+    uint64_t V3ArgonRefUs{8000};
+    uint64_t V3DecodeUsAtNormalizer{10000000};
+    // Consensus parser bounds for the v3 extra_flags nonce carrier (§3);
+    // violations mean "no nonce claimed", never a parse failure.
+    uint64_t V3ExtraFlagsMaxBytes{4096};
+    int V3ExtraFlagsMaxDepth{8};
 };
 
 } // namespace Consensus

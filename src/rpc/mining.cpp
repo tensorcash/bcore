@@ -45,6 +45,7 @@
 #include <util/string.h>
 #include <util/time.h>
 #include <util/translation.h>
+#include <modeldb.h>
 #include <validation.h>
 #include <validationinterface.h>
 #include <validationapi.h>
@@ -1834,6 +1835,21 @@ static RPCHelpMan submit_mining_response()
 
     // QuickVerify before submission, mirroring SolutionReceiverLoop:452-458.
     QuickVerifier quick_verifier;
+    // V3 prompt binding (PROMPT BINDING.md §7): a nonce-bearing v3 proof folds
+    // the admission nonce into every u; without the v3 context this pre-check
+    // recomputes u WITHOUT the nonce and spuriously rejects a consensus-valid
+    // proof. Mirror validation.cpp's pre-check context (height = next_height,
+    // computed above under cs_main; registered difficulty from modeldb).
+    {
+        int64_t v3_difficulty{0};
+        if (block.pow.version >= 3 && g_modeldb && !block.pow.model_identifier.empty()) {
+            ModelRecord rec;
+            if (g_modeldb->ReadModel(block.pow.GetModelHash(), rec)) {
+                v3_difficulty = rec.metadata.difficulty;
+            }
+        }
+        quick_verifier.SetV3Context(chainman.GetConsensus(), next_height, v3_difficulty);
+    }
     // Version-keyed: enforces the reuse gate iff block.pow.version >= REUSE_GATE_VERSION.
     const VerificationResult qv = quick_verifier.QuickVerify(block.pow);
     if (qv != VerificationResult::Quick_OK) {
