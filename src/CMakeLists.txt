@@ -431,6 +431,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   validationinterface.cpp
   versionbits.cpp
   verification/pow_v3.cpp
+  verification/bcred_table_r1024.cpp
   verification/quick_verifier.cpp
   verification/verification_utils.cpp
   $<$<TARGET_EXISTS:bitcoin_wallet>:wallet/init.cpp>

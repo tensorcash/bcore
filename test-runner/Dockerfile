@@ -263,9 +263,11 @@ RUN pip3 install --no-cache-dir /tmp/*.whl && rm -rf /tmp/*.whl && \
 # it is vendored into the functional dir (cwd on sys.path) rather than copied
 # into the repo, so there is exactly one source of truth.
 COPY shared-utils/pow-utils/pow_v3.py /build/bcore/test/functional/pow_v3.py
+# R=1024 B_cred table (§4) — pow_v3 imports it; vendor it beside pow_v3.py.
+COPY shared-utils/pow-utils/bcred_table_r1024.py /build/bcore/test/functional/bcred_table_r1024.py
 RUN pip3 install --no-cache-dir flatbuffers argon2-cffi && \
     python3 -c "import flatbuffers, chiavdf, argon2; print('functional-test deps OK: flatbuffers', flatbuffers.__version__)" && \
-    ( cd /build/bcore/test/functional && python3 -c "import pow_v3; assert pow_v3.V3_PROOF_VERSION == 3; print('pow_v3 vendored OK')" )
+    ( cd /build/bcore/test/functional && python3 -c "import pow_v3; assert pow_v3.V3_PROOF_VERSION == 3 and pow_v3.BCRED_R == 1024; print('pow_v3 vendored OK')" )
 
 # 7) Copy test runner scripts
 COPY services/core-node/bcore/test/run_asset_tests.sh /run_asset_tests.sh

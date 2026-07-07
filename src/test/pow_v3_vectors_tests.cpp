@@ -14,6 +14,9 @@
 #include <test/util/setup_common.h>
 #include <verification/pow_v3.h>
 
+#include <crypto/sha256.h>
+#include <util/strencodings.h>  // HexStr
+
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -256,15 +259,17 @@ BOOST_AUTO_TEST_CASE(admission_valid_strict_less_than_le)
     BOOST_CHECK(!pow_v3::admission_valid(a, b));
 }
 
-// ---- §4 B_cred (vectors "b_cred") ------------------------------------------
+// ---- §4 B_cred credit units (R=1024 table, vectors "b_cred") ----------------
 
 BOOST_AUTO_TEST_CASE(b_cred_golden_vectors)
 {
-    // uniform_quarter_mass: mass_upper = 0.25 exactly => 2 bits/step => 512 bits.
+    // Expected values are byte-identical to gen_v3_vectors.py (Python) — the
+    // cross-language B_cred identity check. R units == 1 bit.
+    // uniform_quarter_mass: mass ~ 0.25 each => 2 bits/step => 512 bits.
     {
         const std::vector<double> lo(256, 0.1);
         const std::vector<double> hi(256, 0.35 - 2 * pow_v3::ATOL);
-        BOOST_CHECK_EQUAL(pow_v3::b_cred_q32_from_bounds(lo, hi), 2199023255552ULL);
+        BOOST_CHECK_EQUAL(pow_v3::b_cred_units_from_bounds(lo, hi), 524288ULL);
     }
     // mixed_masses: lower[i] = i/1000, upper[i] = i/1000 + 0.001 + (i%7)/100.
     {
@@ -273,27 +278,86 @@ BOOST_AUTO_TEST_CASE(b_cred_golden_vectors)
             lo[i] = i / 1000.0;
             hi[i] = i / 1000.0 + 0.001 + (i % 7) / 100.0;
         }
-        BOOST_CHECK_EQUAL(pow_v3::b_cred_q32_from_bounds(lo, hi), 6247741626394ULL);
+        BOOST_CHECK_EQUAL(pow_v3::b_cred_units_from_bounds(lo, hi), 1489453ULL);
     }
-    // point_bounds_atol_only: mass = 2*ATOL each.
+    // point_bounds_atol_only: mass = 2*ATOL each => ~12.29 bits/step.
     {
         const std::vector<double> lo(256, 0.5);
         const std::vector<double> hi(256, 0.5);
-        BOOST_CHECK_EQUAL(pow_v3::b_cred_q32_from_bounds(lo, hi), 13510482639872ULL);
+        BOOST_CHECK_EQUAL(pow_v3::b_cred_units_from_bounds(lo, hi), 3220992ULL);
     }
-    // full_mass_zero_bits: mass >= 1 contributes zero (never negative) bits.
+    // full_mass_zero_bits: mass >= 1 contributes zero (never negative) units.
     {
         const std::vector<double> lo(256, 0.0);
         const std::vector<double> hi(256, 1.0);
-        BOOST_CHECK_EQUAL(pow_v3::b_cred_q32_from_bounds(lo, hi), 0ULL);
+        BOOST_CHECK_EQUAL(pow_v3::b_cred_units_from_bounds(lo, hi), 0ULL);
     }
     // §4 rejects: upper < lower, NaN/Inf, size mismatch — proof invalid.
-    BOOST_CHECK_THROW(pow_v3::b_cred_q32_from_bounds({0.5}, {0.4}), std::invalid_argument);
-    BOOST_CHECK_THROW(pow_v3::b_cred_q32_from_bounds({std::nan("")}, {0.5}), std::invalid_argument);
-    BOOST_CHECK_THROW(pow_v3::b_cred_q32_from_bounds({0.1, 0.2}, {0.5}), std::invalid_argument);
-    // mass_upper <= 0 rejects (never awards max bits); >= 1 contributes 0.
-    BOOST_CHECK_THROW(pow_v3::b_bits_q32_for_step(0.0), std::invalid_argument);
-    BOOST_CHECK_EQUAL(pow_v3::b_bits_q32_for_step(1.0), 0ULL);
+    BOOST_CHECK_THROW(pow_v3::b_cred_units_from_bounds({0.5}, {0.4}), std::invalid_argument);
+    BOOST_CHECK_THROW(pow_v3::b_cred_units_from_bounds({std::nan("")}, {0.5}), std::invalid_argument);
+    BOOST_CHECK_THROW(pow_v3::b_cred_units_from_bounds({0.1, 0.2}, {0.5}), std::invalid_argument);
+    // mass_q63 == 0 rejects (never awards max units); mass 1.0 credits 0.
+    BOOST_CHECK_THROW(pow_v3::credit_units_for_step(0), std::invalid_argument);
+    BOOST_CHECK_EQUAL(pow_v3::credit_units_for_step(pow_v3::mass_q63_for_step(0.0, 1.0)), 0ULL);
+}
+
+// ---- §4 table identity + boundary + conversion ------------------------------
+
+// Little-endian SHA-256 of the compiled table must equal the checked-in
+// identity (== the Python table's SHA), proving both languages share bytes.
+static std::string bcred_table_le_sha256_hex()
+{
+    CSHA256 hasher;
+    for (std::size_t n = 0; n < pow_v3::BCRED_TABLE_LEN; ++n) {
+        uint8_t le[8];
+        uint64_t v = pow_v3::BCRED_THRESHOLD_Q63[n];
+        for (int b = 0; b < 8; ++b) le[b] = static_cast<uint8_t>((v >> (8 * b)) & 0xff);
+        hasher.Write(le, 8);
+    }
+    unsigned char digest[CSHA256::OUTPUT_SIZE];
+    hasher.Finalize(digest);
+    const std::vector<unsigned char> d(digest, digest + CSHA256::OUTPUT_SIZE);
+    return HexStr(d);
+}
+
+BOOST_AUTO_TEST_CASE(b_cred_table_identity_and_boundaries)
+{
+    // Table shape / anchors.
+    BOOST_CHECK_EQUAL(pow_v3::BCRED_R, 1024U);
+    BOOST_CHECK_EQUAL(pow_v3::BCRED_N_MAX, 32U * 1024U);
+    BOOST_CHECK_EQUAL(pow_v3::BCRED_TABLE_LEN, 32U * 1024U + 1U);
+    BOOST_CHECK_EQUAL(pow_v3::BCRED_THRESHOLD_Q63[0], pow_v3::BCRED_Q_ONE);        // 2^63
+    BOOST_CHECK_EQUAL(pow_v3::BCRED_THRESHOLD_Q63[pow_v3::BCRED_N_MAX], 1ULL << 31); // 2^31
+    // Non-increasing.
+    for (std::size_t n = 1; n < pow_v3::BCRED_TABLE_LEN; ++n) {
+        BOOST_CHECK(pow_v3::BCRED_THRESHOLD_Q63[n] <= pow_v3::BCRED_THRESHOLD_Q63[n - 1]);
+    }
+    // Cross-language table identity.
+    BOOST_CHECK_EQUAL(bcred_table_le_sha256_hex(),
+                      std::string(pow_v3::BCRED_TABLE_SHA256_HEX));
+
+    // Boundary: mass_q63 == threshold[n] credits >= n; threshold[n]+1 credits < n.
+    for (std::size_t n : {1U, 1024U, 5000U, 20000U, 32767U}) {
+        const uint64_t t = pow_v3::BCRED_THRESHOLD_Q63[n];
+        BOOST_CHECK(pow_v3::credit_units_for_step(t) >= n);
+        if (t + 1 <= pow_v3::BCRED_Q_ONE) {
+            BOOST_CHECK(pow_v3::credit_units_for_step(t + 1) < n);
+        }
+    }
+
+    // Exact conversion anchors (integer arithmetic, no double*2^63).
+    BOOST_CHECK_EQUAL(pow_v3::f64_to_q63_floor(1.0), pow_v3::BCRED_Q_ONE);
+    BOOST_CHECK_EQUAL(pow_v3::f64_to_q63_ceil(1.0), pow_v3::BCRED_Q_ONE);
+    BOOST_CHECK_EQUAL(pow_v3::f64_to_q63_floor(0.0), 0ULL);
+    BOOST_CHECK_EQUAL(pow_v3::f64_to_q63_floor(0.5), 1ULL << 62);    // exact
+    BOOST_CHECK_EQUAL(pow_v3::f64_to_q63_ceil(0.5), 1ULL << 62);
+    BOOST_CHECK_EQUAL(pow_v3::ATOL_Q63_CEIL, 922337203685478ULL);
+    // For x >= 2^-11, x*2^63 is an exact integer (ceil == floor). Only a value
+    // with a bit below 2^-63 yields ceil == floor + 1.
+    BOOST_CHECK_EQUAL(pow_v3::f64_to_q63_ceil(0.1), pow_v3::f64_to_q63_floor(0.1));
+    const double frac = std::ldexp(0.1, -10);  // 9.765625e-05: sub-2^-63 bit
+    BOOST_CHECK_EQUAL(pow_v3::f64_to_q63_ceil(frac),
+                      pow_v3::f64_to_q63_floor(frac) + 1);
 }
 
 // ---- §5 tier rule -----------------------------------------------------------
@@ -301,13 +365,15 @@ BOOST_AUTO_TEST_CASE(b_cred_golden_vectors)
 BOOST_AUTO_TEST_CASE(tier_rule_boundaries)
 {
     using pow_v3::Tier;
-    const uint64_t floor_q32 = pow_v3::B_FLOOR_Q32;
-    const uint64_t free_q32 = pow_v3::B_FREE_Q32;
-    BOOST_CHECK(pow_v3::tier_for_b_cred_q32(0) == Tier::Invalid);
-    BOOST_CHECK(pow_v3::tier_for_b_cred_q32(floor_q32 - 1) == Tier::Invalid);
-    BOOST_CHECK(pow_v3::tier_for_b_cred_q32(floor_q32) == Tier::AdmissionRequired);
-    BOOST_CHECK(pow_v3::tier_for_b_cred_q32(free_q32 - 1) == Tier::AdmissionRequired);
-    BOOST_CHECK(pow_v3::tier_for_b_cred_q32(free_q32) == Tier::Free);
+    const uint64_t floor_units = pow_v3::B_FLOOR_UNITS;   // 45 * R
+    const uint64_t free_units = pow_v3::B_FREE_UNITS;     // 70 * R
+    BOOST_CHECK_EQUAL(floor_units, 45ULL * 1024ULL);
+    BOOST_CHECK_EQUAL(free_units, 70ULL * 1024ULL);
+    BOOST_CHECK(pow_v3::tier_for_b_cred_units(0) == Tier::Invalid);
+    BOOST_CHECK(pow_v3::tier_for_b_cred_units(floor_units - 1) == Tier::Invalid);
+    BOOST_CHECK(pow_v3::tier_for_b_cred_units(floor_units) == Tier::AdmissionRequired);
+    BOOST_CHECK(pow_v3::tier_for_b_cred_units(free_units - 1) == Tier::AdmissionRequired);
+    BOOST_CHECK(pow_v3::tier_for_b_cred_units(free_units) == Tier::Free);
     BOOST_CHECK_EQUAL(std::string{pow_v3::tier_name(Tier::Invalid)}, "invalid");
     BOOST_CHECK_EQUAL(std::string{pow_v3::tier_name(Tier::AdmissionRequired)}, "admission_required");
     BOOST_CHECK_EQUAL(std::string{pow_v3::tier_name(Tier::Free)}, "free");
