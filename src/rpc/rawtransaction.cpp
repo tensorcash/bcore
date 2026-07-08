@@ -6470,7 +6470,7 @@ static RPCHelpMan icu_acceptance_record_assemble()
             {"sig_scheme", RPCArg::Type::NUM, RPCArg::Optional::NO, "1=SECP_SCHNORR_RAW, 2=SECP_BIP322_HASH"},
             {"body_refs", RPCArg::Type::ARR, RPCArg::Optional::NO, "Affirmed clause body hashes from prepare (may be empty)",
                 {{"body_ref", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "32-byte body hash hex"}}},
-            {"signature", RPCArg::Type::OBJ, RPCArg::Optional::NO, "Client signature material",
+            {"client_signature", RPCArg::Type::OBJ, RPCArg::Optional::NO, "Client signature material",
                 {
                     {"record_signature", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "SECP_SCHNORR_RAW: the 64-byte raw Schnorr signature over signing_hash"},
                     {"revealed_bip322_proof", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "SECP_BIP322_HASH: the base64 BIP-322 proof over message_to_sign"},
@@ -6507,7 +6507,7 @@ static RPCHelpMan icu_acceptance_record_assemble()
             std::vector<std::array<unsigned char, 32>> body_refs = ParseRecordBodyRefs(request.params[8], "body_refs");
 
             const UniValue& sig = request.params[9];
-            if (!sig.isObject()) throw JSONRPCError(RPC_INVALID_PARAMETER, "signature must be an object");
+            if (!sig.isObject()) throw JSONRPCError(RPC_INVALID_PARAMETER, "client_signature must be an object");
             std::optional<std::array<unsigned char, 32>> dek = ParseOptionalIcuDek(sig);
 
             // Resolve asset + registry.
