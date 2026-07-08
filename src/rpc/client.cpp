@@ -562,7 +562,7 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "icu.acceptance.record.assemble", 6, "accepted_units" },
     { "icu.acceptance.record.assemble", 7, "sig_scheme" },
     { "icu.acceptance.record.assemble", 8, "body_refs" },
-    { "icu.acceptance.record.assemble", 9, "signature" },
+    { "icu.acceptance.record.assemble", 9, "client_signature" },
     // Forward contract RPC conversions
     { "forward.propose", 0, "terms" },
     { "forward.propose", 1, "options" },

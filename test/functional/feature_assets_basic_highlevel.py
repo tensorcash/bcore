@@ -29,6 +29,10 @@ class AssetHighLevelTest(BitcoinTestFramework):
     def set_test_params(self):
         self.num_nodes = 2
         self.setup_clean_chain = True
+        # generatezkproof runs a CPU-bound Groth16 proof; on slower CI runners
+        # it exceeds the default 60s (x timeout factor) RPC client timeout.
+        # The proof itself is correct — give it real headroom.
+        self.rpc_timeout = 600
         # Generate unique test run ID to avoid conflicts
         self.test_run_id = hashlib.sha256(f"{os.getpid()}_{time.time()}_highlevel".encode()).hexdigest()[:16]
         # Enable assets at genesis
