@@ -191,7 +191,12 @@ RPCHelpMan optionseries_build_register()
         [](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue {
             const OptionSeriesTerms terms = ParseOptionSeriesTermsFromJson(request.params[0]);
             std::string verr;
-            if (!ValidateOptionSeriesTerms(terms, /*pow_limit=*/nullptr, verr)) {
+            // Gate the strike against the chain powLimit at REGISTRATION — otherwise a difficulty strike
+            // below the difficulty floor (target > powLimit) registers and tokenizes fine, then can never
+            // settle (BuildOptionSettlementSkeleton re-checks DeriveTarget with the real powLimit and
+            // rejects), stranding the collateral. Mirror difficulty.cpp, which passes &pow_limit at propose.
+            const uint256 pow_limit = Params().GetConsensus().powLimit;
+            if (!ValidateOptionSeriesTerms(terms, &pow_limit, verr)) {
                 throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid option series terms: " + verr);
             }
             const std::string root = ToUpper(RequireStr(request.params[1], "root"));
@@ -330,7 +335,9 @@ RPCHelpMan optionseries_build_issue()
 
             const OptionSeriesTerms terms = ParseOptionSeriesTermsFromJson(request.params[0]);
             std::string verr;
-            if (!ValidateOptionSeriesTerms(terms, /*pow_limit=*/nullptr, verr)) {
+            // Same powLimit gate as build_register — refuse to mint units against an out-of-range strike.
+            const uint256 pow_limit = Params().GetConsensus().powLimit;
+            if (!ValidateOptionSeriesTerms(terms, &pow_limit, verr)) {
                 throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid option series terms: " + verr);
             }
             // This builder only implements SELF-issuance (mint N to writer; no premium->writer output,
@@ -491,7 +498,9 @@ RPCHelpMan optionseries_record_issue()
 
             const OptionSeriesTerms terms = ParseOptionSeriesTermsFromJson(request.params[0]);
             std::string verr;
-            if (!ValidateOptionSeriesTerms(terms, /*pow_limit=*/nullptr, verr)) {
+            // Same powLimit gate — a recorded external issuance must also carry an in-range strike.
+            const uint256 pow_limit = Params().GetConsensus().powLimit;
+            if (!ValidateOptionSeriesTerms(terms, &pow_limit, verr)) {
                 throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid option series terms: " + verr);
             }
             const uint256 series_id = ComputeOptionSeriesId(terms);

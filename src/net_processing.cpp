@@ -2559,7 +2559,24 @@ PeerManagerImpl::PeerManagerImpl(CConnman& connman, AddrMan& addrman,
     m_min_cumulative_tick_slack_days = opts.spv_min_cumulative_tick_slack_days;
     m_spv_reorg_sampling_threshold = opts.spv_reorg_sampling_threshold;
     m_spv_sampling_max_n = opts.spv_sampling_max_n;
-    m_onion_vanity_prefix = opts.spv_onion_prefix;
+    if (!opts.spv_onion_prefix.empty()) {
+        m_onion_vanity_prefix = opts.spv_onion_prefix;
+    } else {
+        // Chain-derived default (see PeerManager::Options::spv_onion_prefix):
+        // the vanity convention is a property of the network, not the binary.
+        switch (m_chainparams.GetChainType()) {
+        case ChainType::TENSOR_MAIN:
+            m_onion_vanity_prefix = "tenso";
+            break;
+        case ChainType::TENSOR_TEST:
+        case ChainType::TENSOR_REG:
+            m_onion_vanity_prefix = "ten";
+            break;
+        default:
+            m_onion_vanity_prefix = "tensorc";
+            break;
+        }
+    }
     m_onion_tag_len = opts.spv_onion_tag_len;
     m_onion_freshness_window = opts.spv_onion_freshness_window;
 
@@ -3642,6 +3659,20 @@ void PeerManagerImpl::UpdatePeerStateForReceivedHeaders(CNode& pfrom, Peer& peer
             } else {
                 // Clearnet / I2P / CJDNS: ASN as before
                 uint64_t asn = m_connman.GetMappedAS(pfrom.addr);
+                if (asn == 0) {
+                    // No ASMap loaded (or unmapped prefix): every clearnet
+                    // peer would collapse into the single key 0, so IP peers
+                    // could never satisfy spv-asn-min on their own and a
+                    // Tor-partitioned cohort can stay wedged behind the
+                    // deep-reorg gate. Fall back to a netgroup-derived key so
+                    // distinct /16s corroborate independently. Bit 62
+                    // namespaces these away from real ASNs (uint32 range)
+                    // and onion diversity keys (bit 63).
+                    const std::vector<unsigned char> group = m_connman.GetNetGroup(pfrom.addr);
+                    CSipHasher gh(0x1213141516171819ULL, 0x2a2b2c2d2e2f3031ULL);
+                    gh.Write(std::span<const unsigned char>(group.data(), group.size()));
+                    asn = (1ULL << 62) | (gh.Finalize() & 0x3FFFFFFFFFFFFFFFULL);
+                }
                 m_tip_asn_announcers[last_header.GetBlockHash()].insert(asn);
                 LogInfo("ASN: Recording tip %s from peer %d (addr=%s) with ASN=%llu\n",
                         last_header.GetBlockHash().ToString(), pfrom.GetId(),

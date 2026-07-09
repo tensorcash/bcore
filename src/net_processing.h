@@ -114,8 +114,15 @@ public:
         int spv_reorg_sampling_threshold{6};
         // SPV sampling max N (default 12)
         uint32_t spv_sampling_max_n{12};
-        // Onion diversity: vanity prefix, freshness tag length, block window
-        std::string spv_onion_prefix{"tensorc"};
+        // Onion diversity: vanity prefix, freshness tag length, block window.
+        // Empty prefix = derive from the chain (the network-wide vanity
+        // convention: "tenso" on tensor mainnet, "ten" on tensor-test /
+        // tensor-reg). A compiled constant here can rot: if the network's
+        // ground prefix convention changes while nodes without an explicit
+        // -spv-onion-prefix keep checking the old value, they earn zero
+        // diversity credit and Tor-only nodes wedge behind the deep-reorg
+        // gate. Deriving from the chain keeps binary and network aligned.
+        std::string spv_onion_prefix{};
         size_t spv_onion_tag_len{3};
         int spv_onion_freshness_window{1400};
     };
