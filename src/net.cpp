@@ -3901,6 +3901,11 @@ uint32_t CConnman::GetMappedAS(const CNetAddr& addr) const
     return m_netgroupman.GetMappedAS(addr);
 }
 
+std::vector<unsigned char> CConnman::GetNetGroup(const CNetAddr& addr) const
+{
+    return m_netgroupman.GetGroup(addr);
+}
+
 void CConnman::GetNodeStats(std::vector<CNodeStats>& vstats) const
 {
     vstats.clear();

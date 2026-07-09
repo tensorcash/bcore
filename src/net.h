@@ -1226,6 +1226,11 @@ public:
     size_t GetNodeCount(ConnectionDirection) const;
     std::map<CNetAddr, LocalServiceInfo> getNetLocalAddresses() const;
     uint32_t GetMappedAS(const CNetAddr& addr) const;
+
+    /** Netgroup bucket for an address (asmap-independent /16 fallback).
+     *  Used by the SPV deep-reorg corroboration gate so distinct clearnet
+     *  sources still count independently when no ASMap is loaded. */
+    std::vector<unsigned char> GetNetGroup(const CNetAddr& addr) const;
     void GetNodeStats(std::vector<CNodeStats>& vstats) const;
     bool DisconnectNode(const std::string& node);
     bool DisconnectNode(const CSubNet& subnet);
