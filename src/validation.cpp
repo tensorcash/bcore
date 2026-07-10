@@ -7363,9 +7363,10 @@ bool Chainstate::ActivateBestChainStep(BlockValidationState& state, CBlockIndex*
         // Check if this reorg requires operator gating (blocking until decision)
         const bool disconnect_only = pindexMostWork == pindexFork;
         if (ShouldGateReorg(reorg_depth, since_last_block, disconnect_only)) {
-            // Gating is enabled and thresholds are met - compute advisory synchronously
-            // and block until operator decision
-            LogPrintf("REORG GATING: Deep reorg detected (depth=%d). Awaiting operator decision.\n", reorg_depth);
+            // Gating is enabled and thresholds are met. Compute advisory synchronously:
+            // sane partition recoveries may auto-follow; suspicious/anomalous reorgs
+            // still block until operator decision.
+            LogPrintf("REORG GATING: Deep reorg detected (depth=%d). Evaluating auto-follow policy.\n", reorg_depth);
 
             // Compute advisory synchronously (we need it for pending state)
             ReorgAdvisory advisory = GenerateReorgAdvisory(
@@ -7379,14 +7380,8 @@ bool Chainstate::ActivateBestChainStep(BlockValidationState& state, CBlockIndex*
             // Store to advisory store for RPC visibility
             GetReorgAdvisoryStore().Add(advisory);
 
-            // Set pending state - this will be read by RPC and signaled by submitreorgdecision
-            GetReorgGatingManager().SetPending(
-                advisory,
-                pindexMostWork->GetBlockHash(),
-                pindexOldTip->GetBlockHash()
-            );
-
-            // Run notify command if configured
+            // Run notify command if configured. This fires for both auto-follow
+            // and gated reorgs so operators still see the event.
             std::string notify_cmd = gArgs.GetArg("-reorgadvisorynotify", "");
             if (!notify_cmd.empty()) {
                 // Substitute placeholders
@@ -7401,12 +7396,23 @@ bool Chainstate::ActivateBestChainStep(BlockValidationState& state, CBlockIndex*
                 }).detach();
             }
 
-            // Return with BLOCK_REORG_GATING - caller (ActivateBestChain) will handle
-            // releasing cs_main, waiting for decision, and retrying
-            state.Invalid(BlockValidationResult::BLOCK_REORG_GATING,
-                          "reorg-gating",
-                          strprintf("Deep reorg (depth=%d) awaiting operator decision", reorg_depth));
-            return false;
+            if (ShouldAutoFollowSanePartitionReorg(advisory)) {
+                LogPrintf("REORG GATING: Auto-following sane partition recovery: %s\n", advisory.Summary());
+            } else {
+                // Set pending state - this will be read by RPC and signaled by submitreorgdecision
+                GetReorgGatingManager().SetPending(
+                    advisory,
+                    pindexMostWork->GetBlockHash(),
+                    pindexOldTip->GetBlockHash()
+                );
+
+                // Return with BLOCK_REORG_GATING - caller (ActivateBestChain) will handle
+                // releasing cs_main, waiting for decision, and retrying
+                state.Invalid(BlockValidationResult::BLOCK_REORG_GATING,
+                              "reorg-gating",
+                              strprintf("Deep reorg (depth=%d) awaiting operator decision", reorg_depth));
+                return false;
+            }
         } else if (ShouldTriggerAdvisory(reorg_depth, since_last_block)) {
             // Gating not enabled or thresholds not met - log advisory asynchronously
             AsyncLogReorgAdvisory(

@@ -508,6 +508,19 @@ constexpr bool DEFAULT_REORG_TIMEOUT_ACTION_ACCEPT = false;
 //! Default operator gating for deep reorgs.
 constexpr bool DEFAULT_REORG_GATING_ENABLED = true;
 
+//! Default auto-follow policy for reorgs that look like sane partition recovery.
+constexpr bool DEFAULT_REORG_AUTOFOLLOW_SANE_PARTITIONS = true;
+
+//! Candidate fork hashrate must be plausible relative to the calibrated baseline.
+constexpr int DEFAULT_REORG_AUTOFOLLOW_MIN_FORK_HASHRATE_PCT = 25;
+constexpr int DEFAULT_REORG_AUTOFOLLOW_MAX_FORK_HASHRATE_PCT = 400;
+
+//! Candidate fork hashrate must materially exceed the local branch hashrate.
+constexpr int DEFAULT_REORG_AUTOFOLLOW_MIN_FORK_TO_CURRENT_RATIO_PCT = 125;
+
+//! A sane partition should have delayed first visibility of the competing branch.
+constexpr int64_t DEFAULT_REORG_AUTOFOLLOW_MIN_FIRST_BLOCK_DELAY_SECS = 20 * 60;
+
 /**
  * Gating configuration read from command-line args.
  */
@@ -523,6 +536,19 @@ struct ReorgGatingConfig {
 
     //! Minimum depth to trigger gating (can be different from advisory threshold).
     int gating_depth_threshold{ADVISORY_DEPTH_THRESHOLD};
+
+    //! Auto-follow reorgs classified as sane partition recovery instead of blocking.
+    bool autofollow_sane_partitions{DEFAULT_REORG_AUTOFOLLOW_SANE_PARTITIONS};
+
+    //! Plausible candidate fork hashrate band, as percentage of calibrated baseline.
+    int autofollow_min_fork_hashrate_pct{DEFAULT_REORG_AUTOFOLLOW_MIN_FORK_HASHRATE_PCT};
+    int autofollow_max_fork_hashrate_pct{DEFAULT_REORG_AUTOFOLLOW_MAX_FORK_HASHRATE_PCT};
+
+    //! Candidate fork hashrate must be at least this percentage of current-branch hashrate.
+    int autofollow_min_fork_to_current_ratio_pct{DEFAULT_REORG_AUTOFOLLOW_MIN_FORK_TO_CURRENT_RATIO_PCT};
+
+    //! Minimum delay before the first competing block was seen.
+    int64_t autofollow_min_first_block_delay_secs{DEFAULT_REORG_AUTOFOLLOW_MIN_FIRST_BLOCK_DELAY_SECS};
 };
 
 /**
@@ -624,5 +650,19 @@ ReorgGatingManager& GetReorgGatingManager();
  */
 bool ShouldGateReorg(int depth_current, int64_t since_last_block, bool disconnect_only = false,
                      const std::optional<ReorgGatingConfig>& config = std::nullopt);
+
+/**
+ * Check if an otherwise-gated reorg should auto-follow as sane partition recovery.
+ *
+ * This intentionally ignores transaction overlap as an accept signal because empty
+ * block segments report 100% overlap.
+ *
+ * @param advisory Full advisory metrics for the candidate reorg.
+ * @param config Optional config; if not provided, reads from gArgs.
+ * @return true if the candidate looks like a plausible higher-work public branch
+ *         catching up after local partition, rather than an anomalous reorg.
+ */
+bool ShouldAutoFollowSanePartitionReorg(const ReorgAdvisory& advisory,
+                                        const std::optional<ReorgGatingConfig>& config = std::nullopt);
 
 #endif // BITCOIN_VALIDATIONADVISORY_H
