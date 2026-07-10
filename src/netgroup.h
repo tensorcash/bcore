@@ -8,6 +8,7 @@
 #include <netaddress.h>
 #include <uint256.h>
 
+#include <string>
 #include <vector>
 
 /**
@@ -15,12 +16,15 @@
  */
 class NetGroupManager {
 public:
-    explicit NetGroupManager(std::vector<bool> asmap)
-        : m_asmap{std::move(asmap)}
+    explicit NetGroupManager(std::vector<bool> asmap, std::string asmap_source = "none")
+        : m_asmap{std::move(asmap)}, m_asmap_source{std::move(asmap_source)}
     {}
 
     /** Get a checksum identifying the asmap being used. */
     uint256 GetAsmapChecksum() const;
+
+    /** Provenance of the loaded asmap: "embedded", "datadir", "file", or "none" (/16 fallback). */
+    std::string GetAsmapSource() const { return m_asmap_source; }
 
     /**
      * Get the canonical identifier of the network group for address.
@@ -71,6 +75,10 @@ private:
      * This is initialized in the constructor, const, and therefore is
      * thread-safe. */
     const std::vector<bool> m_asmap;
+
+    /** Provenance tier of m_asmap (set at construction, const, thread-safe):
+     *  "embedded", "datadir", "file", or "none". Diagnostic only. */
+    const std::string m_asmap_source;
 };
 
 #endif // BITCOIN_NETGROUP_H

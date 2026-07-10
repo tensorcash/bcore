@@ -15,6 +15,7 @@
 #include <net_types.h> // For banmap_t
 #include <netbase.h>
 #include <node/context.h>
+#include <netgroup.h>
 #include <node/protocol_version.h>
 #include <node/warnings.h>
 #include <policy/settings.h>
@@ -659,6 +660,12 @@ static RPCHelpMan getnetworkinfo()
                                 {RPCResult::Type::NUM, "score", "relative score"},
                             }},
                         }},
+                        {RPCResult::Type::OBJ, "asmap", "IP->ASN mapping (ASMap) status",
+                        {
+                            {RPCResult::Type::BOOL, "active", "whether ASN-based bucketing is active (false = /16 fallback)"},
+                            {RPCResult::Type::STR, "source", "map provenance: \"embedded\", \"datadir\", \"file\", or \"none\""},
+                            {RPCResult::Type::STR_HEX, "version", "checksum identifying the loaded map"},
+                        }},
                         (IsDeprecatedRPCEnabled("warnings") ?
                             RPCResult{RPCResult::Type::STR, "warnings", "any network and blockchain warnings (DEPRECATED)"} :
                             RPCResult{RPCResult::Type::ARR, "warnings", "any network and blockchain warnings (run with `-deprecatedrpc=warnings` to return the latest warning as a single string)",
@@ -716,6 +723,13 @@ static RPCHelpMan getnetworkinfo()
         }
     }
     obj.pushKV("localaddresses", std::move(localAddresses));
+    if (node.netgroupman) {
+        UniValue asmap_obj(UniValue::VOBJ);
+        asmap_obj.pushKV("active", node.netgroupman->UsingASMap());
+        asmap_obj.pushKV("source", node.netgroupman->GetAsmapSource());
+        asmap_obj.pushKV("version", node.netgroupman->GetAsmapChecksum().ToString());
+        obj.pushKV("asmap", std::move(asmap_obj));
+    }
     obj.pushKV("warnings", node::GetWarningsForRpc(*CHECK_NONFATAL(node.warnings), IsDeprecatedRPCEnabled("warnings")));
     return obj;
 },
