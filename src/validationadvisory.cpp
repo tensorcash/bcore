@@ -752,10 +752,21 @@ ReorgGatingConfig GetReorgGatingConfig()
     config.timeout_secs = gArgs.GetIntArg("-reorgadvisorytimeout", DEFAULT_REORG_DECISION_TIMEOUT_SECS);
     config.timeout_accept = gArgs.GetBoolArg("-reorgadvisorytimeoutaccept", DEFAULT_REORG_TIMEOUT_ACTION_ACCEPT);
     config.gating_depth_threshold = gArgs.GetIntArg("-reorgadvisorygatingdepth", ADVISORY_DEPTH_THRESHOLD);
+    config.autofollow_sane_partitions = gArgs.GetBoolArg("-reorgadvisoryautofollow", DEFAULT_REORG_AUTOFOLLOW_SANE_PARTITIONS);
+    config.autofollow_min_fork_hashrate_pct = gArgs.GetIntArg("-reorgadvisoryautofollowminforkhashrate", DEFAULT_REORG_AUTOFOLLOW_MIN_FORK_HASHRATE_PCT);
+    config.autofollow_max_fork_hashrate_pct = gArgs.GetIntArg("-reorgadvisoryautofollowmaxforkhashrate", DEFAULT_REORG_AUTOFOLLOW_MAX_FORK_HASHRATE_PCT);
+    config.autofollow_min_fork_to_current_ratio_pct = gArgs.GetIntArg("-reorgadvisoryautofollowminratio", DEFAULT_REORG_AUTOFOLLOW_MIN_FORK_TO_CURRENT_RATIO_PCT);
+    config.autofollow_min_first_block_delay_secs = gArgs.GetIntArg("-reorgadvisoryautofollowmindelay", DEFAULT_REORG_AUTOFOLLOW_MIN_FIRST_BLOCK_DELAY_SECS);
 
     // Clamp timeout to reasonable range (1 minute to 24 hours)
     if (config.timeout_secs < 60) config.timeout_secs = 60;
     if (config.timeout_secs > 24 * 60 * 60) config.timeout_secs = 24 * 60 * 60;
+    if (config.autofollow_min_fork_hashrate_pct < 1) config.autofollow_min_fork_hashrate_pct = 1;
+    if (config.autofollow_max_fork_hashrate_pct < config.autofollow_min_fork_hashrate_pct) {
+        config.autofollow_max_fork_hashrate_pct = config.autofollow_min_fork_hashrate_pct;
+    }
+    if (config.autofollow_min_fork_to_current_ratio_pct < 1) config.autofollow_min_fork_to_current_ratio_pct = 1;
+    if (config.autofollow_min_first_block_delay_secs < 0) config.autofollow_min_first_block_delay_secs = 0;
 
     return config;
 }
@@ -917,6 +928,59 @@ bool ShouldGateReorg(int depth_current, int64_t since_last_block, bool disconnec
         LogDebug(BCLog::VALIDATION,
             "REORG GATING: Skipping gate - node was offline for %lld seconds (threshold: %lld)\n",
             since_last_block, adv_config.offline_threshold_secs);
+        return false;
+    }
+
+    return true;
+}
+
+bool ShouldAutoFollowSanePartitionReorg(const ReorgAdvisory& advisory,
+                                        const std::optional<ReorgGatingConfig>& config_opt)
+{
+    const ReorgGatingConfig config = config_opt ? *config_opt : GetReorgGatingConfig();
+
+    if (!config.autofollow_sane_partitions) {
+        return false;
+    }
+
+    if (!advisory.is_valid || !advisory.calibration.is_valid) {
+        return false;
+    }
+
+    if (advisory.depth_current <= config.gating_depth_threshold) {
+        return false;
+    }
+
+    if (advisory.depth_fork <= 0 || advisory.seg_current.block_count <= 0 || advisory.seg_fork.block_count <= 0) {
+        return false;
+    }
+
+    if (advisory.seg_fork.work_diff <= advisory.seg_current.work_diff) {
+        return false;
+    }
+
+    if (advisory.first_block_delay_secs < config.autofollow_min_first_block_delay_secs) {
+        return false;
+    }
+
+    const double fork_hashrate = advisory.hashrate_fork_pct;
+    const double current_hashrate = advisory.hashrate_current_pct;
+
+    if (!std::isfinite(fork_hashrate) || !std::isfinite(current_hashrate)) {
+        return false;
+    }
+
+    if (fork_hashrate <= 0.0 || current_hashrate <= 0.0) {
+        return false;
+    }
+
+    if (fork_hashrate < static_cast<double>(config.autofollow_min_fork_hashrate_pct) ||
+        fork_hashrate > static_cast<double>(config.autofollow_max_fork_hashrate_pct)) {
+        return false;
+    }
+
+    if ((fork_hashrate * 100.0) <
+        (current_hashrate * static_cast<double>(config.autofollow_min_fork_to_current_ratio_pct))) {
         return false;
     }
 

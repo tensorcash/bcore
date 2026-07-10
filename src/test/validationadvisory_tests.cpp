@@ -254,6 +254,13 @@ BOOST_AUTO_TEST_CASE(config_struct_defaults)
     BOOST_CHECK(config.enabled);
     BOOST_CHECK_EQUAL(config.depth_threshold, ADVISORY_DEPTH_THRESHOLD);
     BOOST_CHECK_EQUAL(config.offline_threshold_secs, ADVISORY_OFFLINE_THRESHOLD_SECS);
+
+    ReorgGatingConfig gating_config;
+    BOOST_CHECK(gating_config.autofollow_sane_partitions);
+    BOOST_CHECK_EQUAL(gating_config.autofollow_min_fork_hashrate_pct, DEFAULT_REORG_AUTOFOLLOW_MIN_FORK_HASHRATE_PCT);
+    BOOST_CHECK_EQUAL(gating_config.autofollow_max_fork_hashrate_pct, DEFAULT_REORG_AUTOFOLLOW_MAX_FORK_HASHRATE_PCT);
+    BOOST_CHECK_EQUAL(gating_config.autofollow_min_fork_to_current_ratio_pct, DEFAULT_REORG_AUTOFOLLOW_MIN_FORK_TO_CURRENT_RATIO_PCT);
+    BOOST_CHECK_EQUAL(gating_config.autofollow_min_first_block_delay_secs, DEFAULT_REORG_AUTOFOLLOW_MIN_FIRST_BLOCK_DELAY_SECS);
 }
 
 BOOST_AUTO_TEST_CASE(should_gate_reorg_skips_disconnect_only_retreat)
@@ -264,6 +271,54 @@ BOOST_AUTO_TEST_CASE(should_gate_reorg_skips_disconnect_only_retreat)
 
     BOOST_CHECK(ShouldGateReorg(ADVISORY_DEPTH_THRESHOLD + 1, 0, /*disconnect_only=*/false, config));
     BOOST_CHECK(!ShouldGateReorg(ADVISORY_DEPTH_THRESHOLD + 1, 0, /*disconnect_only=*/true, config));
+}
+
+BOOST_AUTO_TEST_CASE(should_auto_follow_sane_partition_reorg)
+{
+    ReorgGatingConfig config;
+    config.enabled = true;
+    config.gating_depth_threshold = ADVISORY_DEPTH_THRESHOLD;
+
+    ReorgAdvisory advisory;
+    advisory.is_valid = true;
+    advisory.calibration.is_valid = true;
+    advisory.depth_current = 8;
+    advisory.depth_fork = 12;
+    advisory.seg_current.block_count = 8;
+    advisory.seg_fork.block_count = 12;
+    advisory.seg_current.work_diff = arith_uint256(80);
+    advisory.seg_fork.work_diff = arith_uint256(120);
+    advisory.hashrate_current_pct = 40.0;
+    advisory.hashrate_fork_pct = 100.0;
+    advisory.first_block_delay_secs = DEFAULT_REORG_AUTOFOLLOW_MIN_FIRST_BLOCK_DELAY_SECS + 60;
+
+    BOOST_CHECK(ShouldAutoFollowSanePartitionReorg(advisory, config));
+
+    ReorgAdvisory disabled_candidate = advisory;
+    config.autofollow_sane_partitions = false;
+    BOOST_CHECK(!ShouldAutoFollowSanePartitionReorg(disabled_candidate, config));
+    config.autofollow_sane_partitions = true;
+
+    ReorgAdvisory invalid_candidate = advisory;
+    invalid_candidate.is_valid = false;
+    BOOST_CHECK(!ShouldAutoFollowSanePartitionReorg(invalid_candidate, config));
+
+    ReorgAdvisory weak_candidate = advisory;
+    weak_candidate.seg_fork.work_diff = arith_uint256(70);
+    BOOST_CHECK(!ShouldAutoFollowSanePartitionReorg(weak_candidate, config));
+
+    ReorgAdvisory anomalous_candidate = advisory;
+    anomalous_candidate.hashrate_fork_pct = DEFAULT_REORG_AUTOFOLLOW_MAX_FORK_HASHRATE_PCT + 1.0;
+    BOOST_CHECK(!ShouldAutoFollowSanePartitionReorg(anomalous_candidate, config));
+
+    ReorgAdvisory peer_race_candidate = advisory;
+    peer_race_candidate.first_block_delay_secs = DEFAULT_REORG_AUTOFOLLOW_MIN_FIRST_BLOCK_DELAY_SECS - 1;
+    BOOST_CHECK(!ShouldAutoFollowSanePartitionReorg(peer_race_candidate, config));
+
+    ReorgAdvisory not_materially_stronger = advisory;
+    not_materially_stronger.hashrate_current_pct = 90.0;
+    not_materially_stronger.hashrate_fork_pct = 100.0;
+    BOOST_CHECK(!ShouldAutoFollowSanePartitionReorg(not_materially_stronger, config));
 }
 
 BOOST_AUTO_TEST_CASE(advisory_store_operations)
