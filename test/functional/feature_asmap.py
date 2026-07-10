@@ -55,6 +55,9 @@ class AsmapTest(BitcoinTestFramework):
         # embedded default map (contrib/asmap/ip_asn.map) is loaded.
         with self.node.assert_debug_log(['Using embedded default asmap version ']):
             self.start_node(0)
+        info = self.node.getnetworkinfo()['asmap']
+        assert_equal(info['active'], True)
+        assert_equal(info['source'], 'embedded')
 
     def test_datadir_default_file_without_arg(self):
         self.log.info('Test datadir ip_asn.map is used with no -asmap arg (operator override of the embedded default)')
@@ -69,6 +72,17 @@ class AsmapTest(BitcoinTestFramework):
         self.stop_node(0)
         with self.node.assert_debug_log(['Using /16 prefix for IP bucketing']):
             self.start_node(0, ["-noasmap"])
+        info = self.node.getnetworkinfo()['asmap']
+        assert_equal(info['active'], False)
+        assert_equal(info['source'], 'none')
+
+    def test_asmap_zero_is_filename_not_disable(self):
+        self.log.info('Test bitcoind -asmap=0 is a filename, not a disable (only -noasmap disables)')
+        self.stop_node(0)
+        # "0" is read as a relative filename under the net datadir, not a disable spelling.
+        zero_path = os.path.join(self.datadir, '0')
+        msg = f'Error: Could not find asmap file "{zero_path}"'
+        self.node.assert_start_raises_init_error(extra_args=['-asmap=0'], expected_msg=msg)
 
     def test_asmap_with_absolute_path(self):
         self.log.info('Test bitcoind -asmap=<absolute path>')
@@ -155,6 +169,7 @@ class AsmapTest(BitcoinTestFramework):
         self.test_without_asmap_arg()
         self.test_datadir_default_file_without_arg()
         self.test_noasmap_arg()
+        self.test_asmap_zero_is_filename_not_disable()
         self.test_asmap_with_absolute_path()
         self.test_asmap_with_relative_path()
         self.test_default_asmap()

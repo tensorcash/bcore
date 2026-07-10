@@ -2104,6 +2104,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
         // Read asmap: an explicit -asmap file, else the compiled-in default map,
         // unless disabled with -noasmap. ASN-based bucketing is thus ON BY DEFAULT.
         std::vector<bool> asmap;
+        std::string asmap_source{"none"}; // provenance surfaced via getnetworkinfo.asmap
         if (args.IsArgNegated("-asmap")) {
             LogPrintf("asmap disabled (-noasmap). Using /16 prefix for IP bucketing\n");
         } else if (args.IsArgSet("-asmap")) {
@@ -2122,6 +2123,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
             }
             const uint256 asmap_version = (HashWriter{} << asmap).GetHash();
             LogPrintf("Using asmap version %s for IP bucketing\n", asmap_version.ToString());
+            asmap_source = "file";
         } else {
             // No -asmap argument: prefer a datadir ip_asn.map if an operator dropped one in
             // (override without recompiling), otherwise use the compiled-in default map.
@@ -2134,20 +2136,29 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
                 }
                 const uint256 asmap_version = (HashWriter{} << asmap).GetHash();
                 LogPrintf("Using asmap version %s (datadir default file) for IP bucketing\n", asmap_version.ToString());
+                asmap_source = "datadir";
             } else {
                 asmap = DecodeAsmap(GetEmbeddedAsmapBytes(), "embedded default");
                 if (asmap.size() == 0) {
-                    LogPrintf("Embedded default asmap unavailable or invalid. Using /16 prefix for IP bucketing\n");
+                    // Should never happen: the embedded map is validated at build/commit time.
+                    // An empty result here means a corrupt/broken build artifact, which would
+                    // silently degrade every node to /16. Make it impossible to miss (and note
+                    // -noasmap is the intentional disable). Not fatal so a bad map can't brick startup.
+                    InitWarning(_("Embedded default asmap failed to decode (corrupt build artifact?). "
+                                  "Falling back to /16 prefix bucketing, which weakens Sybil resistance. "
+                                  "Use -noasmap to silence this if the fallback is intended."));
+                    LogPrintf("ERROR: embedded default asmap failed sanity check; using /16 prefix for IP bucketing\n");
                 } else {
                     const uint256 asmap_version = (HashWriter{} << asmap).GetHash();
                     LogPrintf("Using embedded default asmap version %s for IP bucketing\n", asmap_version.ToString());
+                    asmap_source = "embedded";
                 }
             }
         }
 
         // Initialize netgroup manager
         assert(!node.netgroupman);
-        node.netgroupman = std::make_unique<NetGroupManager>(std::move(asmap));
+        node.netgroupman = std::make_unique<NetGroupManager>(std::move(asmap), asmap_source);
 
         // Initialize addrman
         assert(!node.addrman);

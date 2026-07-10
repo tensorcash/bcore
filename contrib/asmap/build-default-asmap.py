@@ -13,10 +13,11 @@ Run from anywhere:  python3 contrib/asmap/build-default-asmap.py
 Writes ip_asn.map next to this script and prints the artifact size + sha256 + coverage.
 Regenerate at each release (or monthly); IP->ASN is stable for months.
 """
-import base64  # noqa: F401  (kept for parity with tooling)
+import datetime
 import gzip
 import hashlib
 import ipaddress
+import json
 import os
 import subprocess
 import sys
@@ -47,9 +48,13 @@ def fetch(url):
 def main():
     n_rows = n_lines = n_skipped = 0
     asn_present = set()
+    input_meta = {}
     with open(OUT_TXT, "w") as out:
         for _fam, url in SOURCES.items():
-            for line in fetch(url).decode("utf-8", "replace").splitlines():
+            data = fetch(url)
+            input_meta[url] = {"decompressed_sha256": hashlib.sha256(data).hexdigest(),
+                               "decompressed_bytes": len(data)}
+            for line in data.decode("utf-8", "replace").splitlines():
                 if not line.strip():
                     continue
                 f = line.split("\t")  # start \t end \t ASN \t country \t desc
@@ -78,7 +83,29 @@ def main():
     os.remove(OUT_TXT)
 
     data = open(OUT_MAP, "rb").read()
-    print(f"wrote {OUT_MAP}: {len(data)/1e6:.2f} MB  sha256={hashlib.sha256(data).hexdigest()}", file=sys.stderr)
+    art_sha = hashlib.sha256(data).hexdigest()
+    print(f"wrote {OUT_MAP}: {len(data)/1e6:.2f} MB  sha256={art_sha}", file=sys.stderr)
+
+    # Record the exact source snapshot so the artifact is auditable, not just rebuildable.
+    manifest = {
+        "artifact": "ip_asn.map",
+        "artifact_sha256": art_sha,
+        "artifact_bytes": len(data),
+        "built_utc_date": datetime.datetime.now(datetime.timezone.utc).date().isoformat(),
+        "builder": "contrib/asmap/build-default-asmap.py",
+        "encoder": "contrib/asmap/asmap-tool.py encode",
+        "source": "iptoasn.com (Public Domain, PDDL v1.0; RouteViews-derived)",
+        "inputs": input_meta,
+        "filter": f"dropped AS0 (unannounced) and ASN > {ASN_MAX} (asmap _CODER_ASN max; private/reserved 32-bit)",
+        "reproducibility": ("Rebuildable any time, but bit-identical reproduction of THIS artifact requires the "
+                            "same iptoasn snapshot (regenerated daily). The input decompressed_sha256 values pin "
+                            "the exact inputs so drift is detectable."),
+    }
+    with open(OUT_MAP + ".manifest", "w") as mf:
+        json.dump(manifest, mf, indent=2, sort_keys=True)
+        mf.write("\n")
+    print(f"wrote {OUT_MAP}.manifest", file=sys.stderr)
+
     missing = [f"{a}({n})" for a, n in CLOUD_ASNS.items() if a not in asn_present]
     print(f"cloud-ASN coverage: {len(CLOUD_ASNS) - len(missing)}/{len(CLOUD_ASNS)}"
           + (f"  MISSING={missing}" if missing else "  (all present)"), file=sys.stderr)
