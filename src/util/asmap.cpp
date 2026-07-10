@@ -221,3 +221,29 @@ std::vector<bool> DecodeAsmap(fs::path path)
     return bits;
 }
 
+std::vector<bool> DecodeAsmap(std::span<const uint8_t> raw, const std::string& source_desc)
+{
+    std::vector<bool> bits;
+    bits.reserve(raw.size() * 8);
+    for (const uint8_t cur_byte : raw) {
+        for (int bit = 0; bit < 8; ++bit) {
+            bits.push_back((cur_byte >> bit) & 1);
+        }
+    }
+    if (!SanityCheckASMap(bits, 128)) {
+        LogPrintf("Sanity check of asmap (%s) failed\n", source_desc);
+        return {};
+    }
+    return bits;
+}
+
+// Defined in the build-time generated embedded_asmap.cpp (from contrib/asmap/ip_asn.map).
+// The preceding `extern` declarations give these external linkage despite being const.
+extern const unsigned char g_embedded_asmap[];
+extern const size_t g_embedded_asmap_len;
+
+std::span<const uint8_t> GetEmbeddedAsmapBytes()
+{
+    return std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(g_embedded_asmap), g_embedded_asmap_len);
+}
+

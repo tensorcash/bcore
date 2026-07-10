@@ -2101,9 +2101,12 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
 
     {
 
-        // Read asmap file if configured
+        // Read asmap: an explicit -asmap file, else the compiled-in default map,
+        // unless disabled with -noasmap. ASN-based bucketing is thus ON BY DEFAULT.
         std::vector<bool> asmap;
-        if (args.IsArgSet("-asmap") && !args.IsArgNegated("-asmap")) {
+        if (args.IsArgNegated("-asmap")) {
+            LogPrintf("asmap disabled (-noasmap). Using /16 prefix for IP bucketing\n");
+        } else if (args.IsArgSet("-asmap")) {
             fs::path asmap_path = args.GetPathArg("-asmap", DEFAULT_ASMAP_FILENAME);
             if (!asmap_path.is_absolute()) {
                 asmap_path = args.GetDataDirNet() / asmap_path;
@@ -2120,7 +2123,26 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
             const uint256 asmap_version = (HashWriter{} << asmap).GetHash();
             LogPrintf("Using asmap version %s for IP bucketing\n", asmap_version.ToString());
         } else {
-            LogPrintf("Using /16 prefix for IP bucketing\n");
+            // No -asmap argument: prefer a datadir ip_asn.map if an operator dropped one in
+            // (override without recompiling), otherwise use the compiled-in default map.
+            fs::path default_path = args.GetDataDirNet() / DEFAULT_ASMAP_FILENAME;
+            if (fs::exists(default_path)) {
+                asmap = DecodeAsmap(default_path);
+                if (asmap.size() == 0) {
+                    InitError(strprintf(_("Could not parse asmap file %s"), fs::quoted(fs::PathToString(default_path))));
+                    return false;
+                }
+                const uint256 asmap_version = (HashWriter{} << asmap).GetHash();
+                LogPrintf("Using asmap version %s (datadir default file) for IP bucketing\n", asmap_version.ToString());
+            } else {
+                asmap = DecodeAsmap(GetEmbeddedAsmapBytes(), "embedded default");
+                if (asmap.size() == 0) {
+                    LogPrintf("Embedded default asmap unavailable or invalid. Using /16 prefix for IP bucketing\n");
+                } else {
+                    const uint256 asmap_version = (HashWriter{} << asmap).GetHash();
+                    LogPrintf("Using embedded default asmap version %s for IP bucketing\n", asmap_version.ToString());
+                }
+            }
         }
 
         // Initialize netgroup manager

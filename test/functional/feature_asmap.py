@@ -49,10 +49,20 @@ class AsmapTest(BitcoinTestFramework):
             self.nodes[node_id].addpeeraddress(address=f"101.{addr}.0.0", tried=tried, port=8333)
 
     def test_without_asmap_arg(self):
-        self.log.info('Test bitcoind with no -asmap arg passed')
+        self.log.info('Test bitcoind with no -asmap arg passed uses the compiled-in default asmap')
         self.stop_node(0)
-        with self.node.assert_debug_log(['Using /16 prefix for IP bucketing']):
+        # ASN bucketing is on by default: with no -asmap and no datadir file, the
+        # embedded default map (contrib/asmap/ip_asn.map) is loaded.
+        with self.node.assert_debug_log(['Using embedded default asmap version ']):
             self.start_node(0)
+
+    def test_datadir_default_file_without_arg(self):
+        self.log.info('Test datadir ip_asn.map is used with no -asmap arg (operator override of the embedded default)')
+        self.stop_node(0)
+        shutil.copyfile(self.asmap_raw, self.default_asmap)
+        with self.node.assert_debug_log([f'Using asmap version {VERSION} (datadir default file) for IP bucketing']):
+            self.start_node(0)
+        os.remove(self.default_asmap)
 
     def test_noasmap_arg(self):
         self.log.info('Test bitcoind with -noasmap arg passed')
@@ -143,6 +153,7 @@ class AsmapTest(BitcoinTestFramework):
         self.asmap_raw = os.path.join(base_dir, ASMAP)
 
         self.test_without_asmap_arg()
+        self.test_datadir_default_file_without_arg()
         self.test_noasmap_arg()
         self.test_asmap_with_absolute_path()
         self.test_asmap_with_relative_path()
