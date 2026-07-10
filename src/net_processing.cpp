@@ -2566,7 +2566,7 @@ PeerManagerImpl::PeerManagerImpl(CConnman& connman, AddrMan& addrman,
         // the vanity convention is a property of the network, not the binary.
         switch (m_chainparams.GetChainType()) {
         case ChainType::TENSOR_MAIN:
-            m_onion_vanity_prefix = "tenso";
+            m_onion_vanity_prefix = "tensorc";
             break;
         case ChainType::TENSOR_TEST:
         case ChainType::TENSOR_REG:

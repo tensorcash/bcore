@@ -780,7 +780,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-spv-min-cumulative-tick-slack-days=<n>", strprintf("Slack in days, converted to blocks at 9 minutes per block, before enforcing the minimum cumulative VDF tick floor (default: %u)", DEFAULT_SPV_MIN_CUMULATIVE_TICK_SLACK_DAYS), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-spv-reorg-sampling-threshold=<n>", "Reorg depth D threshold above which M-of-N body sampling is required (default: 6)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-spv-sampling-max-n=<n>", "Maximum number of sample blocks N for deep reorg sampling (default: 12)", ArgsManager::ALLOW_ANY, OptionsCategory::DEBUG_TEST);
-    argsman.AddArg("-spv-onion-prefix=<s>", "Vanity .onion prefix for diversity credit (default: derived from chain — tenso on tensor, ten on tensor-test/tensor-reg)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-spv-onion-prefix=<s>", "Vanity .onion prefix for diversity credit (default: derived from chain — tensorc on tensor, ten on tensor-test/tensor-reg)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-spv-onion-tag-len=<n>", "Freshness tag length after vanity prefix (default: 3)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-spv-onion-freshness-window=<n>", "Block window for valid freshness tags (default: 1400)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
 
