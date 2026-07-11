@@ -62,7 +62,11 @@ def seed_addrman(node):
 class NetTest(BitcoinTestFramework):
     def set_test_params(self):
         self.num_nodes = 2
-        self.extra_args = [["-minrelaytxfee=0.00001000"], ["-minrelaytxfee=0.00000500"]]
+        # -noasmap: this test fills AddrMan with synthetic addresses and asserts on
+        # retention counts, which assume /16-prefix bucketing. The binary now loads an
+        # embedded default asmap (ASN bucketing) unless disabled, which collapses these
+        # synthetic ranges into few ASN buckets and drops retention below the thresholds.
+        self.extra_args = [["-minrelaytxfee=0.00001000", "-noasmap"], ["-minrelaytxfee=0.00000500", "-noasmap"]]
         # Specify a non-working proxy to make sure no actual connections to public IPs are attempted
         for args in self.extra_args:
             args.append("-proxy=127.0.0.1:1")

@@ -47,8 +47,13 @@ class AddrTest(BitcoinTestFramework):
         # Use some of the remaining p2p ports for the onion binds.
         self.onion_port1 = p2p_port(self.num_nodes)
         self.onion_port2 = p2p_port(self.num_nodes + 1)
+        # -noasmap: this test fills AddrMan with synthetic addresses and relies on
+        # /16-prefix bucketing to keep enough records to hit MAX_ADDR_TO_SEND. The binary
+        # now loads an embedded default asmap (ASN bucketing) unless disabled, collapsing
+        # these synthetic ranges into few ASN buckets and dropping retention below
+        # MAX_ADDR_TO_SEND / (MAX_PCT_ADDR_TO_SEND/100).
         self.extra_args = [
-            [f"-bind=127.0.0.1:{self.onion_port1}=onion", f"-bind=127.0.0.1:{self.onion_port2}=onion", "-spv-asn-corroboration=0"],
+            [f"-bind=127.0.0.1:{self.onion_port1}=onion", f"-bind=127.0.0.1:{self.onion_port2}=onion", "-spv-asn-corroboration=0", "-noasmap"],
         ]
 
     def run_test(self):
