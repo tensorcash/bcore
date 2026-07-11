@@ -300,12 +300,14 @@ public:
         consensus.vdf_spv_commitment_height = 0;
         consensus.vdf_spv_vdfverify_height = 0;
         consensus.reuse_entropy_height = 1500;
-        // V3 prompt binding (TIP-0003): NOT activated on mainnet.
-        // Hardwired (never gArgs) — a coordinated chainparams release sets the
-        // height; until then v3 rules are inert and verification is
-        // byte-identical to v2. The remaining V3* constants keep their
-        // params.h defaults (they only bind at/after activation).
-        consensus.V3ActivationHeight = std::numeric_limits<int>::max();
+        // V3 prompt binding (TIP-0003): activates on tensor mainnet at height
+        // 8000. Hardwired (never gArgs) — the consensus height can never come
+        // from node-local config. The whole tensor fleet (miners, full nodes,
+        // verifiers) must run a v3-capable binary before this height; below it
+        // v3 rules are inert and verification is byte-identical to v2. The
+        // remaining V3* constants keep their params.h defaults (they only bind
+        // at/after activation).
+        consensus.V3ActivationHeight = 8000;
         // Re-mined genesis (715 TSC + GENESIS_PUBKEY 047acd84..., model Qwen/Qwen3-8B@9c925d64
         // at bf16). nTime/nNonce are the winning values from the genesis grind; the proof blob
         // is g_genesisBlob (kernel/genesis_proof.h). 715 * COIN == GENESIS_REWARD_COINS.
