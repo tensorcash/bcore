@@ -9635,12 +9635,15 @@ VerifyDBResult CVerifyDB::VerifyDB(
             {
                 LogPrintf("%s: Full %s send the validation request\n", __func__, block.GetHash().ToString());
                 g_ValidationApi->EnqueueApiRequest(block, ValidationReqType::Full, ValidationResponseBehavior::Nothing);
-                LogPrintf("%s: Full %s pending validation result, skipping synchronous VerifyDB wait\n",
+                // Do NOT `continue` here: every iteration of this backward walk
+                // must still run the level-3 memory-only DisconnectBlock below,
+                // or coins.GetBestBlock() stops tracking pindex and the next
+                // iteration hits assert(coins.GetBestBlock() == pindex hash).
+                // A missing verdict is not corruption; skip only the gate.
+                LogPrintf("%s: Full %s pending validation result; proceeding with local checks\n",
                           __func__, block.GetHash().ToString());
-                continue;
             }
-            LogPrintf("%s: Full %s get the validation answer\n", __func__, block.GetHash().ToString());
-            if (status == ValidationResponseValue::Full_Red)
+            else if (status == ValidationResponseValue::Full_Red)
             {
                 LogPrintf("Full Verification warning: block at %d, hash=%s is RED locally; verifying stored data with zero work contribution\n",
                         pindex->nHeight, pindex->GetBlockHash().ToString());
