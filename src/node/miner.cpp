@@ -559,7 +559,7 @@ bool BlockAssembler::PackageHasApiValidatedCommits(const CTxMemPool::setEntries&
 
             ValidationResponseValue status;
             if (!g_ValidationApi->GetRequestStatus(commit_payload.model_hash, ValidationReqType::Model, status)) {
-                g_ValidationApi->SendApiRequest(commit_payload.model_hash, record, ValidationReqType::Model);
+                g_ValidationApi->EnqueueApiRequest(commit_payload.model_hash, record, ValidationReqType::Model);
                 return false;
             }
 
@@ -608,7 +608,7 @@ bool BlockAssembler::PackageHasApiValidatedCommits(const CTxMemPool::setEntries&
                     return false;
                 }
 
-                g_ValidationApi->SendApiRequest(challenged_block, ValidationReqType::Challenge, ValidationResponseBehavior::Nothing);
+                g_ValidationApi->EnqueueApiRequest(challenged_block, ValidationReqType::Challenge, ValidationResponseBehavior::Nothing);
                 return false;
             }
 

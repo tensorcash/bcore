@@ -143,6 +143,12 @@ public:
     // Core validation methods used by the codebase
     virtual void SendApiRequest(const CBlock& block, const ValidationReqType& type, const ValidationResponseBehavior& behavior) = 0;
     virtual void SendApiRequest(const uint256& req_id, const ModelRecord& model, const ValidationReqType& type) = 0;
+    virtual void EnqueueApiRequest(const CBlock& block, const ValidationReqType& type, const ValidationResponseBehavior& behavior) {
+        SendApiRequest(block, type, behavior);
+    }
+    virtual void EnqueueApiRequest(const uint256& req_id, const ModelRecord& model, const ValidationReqType& type) {
+        SendApiRequest(req_id, model, type);
+    }
     virtual bool GetRequestStatus(const uint256& id, const ValidationReqType& type, ValidationResponseValue& status, bool async = true) const = 0;
     virtual bool SetRequestStatus(const uint256& id, const ValidationReqType& type, const ValidationResponseValue& status) = 0;
     virtual uint8_t GetOwnFullStatus(const uint256& id) const = 0;
@@ -445,6 +451,8 @@ public:
 
     void SendApiRequest(const CBlock& block, const ValidationReqType& type, const ValidationResponseBehavior& behavior) override;
     void SendApiRequest(const uint256& req_id, const ModelRecord& model, const ValidationReqType& type) override;
+    void EnqueueApiRequest(const CBlock& block, const ValidationReqType& type, const ValidationResponseBehavior& behavior) override;
+    void EnqueueApiRequest(const uint256& req_id, const ModelRecord& model, const ValidationReqType& type) override;
     void SendApiRequest(const uint256 &req_id, const CBlock& block, const ValidationReqType& type);
     void SendApiRequestInternal(const uint256 &req_id, const ModelRecord& model, const ValidationReqType& type);
     bool GetRequestStatus(const uint256 &id, const ValidationReqType& type, ValidationResponseValue& status, bool async = true) const override;

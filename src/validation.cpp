@@ -1178,7 +1178,7 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
             ValidationResponseValue challenge_status{ValidationResponseValue::Not_Checked};
             if (!g_ValidationApi->GetRequestStatus(challenge_payload.block_hash, ValidationReqType::Challenge, challenge_status)) {
                 LogPrintf("%s: Challenge %s send the validation request\n", __func__, challenge_payload.block_hash.ToString());
-                g_ValidationApi->SendApiRequest(challenged_block, ValidationReqType::Challenge, ValidationResponseBehavior::Nothing);
+                g_ValidationApi->EnqueueApiRequest(challenged_block, ValidationReqType::Challenge, ValidationResponseBehavior::Nothing);
             }
         }
     }
@@ -1296,7 +1296,7 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
                 ValidationResponseValue status_value;
                 if (!g_ValidationApi->GetRequestStatus(commit_payload.model_hash, ValidationReqType::Model, status_value)) {
                     LogPrintf("%s: Model %s send the validation request\n", __func__, commit_payload.model_hash.ToString());
-                    g_ValidationApi->SendApiRequest(commit_payload.model_hash, record, ValidationReqType::Model);
+                    g_ValidationApi->EnqueueApiRequest(commit_payload.model_hash, record, ValidationReqType::Model);
                 }
                 if (record.deposit_block_height > 0) {
                     const uint32_t deadline = static_cast<uint32_t>(record.deposit_block_height) + consensusParams.ModelVerificationBlockCount;
@@ -1361,7 +1361,7 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
             if (idx) {
                 CBlock challenged_block;
                 if (m_active_chainstate.m_chainman.m_blockman.ReadBlock(challenged_block, *idx)) {
-                    g_ValidationApi->SendApiRequest(challenged_block, ValidationReqType::Challenge, ValidationResponseBehavior::Nothing);
+                    g_ValidationApi->EnqueueApiRequest(challenged_block, ValidationReqType::Challenge, ValidationResponseBehavior::Nothing);
                 }
             }
         }
@@ -6531,7 +6531,7 @@ bool Chainstate::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew,
                 if (g_ValidationApi) {
                     ValidationResponseValue status;
                     if (!g_ValidationApi->GetRequestStatus(model_hash, ValidationReqType::Model, status))
-                        g_ValidationApi->SendApiRequest(model_hash, record, ValidationReqType::Model);
+                        g_ValidationApi->EnqueueApiRequest(model_hash, record, ValidationReqType::Model);
                 }
             }
 
@@ -6623,7 +6623,7 @@ bool Chainstate::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew,
                 ValidationResponseValue status;
                 if (!g_ValidationApi->GetRequestStatus(model_hash, ValidationReqType::Model, status)) {
                     LogPrintf("%s: Model %s send the validation request\n", __func__, model_hash.ToString());
-                    g_ValidationApi->SendApiRequest(model_hash, record, ValidationReqType::Model);
+                    g_ValidationApi->EnqueueApiRequest(model_hash, record, ValidationReqType::Model);
                 }
                 if (record.deposit_block_height > 0) {
                     const uint32_t deadline = static_cast<uint32_t>(record.deposit_block_height) + consensusParams.ModelVerificationBlockCount;
@@ -6806,7 +6806,7 @@ bool Chainstate::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew,
         record.challenge_commit_count = 0;
         record.challenge_verdict_height = pindexNew->nHeight + static_cast<int>(consensusParams.ModelChallengeVerdictBlockCount);
         if (g_ValidationApi) {
-            g_ValidationApi->SendApiRequest(challenged_block, ValidationReqType::Challenge, ValidationResponseBehavior::Nothing);
+            g_ValidationApi->EnqueueApiRequest(challenged_block, ValidationReqType::Challenge, ValidationResponseBehavior::Nothing);
         }
 
         const COutPoint challenge_outpoint(tx.GetHash(), challenge_payload.deposit_vout);
@@ -8216,8 +8216,9 @@ static bool CheckPOWFast(const CBlock& block) {
     if (!g_ValidationApi->GetRequestStatus(block.GetHash(), ValidationReqType::Quick_Smell, status))
     {
         LogPrintf("%s: Quick %s send the validation request\n", __func__, block.GetHash().ToString());
-        g_ValidationApi->SendApiRequest(block, ValidationReqType::Quick_Smell, ValidationResponseBehavior::Nothing);
-        g_ValidationApi->GetRequestStatus(block.GetHash(), ValidationReqType::Quick_Smell, status, false);
+        g_ValidationApi->EnqueueApiRequest(block, ValidationReqType::Quick_Smell, ValidationResponseBehavior::Nothing);
+        block.m_checked_smell_api = false;
+        return true;
     }
     LogPrintf("%s: QuickSmell %s status=%d\n", __func__, block.GetHash().ToString(), static_cast<int>(status));
     LogPrintf("%s: QuickSmell %s get the validation answer\n", __func__, block.GetHash().ToString());
@@ -9162,16 +9163,11 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
         if (!GetBlockProcessingFullValidationStatus(block.GetHash(), status))
         {
             LogPrintf("%s: Full %s send the validation request\n", __func__, block.GetHash().ToString());
-            const bool defer_missing = g_ValidationApi->ShouldDeferMissingFullValidation();
-            g_ValidationApi->SendApiRequest(block, ValidationReqType::Full,
-                                            defer_missing ? ValidationResponseBehavior::ProcessNewBlock
-                                                          : ValidationResponseBehavior::Nothing);
-            if (defer_missing) {
-                LogPrintf("%s: Full %s deferred — public validation result not yet available\n",
-                          __func__, block.GetHash().ToString());
-                return state.Error("full-validation-pending");
-            }
-            GetBlockProcessingFullValidationStatus(block.GetHash(), status, true);
+            g_ValidationApi->EnqueueApiRequest(block, ValidationReqType::Full,
+                                               ValidationResponseBehavior::ProcessNewBlock);
+            LogPrintf("%s: Full %s deferred — validation result not yet available\n",
+                      __func__, block.GetHash().ToString());
+            return state.Error("full-validation-pending");
         }
         LogPrintf("%s: Full %s get the validation answer\n", __func__, block.GetHash().ToString());
         if (status == ValidationResponseValue::Full_Red) {
@@ -9291,7 +9287,7 @@ bool ChainstateManager::ProcessNewBlock(const std::shared_ptr<const CBlock>& blo
                         {
                             EarlyPropagation(block);
                         }
-                        g_ValidationApi->SendApiRequest(*block, ValidationReqType::Full, ValidationResponseBehavior::ProcessNewBlock);
+                        g_ValidationApi->EnqueueApiRequest(*block, ValidationReqType::Full, ValidationResponseBehavior::ProcessNewBlock);
                         return false;
                     }
                 }
@@ -9638,13 +9634,10 @@ VerifyDBResult CVerifyDB::VerifyDB(
             if (!GetBlockProcessingFullValidationStatus(block.GetHash(), status))
             {
                 LogPrintf("%s: Full %s send the validation request\n", __func__, block.GetHash().ToString());
-                g_ValidationApi->SendApiRequest(block, ValidationReqType::Full, ValidationResponseBehavior::Nothing);
-                if (g_ValidationApi->ShouldDeferMissingFullValidation()) {
-                    LogPrintf("%s: Full %s pending public validation result, skipping synchronous VerifyDB wait\n",
-                              __func__, block.GetHash().ToString());
-                    continue;
-                }
-                GetBlockProcessingFullValidationStatus(block.GetHash(), status, true);
+                g_ValidationApi->EnqueueApiRequest(block, ValidationReqType::Full, ValidationResponseBehavior::Nothing);
+                LogPrintf("%s: Full %s pending validation result, skipping synchronous VerifyDB wait\n",
+                          __func__, block.GetHash().ToString());
+                continue;
             }
             LogPrintf("%s: Full %s get the validation answer\n", __func__, block.GetHash().ToString());
             if (status == ValidationResponseValue::Full_Red)

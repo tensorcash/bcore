@@ -2595,6 +2595,44 @@ void ValidationAPI::SendApiRequest(const uint256& req_id, const ModelRecord& mod
     }
 }
 
+void ValidationAPI::EnqueueApiRequest(const CBlock& block, const ValidationReqType& type, const ValidationResponseBehavior& behavior) {
+    if (type != ValidationReqType::Quick && type != ValidationReqType::Quick_Smell &&
+        type != ValidationReqType::Full && type != ValidationReqType::Challenge) {
+        LogError("VALIDATOR: wrong request type\n");
+        return;
+    }
+
+    if (UseLocalQuick() && type == ValidationReqType::Quick) {
+        const auto status = RunLocalQuick(block);
+        SetRequestStatus(block.GetHash(), type, status);
+        return;
+    }
+
+    uint256 req_id;
+    if (requestTracker.makeNewRequest(block, type, req_id, behavior)) {
+        if (UseHttpTransport()) {
+            EnqueueStatusRequest(req_id, type);
+        }
+        LogPrintf("%s: queued deferred validation request type=%d id=%s\n",
+                  __func__, static_cast<int>(type), req_id.ToString());
+    }
+}
+
+void ValidationAPI::EnqueueApiRequest(const uint256& req_id, const ModelRecord& model, const ValidationReqType& type) {
+    if (type != ValidationReqType::Model) {
+        LogError("VALIDATOR: wrong request type\n");
+        return;
+    }
+
+    if (requestTracker.makeNewRequest(req_id, model, type)) {
+        if (UseHttpTransport()) {
+            EnqueueStatusRequest(req_id, type);
+        }
+        LogPrintf("%s: queued deferred model validation request id=%s\n",
+                  __func__, req_id.ToString());
+    }
+}
+
 int64_t V3AdvertisedDifficulty(int height, const Consensus::Params& params,
                                int64_t registered_difficulty) {
     if (height < 0 || !params.IsV3Active(height)) return 0;
