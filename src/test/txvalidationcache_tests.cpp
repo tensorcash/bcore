@@ -1299,44 +1299,34 @@ BOOST_FIXTURE_TEST_CASE(model_registration_mempool_validation_caching, ModelRegT
             mock_api.SetRequestStatus(hash, ValidationReqType::Model, ValidationResponseValue::Model_OK);
         }
 
-        // Time validation without cache (first run)
-        auto start_no_cache = std::chrono::high_resolution_clock::now();
+        // First run: uncached — registrations go through the validation API
         for (int i = 0; i < num_iterations; ++i) {
             CTransactionRef perf_ref = MakeTransactionRef(perf_txs[i]);
             const MempoolAcceptResult result = m_node.chainman->ProcessTransaction(perf_ref);
             BOOST_CHECK_MESSAGE(result.m_result_type == MempoolAcceptResult::ResultType::VALID,
                 "Performance test transaction " + std::to_string(i) + " should be valid. Error: " + result.m_state.GetRejectReason());
         }
-        auto end_no_cache = std::chrono::high_resolution_clock::now();
-        auto duration_no_cache = std::chrono::duration_cast<std::chrono::microseconds>(end_no_cache - start_no_cache);
+        const size_t calls_after_uncached = mock_api.GetCapturedRequests().size();
 
         // Clear mempool for second run
         for (const auto& tx : perf_txs) {
             WITH_LOCK(m_node.mempool->cs, m_node.mempool->removeRecursive(CTransaction{tx}, MemPoolRemovalReason::CONFLICT));
         }
 
-        // Time validation with cache (second run - should be faster)
-        auto start_with_cache = std::chrono::high_resolution_clock::now();
+        // Second run: resubmitting the same registrations must be served from the
+        // cache. The skipped API round-trip is the caching guarantee; a wall-clock
+        // comparison of the two runs is scheduler-dependent and flakes under load.
         for (int i = 0; i < num_iterations; ++i) {
             CTransactionRef perf_ref = MakeTransactionRef(perf_txs[i]);
             const MempoolAcceptResult result = m_node.chainman->ProcessTransaction(perf_ref);
             BOOST_CHECK_MESSAGE(result.m_result_type == MempoolAcceptResult::ResultType::VALID,
                 "Performance test cached transaction " + std::to_string(i) + " should be valid. Error: " + result.m_state.GetRejectReason());
         }
-        auto end_with_cache = std::chrono::high_resolution_clock::now();
-        auto duration_with_cache = std::chrono::duration_cast<std::chrono::microseconds>(end_with_cache - start_with_cache);
-
-        // Verify caching provides performance improvement
-        BOOST_CHECK_MESSAGE(duration_with_cache.count() <= duration_no_cache.count(),
-            "Cached validation should be faster than uncached. Uncached: " +
-            std::to_string(duration_no_cache.count()) + "μs, Cached: " +
-            std::to_string(duration_with_cache.count()) + "μs");
-
-        // Check that we have expected number of API calls
-        size_t total_calls = mock_api.GetCapturedRequests().size();
-        // We expect num_iterations calls from first run, possibly fewer from second run due to caching
-        BOOST_CHECK_MESSAGE(total_calls <= num_iterations * 2,
-            "Caching should reduce total API calls");
+        const size_t calls_after_cached = mock_api.GetCapturedRequests().size();
+        BOOST_CHECK_MESSAGE(calls_after_cached == calls_after_uncached,
+            "Cached validation should not issue new API calls. After uncached run: " +
+            std::to_string(calls_after_uncached) + ", after cached run: " +
+            std::to_string(calls_after_cached));
         BOOST_CHECK(CreateAndMineBlock());
     }
 
