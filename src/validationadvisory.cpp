@@ -757,10 +757,13 @@ ReorgGatingConfig GetReorgGatingConfig()
     config.autofollow_max_fork_hashrate_pct = gArgs.GetIntArg("-reorgadvisoryautofollowmaxforkhashrate", DEFAULT_REORG_AUTOFOLLOW_MAX_FORK_HASHRATE_PCT);
     config.autofollow_min_fork_to_current_ratio_pct = gArgs.GetIntArg("-reorgadvisoryautofollowminratio", DEFAULT_REORG_AUTOFOLLOW_MIN_FORK_TO_CURRENT_RATIO_PCT);
     config.autofollow_min_first_block_delay_secs = gArgs.GetIntArg("-reorgadvisoryautofollowmindelay", DEFAULT_REORG_AUTOFOLLOW_MIN_FIRST_BLOCK_DELAY_SECS);
+    config.approval_ttl_secs = gArgs.GetIntArg("-reorgadvisoryapprovalttl", DEFAULT_REORG_APPROVAL_TTL_SECS);
 
     // Clamp timeout to reasonable range (1 minute to 24 hours)
     if (config.timeout_secs < 60) config.timeout_secs = 60;
     if (config.timeout_secs > 24 * 60 * 60) config.timeout_secs = 24 * 60 * 60;
+    if (config.approval_ttl_secs < 60) config.approval_ttl_secs = 60;
+    if (config.approval_ttl_secs > 24 * 60 * 60) config.approval_ttl_secs = 24 * 60 * 60;
     if (config.autofollow_min_fork_hashrate_pct < 1) config.autofollow_min_fork_hashrate_pct = 1;
     if (config.autofollow_max_fork_hashrate_pct < config.autofollow_min_fork_hashrate_pct) {
         config.autofollow_max_fork_hashrate_pct = config.autofollow_min_fork_hashrate_pct;
@@ -788,7 +791,8 @@ bool ReorgGatingManager::IsEnabled() const
 
 void ReorgGatingManager::SetPending(const ReorgAdvisory& advisory,
                                      const uint256& candidate_tip_hash,
-                                     const uint256& current_tip_hash)
+                                     const uint256& current_tip_hash,
+                                     const uint256& fork_point_hash)
 {
     LOCK(m_mutex);
 
@@ -796,6 +800,7 @@ void ReorgGatingManager::SetPending(const ReorgAdvisory& advisory,
     m_pending.advisory = advisory;
     m_pending.candidate_tip_hash = candidate_tip_hash;
     m_pending.current_tip_hash = current_tip_hash;
+    m_pending.fork_point_hash = fork_point_hash;
     m_pending.pending_since = GetTime();
     m_pending.decision = ReorgDecision::NONE;
 
@@ -883,6 +888,45 @@ void ReorgGatingManager::ClearPending()
     LogDebug(BCLog::VALIDATION, "REORG GATING: Pending state cleared.\n");
 }
 
+void ReorgGatingManager::RecordApprovalFromPending()
+{
+    LOCK(m_mutex);
+    if (!m_pending.is_pending) {
+        return;
+    }
+
+    m_approval.is_valid = true;
+    m_approval.fork_point_hash = m_pending.fork_point_hash;
+    m_approval.candidate_tip_hash = m_pending.candidate_tip_hash;
+    m_approval.current_tip_hash = m_pending.current_tip_hash;
+    m_approval.approved_at = GetTime();
+
+    LogPrintf("REORG GATING: Recorded approval for reorg at fork point %s (candidate %s, valid for %d seconds). "
+              "Later segments of this reorg will not re-prompt.\n",
+              m_approval.fork_point_hash.ToString(),
+              m_approval.candidate_tip_hash.ToString(),
+              m_config.approval_ttl_secs);
+}
+
+ReorgApprovalState ReorgGatingManager::GetApproval() const
+{
+    LOCK(m_mutex);
+    if (!m_approval.is_valid) {
+        return ReorgApprovalState{};
+    }
+    if (GetTime() - m_approval.approved_at > m_config.approval_ttl_secs) {
+        return ReorgApprovalState{};
+    }
+    return m_approval;
+}
+
+void ReorgGatingManager::ClearApproval()
+{
+    LOCK(m_mutex);
+    m_approval = ReorgApprovalState{};
+    LogDebug(BCLog::VALIDATION, "REORG GATING: Approval state cleared.\n");
+}
+
 int64_t ReorgGatingManager::GetTimeoutRemaining() const
 {
     LOCK(m_mutex);
@@ -901,9 +945,37 @@ ReorgGatingManager& GetReorgGatingManager()
     return manager;
 }
 
+namespace {
+//! Depth of nested ReorgGateOperatorAction scopes on this thread.
+thread_local int g_reorg_gate_operator_action_depth{0};
+} // namespace
+
+ReorgGateOperatorAction::ReorgGateOperatorAction()
+{
+    ++g_reorg_gate_operator_action_depth;
+}
+
+ReorgGateOperatorAction::~ReorgGateOperatorAction()
+{
+    --g_reorg_gate_operator_action_depth;
+}
+
+bool ReorgGateOperatorActionActive()
+{
+    return g_reorg_gate_operator_action_depth > 0;
+}
+
 bool ShouldGateReorg(int depth_current, int64_t since_last_block, bool disconnect_only,
                      const std::optional<ReorgGatingConfig>& config_opt)
 {
+    // The gate exists to obtain operator sign-off. An operator-initiated
+    // action (invalidateblock/reconsiderblock) already carries that sign-off,
+    // so gating it would only block the RPC until the decision timeout.
+    if (ReorgGateOperatorActionActive()) {
+        LogPrintf("REORG GATING: Skipping gate - chain switch is operator-initiated.\n");
+        return false;
+    }
+
     // Local policy corrections can make the best chain an ancestor of the
     // current tip. That disconnect-only retreat is self-correction, not a
     // competing fork that needs operator approval.

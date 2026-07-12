@@ -1637,6 +1637,10 @@ void InvalidateBlock(ChainstateManager& chainman, const uint256 block_hash) {
             throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found");
         }
     }
+    // The reorg gate exists to obtain operator sign-off; this call already
+    // carries it. Without the override the RPC blocks on its own gate until
+    // the decision timeout.
+    ReorgGateOperatorAction operator_action;
     chainman.ActiveChainstate().InvalidateBlock(state, pblockindex);
 
     if (state.IsValid()) {
@@ -1684,6 +1688,8 @@ void ReconsiderBlock(ChainstateManager& chainman, uint256 block_hash) {
         chainman.RecalculateBestHeader();
     }
 
+    // Operator-initiated, same as InvalidateBlock: bypass the reorg gate.
+    ReorgGateOperatorAction operator_action;
     BlockValidationState state;
     chainman.ActiveChainstate().ActivateBestChain(state);
 
@@ -3700,6 +3706,7 @@ static RPCHelpMan getpendingreorg()
                         {RPCResult::Type::BOOL, "pending", "Whether there is a pending reorg"},
                         {RPCResult::Type::STR_HEX, "candidate_tip", "Hash of the candidate (fork) tip"},
                         {RPCResult::Type::STR_HEX, "current_tip", "Hash of the current chain tip"},
+                        {RPCResult::Type::STR_HEX, "fork_point", "Hash of the fork point (last common ancestor)"},
                         {RPCResult::Type::NUM, "pending_since", "Unix timestamp when pending state was set"},
                         {RPCResult::Type::NUM, "timeout_remaining", "Seconds remaining until timeout"},
                         {RPCResult::Type::NUM, "depth_current", "Reorg depth on current chain"},
@@ -3727,6 +3734,7 @@ static RPCHelpMan getpendingreorg()
     obj.pushKV("pending", pending.is_pending);
     obj.pushKV("candidate_tip", pending.candidate_tip_hash.ToString());
     obj.pushKV("current_tip", pending.current_tip_hash.ToString());
+    obj.pushKV("fork_point", pending.fork_point_hash.ToString());
     obj.pushKV("pending_since", pending.pending_since);
     obj.pushKV("timeout_remaining", mgr.GetTimeoutRemaining());
     obj.pushKV("depth_current", pending.advisory.depth_current);
