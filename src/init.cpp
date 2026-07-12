@@ -647,6 +647,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-reorgadvisoryautofollowmindelay=<n>", "Minimum seconds before first competing block was seen for sane-partition auto-follow (default: 1200)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-reorgadvisorytimeout=<n>", "Timeout in seconds for operator decision before default action (default: 1800 = 30 minutes, min: 60, max: 86400)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-reorgadvisorytimeoutaccept", "Default action on timeout: 1=accept fork, 0=reject and stay on current chain (default: 0)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-reorgadvisoryapprovalttl=<n>", "How long in seconds an accepted reorg decision keeps covering later segments of the same reorg without re-prompting (default: 3600, min: 60, max: 86400)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-checkmempool=<n>", strprintf("Run mempool consistency checks every <n> transactions. Use 0 to disable. (default: %u, regtest: %u)", defaultChainParams->DefaultConsistencyChecks(), regtestChainParams->DefaultConsistencyChecks()), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     // Checkpoints were removed. We keep `-checkpoints` as a hidden arg to display a more user friendly error when set.
     argsman.AddArg("-checkpoints", "", ArgsManager::ALLOW_ANY, OptionsCategory::HIDDEN);

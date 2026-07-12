@@ -9,6 +9,7 @@
 #include <test/util/setup_common.h>
 #include <uint256.h>
 #include <util/strencodings.h>
+#include <util/time.h>
 #include <primitives/transaction.h>
 
 #include <chrono>
@@ -271,6 +272,95 @@ BOOST_AUTO_TEST_CASE(should_gate_reorg_skips_disconnect_only_retreat)
 
     BOOST_CHECK(ShouldGateReorg(ADVISORY_DEPTH_THRESHOLD + 1, 0, /*disconnect_only=*/false, config));
     BOOST_CHECK(!ShouldGateReorg(ADVISORY_DEPTH_THRESHOLD + 1, 0, /*disconnect_only=*/true, config));
+}
+
+BOOST_AUTO_TEST_CASE(should_gate_reorg_skips_operator_initiated_actions)
+{
+    ReorgGatingConfig config;
+    config.enabled = true;
+    config.gating_depth_threshold = ADVISORY_DEPTH_THRESHOLD;
+
+    BOOST_CHECK(!ReorgGateOperatorActionActive());
+    BOOST_CHECK(ShouldGateReorg(ADVISORY_DEPTH_THRESHOLD + 1, 0, /*disconnect_only=*/false, config));
+    {
+        ReorgGateOperatorAction action;
+        BOOST_CHECK(ReorgGateOperatorActionActive());
+        BOOST_CHECK(!ShouldGateReorg(ADVISORY_DEPTH_THRESHOLD + 1, 0, /*disconnect_only=*/false, config));
+        {
+            ReorgGateOperatorAction nested;
+            BOOST_CHECK(!ShouldGateReorg(ADVISORY_DEPTH_THRESHOLD + 1, 0, /*disconnect_only=*/false, config));
+        }
+        // Still overridden after the nested scope ends.
+        BOOST_CHECK(ReorgGateOperatorActionActive());
+        BOOST_CHECK(!ShouldGateReorg(ADVISORY_DEPTH_THRESHOLD + 1, 0, /*disconnect_only=*/false, config));
+    }
+    BOOST_CHECK(!ReorgGateOperatorActionActive());
+    BOOST_CHECK(ShouldGateReorg(ADVISORY_DEPTH_THRESHOLD + 1, 0, /*disconnect_only=*/false, config));
+}
+
+BOOST_AUTO_TEST_CASE(reorg_gating_approval_lifecycle)
+{
+    ReorgGatingManager mgr;
+
+    const uint256 candidate = uint256::FromHex("00000000000000000000000000000000000000000000000000000000000000aa").value();
+    const uint256 current = uint256::FromHex("00000000000000000000000000000000000000000000000000000000000000bb").value();
+    const uint256 fork_point = uint256::FromHex("00000000000000000000000000000000000000000000000000000000000000cc").value();
+
+    // No approval before any decision.
+    BOOST_CHECK(!mgr.GetApproval().is_valid);
+
+    // Recording without a pending reorg is a no-op.
+    mgr.RecordApprovalFromPending();
+    BOOST_CHECK(!mgr.GetApproval().is_valid);
+
+    ReorgAdvisory advisory;
+    advisory.depth_current = 5;
+    advisory.is_valid = true;
+    mgr.SetPending(advisory, candidate, current, fork_point);
+    BOOST_CHECK(mgr.GetPending().fork_point_hash == fork_point);
+
+    mgr.RecordApprovalFromPending();
+    mgr.ClearPending();
+
+    // Approval survives ClearPending and matches the accepted reorg,
+    // including the old tip it was granted against.
+    BOOST_CHECK(!mgr.HasPending());
+    ReorgApprovalState approval = mgr.GetApproval();
+    BOOST_CHECK(approval.is_valid);
+    BOOST_CHECK(approval.fork_point_hash == fork_point);
+    BOOST_CHECK(approval.candidate_tip_hash == candidate);
+    BOOST_CHECK(approval.current_tip_hash == current);
+
+    mgr.ClearApproval();
+    BOOST_CHECK(!mgr.GetApproval().is_valid);
+}
+
+BOOST_AUTO_TEST_CASE(reorg_gating_approval_ttl)
+{
+    SetMockTime(1000000);
+    ReorgGatingManager mgr;
+
+    const uint256 candidate = uint256::FromHex("00000000000000000000000000000000000000000000000000000000000000aa").value();
+    const uint256 current = uint256::FromHex("00000000000000000000000000000000000000000000000000000000000000bb").value();
+    const uint256 fork_point = uint256::FromHex("00000000000000000000000000000000000000000000000000000000000000cc").value();
+
+    ReorgAdvisory advisory;
+    advisory.is_valid = true;
+    mgr.SetPending(advisory, candidate, current, fork_point);
+    mgr.RecordApprovalFromPending();
+    mgr.ClearPending();
+
+    BOOST_CHECK(mgr.GetApproval().is_valid);
+
+    // Still valid at exactly the TTL boundary.
+    SetMockTime(1000000 + DEFAULT_REORG_APPROVAL_TTL_SECS);
+    BOOST_CHECK(mgr.GetApproval().is_valid);
+
+    // Expired past the TTL.
+    SetMockTime(1000000 + DEFAULT_REORG_APPROVAL_TTL_SECS + 1);
+    BOOST_CHECK(!mgr.GetApproval().is_valid);
+
+    SetMockTime(0);
 }
 
 BOOST_AUTO_TEST_CASE(should_auto_follow_sane_partition_reorg)

@@ -492,11 +492,42 @@ struct PendingReorgState {
     //! Hash of the current tip at time of detection.
     uint256 current_tip_hash;
 
+    //! Hash of the fork point (last common ancestor of current and candidate tips).
+    uint256 fork_point_hash;
+
     //! Timestamp when the pending state was set.
     int64_t pending_since{0};
 
     //! The operator's decision (NONE while pending).
     ReorgDecision decision{ReorgDecision::NONE};
+};
+
+/**
+ * A durable record of an operator ACCEPT decision, anchored to the reorg's
+ * fork point. A deep competing chain's block bodies arrive incrementally over
+ * P2P, so a single reorg re-enters the gate once per arriving segment while
+ * the tip is still on the old branch. The fork point is invariant across all
+ * segments of one reorg, so one ACCEPT recorded here covers every later
+ * segment that extends the approved candidate.
+ */
+struct ReorgApprovalState {
+    //! Whether an approval is recorded (and not yet expired).
+    bool is_valid{false};
+
+    //! Fork point of the approved reorg (invariant across its segments).
+    uint256 fork_point_hash;
+
+    //! Candidate tip the operator saw when approving. Later candidates must
+    //! descend from this block to be covered by the approval.
+    uint256 candidate_tip_hash;
+
+    //! Active tip whose replacement the operator approved. The approval only
+    //! covers switches away from this exact tip, so it cannot leak onto a
+    //! later switch from a different branch within the TTL.
+    uint256 current_tip_hash;
+
+    //! Timestamp when the approval was recorded.
+    int64_t approved_at{0};
 };
 
 //! Default timeout for operator decision (30 minutes).
@@ -520,6 +551,9 @@ constexpr int DEFAULT_REORG_AUTOFOLLOW_MIN_FORK_TO_CURRENT_RATIO_PCT = 125;
 
 //! A sane partition should have delayed first visibility of the competing branch.
 constexpr int64_t DEFAULT_REORG_AUTOFOLLOW_MIN_FIRST_BLOCK_DELAY_SECS = 20 * 60;
+
+//! Default validity window for a recorded reorg approval (1 hour).
+constexpr int64_t DEFAULT_REORG_APPROVAL_TTL_SECS = 60 * 60;
 
 /**
  * Gating configuration read from command-line args.
@@ -549,6 +583,9 @@ struct ReorgGatingConfig {
 
     //! Minimum delay before the first competing block was seen.
     int64_t autofollow_min_first_block_delay_secs{DEFAULT_REORG_AUTOFOLLOW_MIN_FIRST_BLOCK_DELAY_SECS};
+
+    //! How long a recorded ACCEPT keeps covering later segments of the same reorg.
+    int64_t approval_ttl_secs{DEFAULT_REORG_APPROVAL_TTL_SECS};
 };
 
 /**
@@ -566,6 +603,7 @@ private:
     mutable Mutex m_mutex;
     std::condition_variable m_cv;
     PendingReorgState m_pending GUARDED_BY(m_mutex);
+    ReorgApprovalState m_approval GUARDED_BY(m_mutex);
     ReorgGatingConfig m_config;
 
 public:
@@ -583,10 +621,12 @@ public:
      * @param advisory The computed advisory.
      * @param candidate_tip_hash Hash of the fork tip.
      * @param current_tip_hash Hash of current active tip.
+     * @param fork_point_hash Hash of the fork point (last common ancestor).
      */
     void SetPending(const ReorgAdvisory& advisory,
                     const uint256& candidate_tip_hash,
-                    const uint256& current_tip_hash);
+                    const uint256& current_tip_hash,
+                    const uint256& fork_point_hash);
 
     /**
      * Get the current pending state.
@@ -621,6 +661,26 @@ public:
      * Called after the decision has been processed.
      */
     void ClearPending();
+
+    /**
+     * Record a durable approval from the current pending reorg.
+     * Called on ACCEPT (operator or timeout-accept) BEFORE ClearPending, so
+     * that later segments of the same reorg skip the gate instead of
+     * re-prompting the operator once per segment.
+     */
+    void RecordApprovalFromPending();
+
+    /**
+     * Get the recorded approval, if any.
+     * Returns a default (is_valid=false) state when none is recorded or the
+     * approval has outlived its TTL.
+     */
+    ReorgApprovalState GetApproval() const;
+
+    /**
+     * Drop any recorded approval.
+     */
+    void ClearApproval();
 
     /**
      * Reload configuration from gArgs.
@@ -664,5 +724,27 @@ bool ShouldGateReorg(int depth_current, int64_t since_last_block, bool disconnec
  */
 bool ShouldAutoFollowSanePartitionReorg(const ReorgAdvisory& advisory,
                                         const std::optional<ReorgGatingConfig>& config = std::nullopt);
+
+/**
+ * RAII guard marking the current thread as executing an operator-initiated
+ * chain action (invalidateblock/reconsiderblock). While a guard is alive,
+ * ShouldGateReorg returns false on this thread: the gate exists to obtain
+ * operator sign-off, which the operator's own RPC call already carries, so
+ * routing it back through the gate would only block the RPC thread until the
+ * decision timeout.
+ */
+class ReorgGateOperatorAction
+{
+public:
+    ReorgGateOperatorAction();
+    ~ReorgGateOperatorAction();
+    ReorgGateOperatorAction(const ReorgGateOperatorAction&) = delete;
+    ReorgGateOperatorAction& operator=(const ReorgGateOperatorAction&) = delete;
+};
+
+/**
+ * True while the current thread is inside a ReorgGateOperatorAction scope.
+ */
+bool ReorgGateOperatorActionActive();
 
 #endif // BITCOIN_VALIDATIONADVISORY_H

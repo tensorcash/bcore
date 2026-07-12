@@ -7389,7 +7389,30 @@ bool Chainstate::ActivateBestChainStep(BlockValidationState& state, CBlockIndex*
 
         // Check if this reorg requires operator gating (blocking until decision)
         const bool disconnect_only = pindexMostWork == pindexFork;
-        if (ShouldGateReorg(reorg_depth, since_last_block, disconnect_only)) {
+        bool gate = ShouldGateReorg(reorg_depth, since_last_block, disconnect_only);
+        if (gate) {
+            // A prior operator ACCEPT covers every later segment of the same
+            // reorg: the competing chain's bodies arrive incrementally over
+            // P2P, and each extension re-enters this gate while the tip is
+            // still on the old branch. The approval is anchored to the fork
+            // point AND the old tip it was granted against (so it cannot
+            // cover a switch from any other branch), and is only honored for
+            // candidates that descend from the tip the operator approved, so
+            // a different competing branch from the same fork point still
+            // prompts.
+            const ReorgApprovalState approval = GetReorgGatingManager().GetApproval();
+            if (approval.is_valid &&
+                approval.fork_point_hash == pindexFork->GetBlockHash() &&
+                approval.current_tip_hash == pindexOldTip->GetBlockHash()) {
+                const CBlockIndex* approved_tip{m_chainman.m_blockman.LookupBlockIndex(approval.candidate_tip_hash)};
+                if (approved_tip && pindexMostWork->GetAncestor(approved_tip->nHeight) == approved_tip) {
+                    LogPrintf("REORG GATING: Reorg at fork point %s already approved by operator; not re-prompting for candidate %s.\n",
+                              approval.fork_point_hash.ToString(), pindexMostWork->GetBlockHash().ToString());
+                    gate = false;
+                }
+            }
+        }
+        if (gate) {
             // Gating is enabled and thresholds are met. Compute advisory synchronously:
             // sane partition recoveries may auto-follow; suspicious/anomalous reorgs
             // still block until operator decision.
@@ -7430,7 +7453,8 @@ bool Chainstate::ActivateBestChainStep(BlockValidationState& state, CBlockIndex*
                 GetReorgGatingManager().SetPending(
                     advisory,
                     pindexMostWork->GetBlockHash(),
-                    pindexOldTip->GetBlockHash()
+                    pindexOldTip->GetBlockHash(),
+                    pindexFork->GetBlockHash()
                 );
 
                 // Return with BLOCK_REORG_GATING - caller (ActivateBestChain) will handle
@@ -7727,6 +7751,15 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
             LogPrintf("REORG GATING: Use 'tensorcash-cli submitreorgdecision accept' or 'tensorcash-cli submitreorgdecision reject'\n");
 
             ReorgDecision decision = GetReorgGatingManager().WaitForDecision();
+            const bool accepted = decision == ReorgDecision::ACCEPT ||
+                                  (decision == ReorgDecision::TIMEOUT && GetReorgGatingConfig().timeout_accept);
+            if (accepted) {
+                // Record before ClearPending: the approval is copied from the
+                // pending state, and must survive it so the retry (and any
+                // later segments of the same reorg) skip the gate instead of
+                // re-prompting the operator.
+                GetReorgGatingManager().RecordApprovalFromPending();
+            }
             GetReorgGatingManager().ClearPending();
 
             if (decision == ReorgDecision::ACCEPT) {
@@ -7739,8 +7772,7 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
                 // Return success - we stayed on current chain by operator choice
                 return true;
             } else { // TIMEOUT
-                ReorgGatingConfig cfg = GetReorgGatingConfig();
-                if (cfg.timeout_accept) {
+                if (accepted) {
                     LogPrintf("REORG GATING: Timeout - default action is ACCEPT. Proceeding with chain switch.\n");
                     pindexMostWork = nullptr;
                     state = BlockValidationState();
@@ -7753,6 +7785,20 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
         }
 
         // When we reach this point, we switched to a new tip (stored in pindexNewTip).
+
+        // Once the switch has landed on the approved branch the approval has
+        // served its purpose; consume it so it cannot cover any later,
+        // unrelated switch within its TTL.
+        if (pindexNewTip) {
+            const ReorgApprovalState approval = GetReorgGatingManager().GetApproval();
+            if (approval.is_valid) {
+                LOCK(::cs_main);
+                const CBlockIndex* approved_tip{m_chainman.m_blockman.LookupBlockIndex(approval.candidate_tip_hash)};
+                if (approved_tip && pindexNewTip->GetAncestor(approved_tip->nHeight) == approved_tip) {
+                    GetReorgGatingManager().ClearApproval();
+                }
+            }
+        }
 
         if (exited_ibd) {
             // If a background chainstate is in use, we may need to rebalance our

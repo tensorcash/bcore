@@ -47,10 +47,6 @@ class ReorgGatingTest(BitcoinTestFramework):
             node.submitreorgdecision("accept")
             self.wait_until(lambda: node.getpendingreorg() is None, timeout=10)
 
-    def _restart_node_with_flags(self, idx, extra_args):
-        self.stop_node(idx)
-        self.start_node(idx, extra_args=extra_args)
-
     def test_reject_path(self):
         self.log.info("Testing gating reject path")
         n0, n1 = self.nodes
@@ -102,12 +98,12 @@ class ReorgGatingTest(BitcoinTestFramework):
         res = n0.submitreorgdecision("accept")
         assert res["success"]
 
-        # Wait for pending to clear, then restart without gating to ensure reorg completes.
+        # A single accept is recorded as a durable approval anchored to the
+        # reorg's fork point, so the whole reorg must complete with gating
+        # still enabled - no second prompt, no restart workaround.
         self.wait_until(lambda: n0.getpendingreorg() is None, timeout=30)
-        self._restart_node_with_flags(0, [
-            "-reorgadvisory=1", "-reorgadvisorydepth=3", "-reorgadvisorygating=0", "-spv-asn-corroboration=0"])
-        self.connect_nodes(0, 1)
         self.sync_blocks(self.nodes, timeout=120)
+        assert n0.getpendingreorg() is None
 
     def test_timeout_accept(self):
         self.log.info("Testing gating timeout accept path")
@@ -134,12 +130,60 @@ class ReorgGatingTest(BitcoinTestFramework):
         pending = self._wait_for_pending(n0)
         assert_greater_than(pending["depth_current"], 3)
 
-        # Do not submit a decision; wait for timeout accept
+        # Do not submit a decision; wait for timeout accept. A timeout-accept
+        # records the same durable approval as an operator accept, so the
+        # reorg must complete with gating still enabled.
         self.wait_until(lambda: n0.getpendingreorg() is None, timeout=90)
-        self._restart_node_with_flags(0, [
-            "-reorgadvisory=1", "-reorgadvisorydepth=3", "-reorgadvisorygating=0", "-spv-asn-corroboration=0"])
-        self.connect_nodes(0, 1)
         self.sync_blocks(self.nodes, timeout=120)
+        assert n0.getpendingreorg() is None
+
+    def test_operator_rpcs_not_gated(self):
+        self.log.info("Testing invalidateblock/reconsiderblock bypass the gate")
+        n0, n1 = self.nodes
+
+        # Sync both nodes with gating off, then diverge: branch A mined by n0
+        # (longer, active) and branch B mined by n1, submitted to n0 as a side
+        # branch so its arrival does not itself trigger a reorg.
+        self.restart_node(0, extra_args=[
+            "-reorgadvisory=1", "-reorgadvisorydepth=3", "-reorgadvisorygating=0", "-spv-asn-corroboration=0"])
+        self.restart_node(1, extra_args=[
+            "-reorgadvisory=1", "-reorgadvisorydepth=3", "-spv-asn-corroboration=0"])
+        self.connect_nodes(0, 1)
+        self._clear_pending_if_any(n0)
+        self.sync_all()
+        self.generate(n0, 10)
+        self.sync_all()
+
+        self.disconnect_nodes(0, 1)
+        a_blocks = self.generate(n0, 9, sync_fun=self.no_op)
+        b_blocks = self.generate(n1, 6, sync_fun=self.no_op)
+        for bh in b_blocks:
+            n0.submitblock(n1.getblock(bh, 0))
+        a_tip = a_blocks[-1]
+        b_tip = b_blocks[-1]
+        assert_equal(n0.getbestblockhash(), a_tip)
+
+        # Enable gating with a long timeout: if the operator RPCs were routed
+        # through the gate they would block until this timeout.
+        self.restart_node(0, extra_args=[
+            "-reorgadvisory=1", "-reorgadvisorydepth=3", "-reorgadvisorygating=1",
+            "-reorgadvisorygatingdepth=3", "-reorgadvisorytimeout=600", "-spv-asn-corroboration=0"])
+
+        # Invalidating 4 blocks deep on branch A makes branch B the best
+        # chain: a depth-4 branch switch that would gate if peer-initiated.
+        start = time.time()
+        n0.invalidateblock(a_blocks[4])
+        assert time.time() - start < 60
+        assert_equal(n0.getbestblockhash(), b_tip)
+        assert n0.getpendingreorg() is None
+
+        # Reconsidering switches back to branch A: a depth-6 switch, again
+        # operator-initiated and therefore not gated.
+        start = time.time()
+        n0.reconsiderblock(a_blocks[4])
+        assert time.time() - start < 60
+        assert_equal(n0.getbestblockhash(), a_tip)
+        assert n0.getpendingreorg() is None
 
     def test_offline_autofollow(self):
         self.log.info("Testing offline >6h auto-follow (no gating)")
@@ -171,6 +215,7 @@ class ReorgGatingTest(BitcoinTestFramework):
         self.test_reject_path()
         self.test_accept_path()
         self.test_timeout_accept()
+        self.test_operator_rpcs_not_gated()
         self.test_offline_autofollow()
 
 
