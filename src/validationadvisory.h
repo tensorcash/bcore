@@ -27,8 +27,15 @@ class BlockManager;
 } // namespace node
 
 // Default knobs for advisory/gating.
-//! Default reorg depth threshold for triggering advisory.
-constexpr int ADVISORY_DEPTH_THRESHOLD = 3;
+//! Default reorg depth threshold for advisory + operator gating. Raised from 3
+//! to 6: a hashrate spike (faster blocks before difficulty retargets, plus
+//! partition heals) makes benign reorgs of depth 4-6 common, so a depth-3 gate
+//! fires on legitimate reorgs and — with the default timeout action REJECT — an
+//! unattended node can stall on a stale tip. 6 is the same depth at which the
+//! SPV body-sampling corroboration already engages, keeping the two aligned.
+//! This is local operator policy (non-consensus); override with
+//! -reorgadvisorydepth / -reorgadvisorygatingdepth.
+constexpr int ADVISORY_DEPTH_THRESHOLD = 6;
 //! Default offline threshold (seconds) - if exceeded, skip advisory.
 constexpr int64_t ADVISORY_OFFLINE_THRESHOLD_SECS = 6 * 60 * 60;  // 6 hours
 //! Default calibration window (blocks).
