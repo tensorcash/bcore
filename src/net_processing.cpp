@@ -908,6 +908,13 @@ private:
     // Optional ASN corroboration of candidate announcements
     bool m_enable_asn_corroboration{true};
     size_t m_required_asn_corroboration{2};
+    // Reorg depth above which ASN corroboration is required (default 3).
+    int m_spv_asn_min_reorg_depth{3};
+    // Throttle for the "ASN blocking" info line: FindNextBlocksToDownload runs
+    // per peer per SendMessages, so an un-throttled INFO log emits tens of
+    // thousands of lines while a deep reorg is gated. Guarded by cs_main (both
+    // gate sites hold it).
+    int64_t m_last_asn_block_log GUARDED_BY(cs_main){0};
     std::unordered_map<uint256, std::unordered_set<uint64_t>, BlockHasher> m_tip_asn_announcers;
 
     // Onion diversity config
@@ -1970,23 +1977,32 @@ void PeerManagerImpl::FindNextBlocksToDownload(const Peer& peer, unsigned int co
         return;
     }
 
-    // Apply ASN corroboration check for deep reorgs (D > 3) to prevent single-source attacks
+    // Apply ASN corroboration check for deep reorgs (D > m_spv_asn_min_reorg_depth)
+    // to prevent single-source attacks.
     const CBlockIndex* best_tip = m_chainman.ActiveChain().Tip();
     const CBlockIndex* lca = LastCommonAncestor(best_tip, state->pindexBestKnownBlock);
     int reorg_depth = best_tip->nHeight - (lca ? lca->nHeight : -1);
     if (reorg_depth < 0) reorg_depth = 0;
-    if (m_enable_asn_corroboration && reorg_depth > 3) {
+    if (m_enable_asn_corroboration && reorg_depth > m_spv_asn_min_reorg_depth) {
         auto it_asn = m_tip_asn_announcers.find(state->pindexBestKnownBlock->GetBlockHash());
         size_t distinct = (it_asn == m_tip_asn_announcers.end()) ? 0 : it_asn->second.size();
-        LogInfo("ASN: FindNextBlocksToDownload for peer %d, tip=%s, reorg_depth=%d: distinct ASNs=%zu, required=%zu\n",
+        // This runs on every FindNextBlocksToDownload cycle; keep per-call
+        // diagnostics at debug level to avoid flooding debug.log during a spike.
+        LogDebug(BCLog::NET, "ASN: FindNextBlocksToDownload for peer %d, tip=%s, reorg_depth=%d: distinct ASNs=%zu, required=%zu\n",
                 peer.m_id, state->pindexBestKnownBlock->GetBlockHash().ToString(), reorg_depth, distinct, m_required_asn_corroboration);
         if (distinct < m_required_asn_corroboration) {
-            LogInfo("ASN: BLOCKING normal download - insufficient distinct ASNs (%zu < %zu) for deep reorg (D=%d > 3)\n",
-                    distinct, m_required_asn_corroboration, reorg_depth);
+            // Throttle the operator-facing BLOCKING line to at most once per
+            // 30s so an ongoing deep reorg does not spam the log.
+            const int64_t now = GetTime();
+            if (now - m_last_asn_block_log >= 30) {
+                m_last_asn_block_log = now;
+                LogInfo("ASN: BLOCKING normal download - insufficient distinct ASNs (%zu < %zu) for deep reorg (D=%d > %d)\n",
+                        distinct, m_required_asn_corroboration, reorg_depth, m_spv_asn_min_reorg_depth);
+            }
             return;
         }
-        LogInfo("ASN: ALLOWING normal download - sufficient distinct ASNs (%zu >= %zu) for deep reorg (D=%d > 3)\n",
-                distinct, m_required_asn_corroboration, reorg_depth);
+        LogDebug(BCLog::NET, "ASN: ALLOWING normal download - sufficient distinct ASNs (%zu >= %zu) for deep reorg (D=%d > %d)\n",
+                distinct, m_required_asn_corroboration, reorg_depth, m_spv_asn_min_reorg_depth);
     }
 
     // When we sync with AssumeUtxo and discover the snapshot is not in the peer's best chain, abort:
@@ -2565,6 +2581,7 @@ PeerManagerImpl::PeerManagerImpl(CConnman& connman, AddrMan& addrman,
     // Apply SPV selection knobs from options
     m_enable_asn_corroboration = opts.spv_asn_corroboration;
     m_required_asn_corroboration = opts.spv_asn_min;
+    m_spv_asn_min_reorg_depth = opts.spv_asn_min_reorg_depth;
     m_tick_ema_alpha = std::clamp(opts.spv_hysteresis_alpha_bps, 0u, 10000u) / 10000.0;
     m_hysteresis_base_frac = std::clamp(opts.spv_hysteresis_base_bps, 0u, 10000u) / 10000.0;
     if (opts.spv_hysteresis_default_tick > 0) {
@@ -3425,9 +3442,9 @@ void PeerManagerImpl::HeadersDirectFetchBlocks(CNode& pfrom, const Peer& peer, c
     LOCK(cs_main);
     CNodeState *nodestate = State(pfrom.GetId());
 
-    LogInfo("ASN: HeadersDirectFetchBlocks called for peer %d, last_header=%s (height=%d)\n",
+    LogDebug(BCLog::NET, "ASN: HeadersDirectFetchBlocks called for peer %d, last_header=%s (height=%d)\n",
             pfrom.GetId(), last_header.GetBlockHash().ToString(), last_header.nHeight);
-    LogInfo("ASN: CanDirectFetch=%s, IsValid=%s\n",
+    LogDebug(BCLog::NET, "ASN: CanDirectFetch=%s, IsValid=%s\n",
             CanDirectFetch() ? "true" : "false",
             last_header.IsValid(BLOCK_VALID_TREE) ? "true" : "false");
 
@@ -3483,41 +3500,35 @@ void PeerManagerImpl::HeadersDirectFetchBlocks(CNode& pfrom, const Peer& peer, c
             }
         }
         const bool allow_fetch = hysteresis_ok.has_value() ? *hysteresis_ok : chainwork_better;
-        LogInfo("ASN: Hysteresis check - has_value=%s, value=%s, chainwork_better=%s, allow_fetch=%s\n",
+        LogDebug(BCLog::NET, "ASN: Hysteresis check - has_value=%s, value=%s, chainwork_better=%s, allow_fetch=%s\n",
                 hysteresis_ok.has_value() ? "true" : "false",
                 hysteresis_ok.has_value() ? (*hysteresis_ok ? "true" : "false") : "N/A",
                 chainwork_better ? "true" : "false",
                 allow_fetch ? "true" : "false");
         if (!allow_fetch) {
-            LogInfo("ASN: Returning early - hysteresis/chainwork check failed\n");
+            LogDebug(BCLog::NET, "ASN: Returning early - hysteresis/chainwork check failed\n");
             return;
         }
-        // Optional ASN corroboration gate (only for deep reorgs D > 3 to prevent attacks)
-        // reorg_depth <= 3: Normal chain forks due to network latency, no ASN check needed
-        // reorg_depth > 3: Suspicious deep reorg, apply ASN check
+        // Optional ASN corroboration gate (only for deep reorgs D > m_spv_asn_min_reorg_depth
+        // to prevent attacks).
+        // reorg_depth <= threshold: Normal chain forks due to network latency, no ASN check needed
+        // reorg_depth >  threshold: Suspicious deep reorg, apply ASN check
         // reorg_depth == -1: Reorg depth unavailable, skip corroboration rather than stalling sync
-        LogInfo("ASN: Checking corroboration gate - enabled=%s, reorg_depth=%d, required=%zu\n",
+        LogDebug(BCLog::NET, "ASN: Checking corroboration gate - enabled=%s, reorg_depth=%d, required=%zu\n",
                 m_enable_asn_corroboration ? "true" : "false", reorg_depth, m_required_asn_corroboration);
-        if (m_enable_asn_corroboration && reorg_depth > 3) {
+        if (m_enable_asn_corroboration && reorg_depth > m_spv_asn_min_reorg_depth) {
             auto it_asn = m_tip_asn_announcers.find(last_header.GetBlockHash());
             size_t distinct = (it_asn == m_tip_asn_announcers.end()) ? 0 : it_asn->second.size();
-            LogInfo("ASN: For block %s (height=%d): found=%s, distinct ASNs=%zu, required=%zu\n",
+            LogDebug(BCLog::NET, "ASN: For block %s (height=%d): found=%s, distinct ASNs=%zu, required=%zu\n",
                     last_header.GetBlockHash().ToString(), last_header.nHeight,
                     (it_asn != m_tip_asn_announcers.end()) ? "true" : "false",
                     distinct, m_required_asn_corroboration);
-            if (it_asn != m_tip_asn_announcers.end()) {
-                LogInfo("ASN: Diversity set contents: ");
-                for (uint64_t key : it_asn->second) {
-                    LogInfo("%llu ", key);
-                }
-                LogInfo("\n");
-            }
             if (distinct < m_required_asn_corroboration) {
-                LogInfo("ASN: BLOCKING FETCH - insufficient distinct ASNs (%zu < %zu)\n",
-                        distinct, m_required_asn_corroboration);
+                LogInfo("ASN: BLOCKING FETCH - insufficient distinct ASNs (%zu < %zu) for deep reorg (D=%d > %d)\n",
+                        distinct, m_required_asn_corroboration, reorg_depth, m_spv_asn_min_reorg_depth);
                 return;
             }
-            LogInfo("ASN: ALLOWING FETCH - sufficient distinct ASNs (%zu >= %zu)\n",
+            LogDebug(BCLog::NET, "ASN: ALLOWING FETCH - sufficient distinct ASNs (%zu >= %zu)\n",
                     distinct, m_required_asn_corroboration);
         }
 
@@ -3549,18 +3560,18 @@ void PeerManagerImpl::HeadersDirectFetchBlocks(CNode& pfrom, const Peer& peer, c
             int D = best_tip->nHeight - (lca ? lca->nHeight : -1);
             if (D > m_spv_reorg_sampling_threshold) {
                 // Apply ASN corroboration check to block sampling for real deep reorgs only.
-                if (m_enable_asn_corroboration && reorg_depth > 3) {
+                if (m_enable_asn_corroboration && reorg_depth > m_spv_asn_min_reorg_depth) {
                     auto it_asn = m_tip_asn_announcers.find(last_header.GetBlockHash());
                     size_t distinct = (it_asn == m_tip_asn_announcers.end()) ? 0 : it_asn->second.size();
-                    LogInfo("ASN: Block sampling - reorg_depth=%d, distinct ASNs=%zu, required=%zu\n",
+                    LogDebug(BCLog::NET, "ASN: Block sampling - reorg_depth=%d, distinct ASNs=%zu, required=%zu\n",
                             reorg_depth, distinct, m_required_asn_corroboration);
                     if (distinct < m_required_asn_corroboration) {
-                        LogInfo("ASN: BLOCKING sampling - insufficient distinct ASNs (%zu < %zu) for deep reorg (D=%d > 3)\n",
-                                distinct, m_required_asn_corroboration, reorg_depth);
+                        LogInfo("ASN: BLOCKING sampling - insufficient distinct ASNs (%zu < %zu) for deep reorg (D=%d > %d)\n",
+                                distinct, m_required_asn_corroboration, reorg_depth, m_spv_asn_min_reorg_depth);
                         return;
                     }
-                    LogInfo("ASN: ALLOWING sampling - sufficient distinct ASNs (%zu >= %zu) for deep reorg (D=%d > 3)\n",
-                            distinct, m_required_asn_corroboration, reorg_depth);
+                    LogDebug(BCLog::NET, "ASN: ALLOWING sampling - sufficient distinct ASNs (%zu >= %zu) for deep reorg (D=%d > %d)\n",
+                            distinct, m_required_asn_corroboration, reorg_depth, m_spv_asn_min_reorg_depth);
                 }
                 // Prepare sampling (idempotent) and request missing samples
                 PrepareBodySamplingForCandidate(&last_header, D);
@@ -3683,7 +3694,7 @@ void PeerManagerImpl::UpdatePeerStateForReceivedHeaders(CNode& pfrom, Peer& peer
                             m_onion_tag_len)) {
                         uint64_t key = OnionToDiversityKey(onion);
                         m_tip_asn_announcers[last_header.GetBlockHash()].insert(key);
-                        LogInfo("ASN: Recording tip %s from outbound onion peer %d with diversity_key=%llu\n",
+                        LogDebug(BCLog::NET, "ASN: Recording tip %s from outbound onion peer %d with diversity_key=%llu\n",
                                 last_header.GetBlockHash().ToString(), pfrom.GetId(), key);
                     }
                     // Non-qualifying outbound onion: no insertion
@@ -3707,13 +3718,13 @@ void PeerManagerImpl::UpdatePeerStateForReceivedHeaders(CNode& pfrom, Peer& peer
                     asn = (1ULL << 62) | (gh.Finalize() & 0x3FFFFFFFFFFFFFFFULL);
                 }
                 m_tip_asn_announcers[last_header.GetBlockHash()].insert(asn);
-                LogInfo("ASN: Recording tip %s from peer %d (addr=%s) with ASN=%llu\n",
+                LogDebug(BCLog::NET, "ASN: Recording tip %s from peer %d (addr=%s) with ASN=%llu\n",
                         last_header.GetBlockHash().ToString(), pfrom.GetId(),
                         pfrom.addr.ToStringAddr(), asn);
             }
             auto it_log = m_tip_asn_announcers.find(last_header.GetBlockHash());
             if (it_log != m_tip_asn_announcers.end()) {
-                LogInfo("ASN: Total distinct keys for this tip: %zu\n", it_log->second.size());
+                LogDebug(BCLog::NET, "ASN: Total distinct keys for this tip: %zu\n", it_log->second.size());
             }
         }
     } catch (const std::exception&) {}

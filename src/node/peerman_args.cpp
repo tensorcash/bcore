@@ -27,6 +27,7 @@ void ApplyArgsManOptions(const ArgsManager& argsman, PeerManager::Options& optio
     // SPV selection knobs
     if (auto v{argsman.GetBoolArg("-spv-asn-corroboration")}) options.spv_asn_corroboration = *v;
     if (auto v{argsman.GetIntArg("-spv-asn-min")}) options.spv_asn_min = uint32_t(std::clamp<int64_t>(*v, 0, 100));
+    if (auto v{argsman.GetIntArg("-spv-asn-min-reorg-depth")}) options.spv_asn_min_reorg_depth = int(std::clamp<int64_t>(*v, 0, 1000000));
     if (auto v{argsman.GetIntArg("-spv-hysteresis-alpha-bps")}) options.spv_hysteresis_alpha_bps = uint32_t(std::clamp<int64_t>(*v, 0, 10000));
     if (auto v{argsman.GetIntArg("-spv-hysteresis-base-bps")}) options.spv_hysteresis_base_bps = uint32_t(std::clamp<int64_t>(*v, 0, 10000));
     if (auto v{argsman.GetIntArg("-spv-hysteresis-default-tick")}) {

@@ -100,6 +100,10 @@ public:
         // SPV selection knobs (default enable ASN corroboration, min=2)
         bool spv_asn_corroboration{true};
         uint32_t spv_asn_min{2};
+        // Reorg depth above which ASN corroboration is required (default 3).
+        // Configurable so low-diversity (e.g. Tor-heavy) nodes can raise it
+        // during a hashrate spike without a rebuild.
+        int spv_asn_min_reorg_depth{3};
         // SPV hysteresis EMA alpha, in basis points (1/10000). Default 200 = 2%
         uint32_t spv_hysteresis_alpha_bps{200};
         // SPV hysteresis base fraction (of E), in basis points. Default 5000 = 50%

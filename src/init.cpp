@@ -776,6 +776,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     // SPV presync selection and sampling knobs
     argsman.AddArg("-spv-asn-corroboration", "Require distinct ASNs to corroborate candidate tips before fetching (default: 1). Negate to disable.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-spv-asn-min=<n>", "Minimum number of distinct ASNs required to corroborate a candidate tip (default: 2)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-spv-asn-min-reorg-depth=<n>", "Reorg depth above which ASN corroboration is required (default: 3). Raise on low-diversity (e.g. Tor-heavy) nodes to avoid wedging behind the anti-eclipse gate during a hashrate spike.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-spv-hysteresis-alpha-bps=<n>", "EMA alpha in basis points for expected ticks per block (default: 200 = 2%)", ArgsManager::ALLOW_ANY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-spv-hysteresis-base-bps=<n>", "Base hysteresis fraction of E in basis points (default: 5000 = 50%)", ArgsManager::ALLOW_ANY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-spv-hysteresis-default-tick=<n>", "Fallback expected tick per block before EMA observations (default: 1000000)", ArgsManager::ALLOW_ANY, OptionsCategory::DEBUG_TEST);
