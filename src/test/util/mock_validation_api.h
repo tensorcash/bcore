@@ -38,6 +38,7 @@ private:
     std::optional<ValidationResponseValue> m_default_full;
     std::optional<ValidationResponseValue> m_default_model;
     std::optional<ValidationResponseValue> m_default_challenge;
+    std::optional<ValidationResponseValue> m_local_quick;
 
 public:
     MockValidationAPI() = default;
@@ -46,6 +47,7 @@ public:
     // IValidationAPI interface
     void SendApiRequest(const CBlock& block, const ValidationReqType& type, const ValidationResponseBehavior& behavior) override;
     void SendApiRequest(const uint256& req_id, const ModelRecord& model, const ValidationReqType& type) override;
+    bool TryLocalQuickVerdict(const CBlock& block, ValidationResponseValue& status) override;
     bool GetRequestStatus(const uint256& id, const ValidationReqType& type, ValidationResponseValue& status, bool async = true) const override;
     bool SetRequestStatus(const uint256& id, const ValidationReqType& type, const ValidationResponseValue& status) override;
     uint8_t GetOwnFullStatus(const uint256& id) const override;
@@ -58,6 +60,7 @@ public:
     
     // Test control methods
     void SetDefaultResponse(ValidationReqType type, ValidationResponseValue value);
+    void SetLocalQuickResponse(ValidationResponseValue value);
     std::vector<ValidationRequest> GetCapturedRequests() const;
     void ClearCapturedRequests();
     void ClearAll();

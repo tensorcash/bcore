@@ -76,6 +76,39 @@ BOOST_AUTO_TEST_CASE(quick_ok_smell_fail_no_propagation)
     m_node.validation_signals->UnregisterValidationInterface(&catcher);
 }
 
+BOOST_AUTO_TEST_CASE(missing_remote_quick_smell_uses_local_quick_to_reject)
+{
+    CBlock block = CreateTensorBlock(m_node);
+    const uint256 block_hash{block.GetHash()};
+
+    genesis_ok->ClearAll();
+    genesis_ok->SetLocalQuickResponse(ValidationResponseValue::Quick_Fail_Smell_Fail);
+    genesis_ok->ClearCapturedRequests();
+
+    auto blockptr = std::make_shared<const CBlock>(block);
+    bool new_block{false};
+    BOOST_CHECK(!Assert(m_node.chainman)->ProcessNewBlock(blockptr, /*force_processing=*/true, /*min_pow_checked=*/true, &new_block));
+    BOOST_CHECK(!new_block);
+
+    bool saw_quick_smell_request{false};
+    bool saw_full_request{false};
+    for (const auto& request : genesis_ok->GetCapturedRequests()) {
+        if (request.hash == block_hash && request.type == ValidationReqType::Quick_Smell) {
+            saw_quick_smell_request = true;
+        }
+        if (request.hash == block_hash && request.type == ValidationReqType::Full) {
+            saw_full_request = true;
+        }
+    }
+    BOOST_CHECK(saw_quick_smell_request);
+    BOOST_CHECK(!saw_full_request);
+
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(Assert(m_node.chainman)->m_blockman.LookupBlockIndex(block_hash) == nullptr);
+    }
+}
+
 BOOST_AUTO_TEST_CASE(full_green_accepts_without_request)
 {
     // Quick_Smell is OK via fixture default

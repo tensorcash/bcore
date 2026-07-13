@@ -26,6 +26,16 @@ void MockValidationAPI::SendApiRequest(const uint256& req_id, const ModelRecord&
     // Log disabled in mock - LogPrint not available in test context
 }
 
+bool MockValidationAPI::TryLocalQuickVerdict(const CBlock& block, ValidationResponseValue& status)
+{
+    (void)block;
+    if (!m_local_quick) {
+        return false;
+    }
+    status = *m_local_quick;
+    return true;
+}
+
 bool MockValidationAPI::GetRequestStatus(const uint256& id, const ValidationReqType& type, ValidationResponseValue& status, bool async) const
 {
     // Check specific status first
@@ -115,6 +125,11 @@ void MockValidationAPI::SetDefaultResponse(ValidationReqType type, ValidationRes
     }
 }
 
+void MockValidationAPI::SetLocalQuickResponse(ValidationResponseValue value)
+{
+    m_local_quick = value;
+}
+
 std::vector<ValidationRequest> MockValidationAPI::GetCapturedRequests() const
 {
     return m_captured_requests;
@@ -133,6 +148,7 @@ void MockValidationAPI::ClearAll()
     m_default_full.reset();
     m_default_model.reset();
     m_default_challenge.reset();
+    m_local_quick.reset();
 }
 
 // ScopedValidationApiMock implementation
