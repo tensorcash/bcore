@@ -3401,8 +3401,22 @@ void ValidationAPI::SetConnman(CConnman* connman)
 bool ValidationAPI::GetRequestStatus(const uint256 &id, const ValidationReqType& type, ValidationResponseValue& status, bool async) const {
     if (async)
         return GetRequestStatusImpl(id, type, status);
+    // Bounded wait. The block-connection path no longer blocks here — it enqueues
+    // and defers — but a synchronous caller remains: the block-submission RPC
+    // checks whether Quick has already reached a verdict. An UNBOUNDED spin would
+    // hang that caller indefinitely if the external validator is slow or
+    // rate-limiting (HTTP 429) and the status never becomes terminal. Cap the wait
+    // and, on timeout, return whatever GetRequestStatusImpl reports (non-terminal
+    // -> false). Returning false is already a normal, safely handled outcome: the
+    // async path (async=true) returns false while pending and callers defer +
+    // re-check on the next pass; we reuse that contract instead of hanging.
+    constexpr auto kMaxBlockingWait = std::chrono::seconds(5);
+    const auto deadline = std::chrono::steady_clock::now() + kMaxBlockingWait;
     while (!GetRequestStatusImpl(id, type, status))
     {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return false;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     return true;
