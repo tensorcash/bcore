@@ -2633,6 +2633,15 @@ void ValidationAPI::EnqueueApiRequest(const uint256& req_id, const ModelRecord& 
     }
 }
 
+bool ValidationAPI::TryLocalQuickVerdict(const CBlock& block, ValidationResponseValue& status)
+{
+    if (!UseLocalQuick()) {
+        return false;
+    }
+    status = RunLocalQuick(block);
+    return true;
+}
+
 int64_t V3AdvertisedDifficulty(int height, const Consensus::Params& params,
                                int64_t registered_difficulty) {
     if (height < 0 || !params.IsV3Active(height)) return 0;

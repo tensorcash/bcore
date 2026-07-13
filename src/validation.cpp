@@ -8217,8 +8217,14 @@ static bool CheckPOWFast(const CBlock& block) {
     {
         LogPrintf("%s: Quick %s send the validation request\n", __func__, block.GetHash().ToString());
         g_ValidationApi->EnqueueApiRequest(block, ValidationReqType::Quick_Smell, ValidationResponseBehavior::Nothing);
-        block.m_checked_smell_api = false;
-        return true;
+        // Never wait on the remote validator while cs_main is held. If this
+        // backend has a bounded local quick verifier, use that verdict to keep
+        // the fast admission gate fail-closed for Quick failures while the
+        // authoritative Quick_Smell result lands asynchronously.
+        if (!g_ValidationApi->TryLocalQuickVerdict(block, status)) {
+            block.m_checked_smell_api = false;
+            return true;
+        }
     }
     LogPrintf("%s: QuickSmell %s status=%d\n", __func__, block.GetHash().ToString(), static_cast<int>(status));
     LogPrintf("%s: QuickSmell %s get the validation answer\n", __func__, block.GetHash().ToString());
