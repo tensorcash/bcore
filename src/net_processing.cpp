@@ -861,6 +861,20 @@ private:
     static constexpr int EXT_MAX_RETRIES{3};
     static constexpr size_t MAX_HEADERS_EXT_PER_MIN{2000};
 
+    // Sidecar backfill: (header_hash, prev_hash) pairs for headers already in
+    // the index whose VDF sidecar bucket the block-download gate found missing
+    // or not-yet-VALID. The fresh-HEADERS path requests a sidecar only once, on
+    // receipt, so a header we already know but whose bucket never went VALID
+    // (e.g. its GETHEADERS_EXT was dropped and its inflight retries expired)
+    // would otherwise never be re-requested, leaving its body gated forever.
+    // Recorded at the gate, drained in SendMessages into the normal
+    // GETHEADERS_EXT path (which carries its own inflight/timeout/retry + rate
+    // limiting). This only restores the *request*; the download gate itself is
+    // unchanged, so a body is still never fetched without a VALID sidecar.
+    Mutex m_sidecar_backfill_mutex;
+    std::unordered_map<NodeId, std::set<std::pair<uint256, uint256>>> m_sidecar_backfill GUARDED_BY(m_sidecar_backfill_mutex);
+    static constexpr size_t MAX_SIDECAR_BACKFILL_PER_PEER{2000};
+
     /** Queue HEADERS_EXT queries and drain them respecting the per-minute cap. */
     void QueueGetHeadersExt(Peer& peer, std::vector<VdfExtQueryItem>&& queries) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
     void RequeueHeadersExt(Peer& peer, std::vector<VdfExtBacklogItem>&& queries) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
@@ -2219,6 +2233,7 @@ void PeerManagerImpl::FinalizeNode(const CNode& node)
         m_peer_ext_send_limits.erase(nodeid);
         m_peer_ext_limits.erase(nodeid);
         m_peer_ext_inflight.erase(nodeid);
+        { LOCK(m_sidecar_backfill_mutex); m_sidecar_backfill.erase(nodeid); }
     }
     CNodeState *state = State(nodeid);
     assert(state != nullptr);
@@ -3596,7 +3611,25 @@ void PeerManagerImpl::HeadersDirectFetchBlocks(CNode& pfrom, const Peer& peer, c
                         }
                     }
                 } catch (const std::exception&) {}
-                if (!gate_ok) continue;
+                if (!gate_ok) {
+                    // Body stays gated (no VALID sidecar => no download). But the
+                    // fresh-HEADERS path never re-requests a sidecar for a header
+                    // already in the index, so record it for backfill: SendMessages
+                    // re-issues GETHEADERS_EXT so the bucket can fill and this gate
+                    // pass legitimately. Security is unchanged here -- we still
+                    // refuse the body; we only re-ask for the proof.
+                    try {
+                        ServiceFlags srv = peer.m_their_services.load();
+                        if ((srv & NODE_VDFSPV) == NODE_VDFSPV) {
+                            const uint256 hdr = pindex->GetBlockHash();
+                            const uint256 prev = pindex->pprev ? pindex->pprev->GetBlockHash() : uint256();
+                            LOCK(m_sidecar_backfill_mutex);
+                            auto& q = m_sidecar_backfill[pfrom.GetId()];
+                            if (q.size() < MAX_SIDECAR_BACKFILL_PER_PEER) q.emplace(hdr, prev);
+                        }
+                    } catch (const std::exception&) {}
+                    continue;
+                }
                 uint32_t nFetchFlags = GetFetchFlags(peer);
                 vGetData.emplace_back(MSG_BLOCK | nFetchFlags, pindex->GetBlockHash());
                 BlockRequested(pfrom.GetId(), *pindex);
@@ -7318,6 +7351,31 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
         if (!vGetData.empty())
             MakeAndPushMessage(*pto, NetMsgType::GETDATA, vGetData);
     } // release cs_main
+
+    // Drain the sidecar backfill: re-request VDF sidecars for already-known
+    // headers whose bucket the download gate found missing. Runs under
+    // g_msgproc_mutex with cs_main released; skips headers already in flight so
+    // we don't duplicate outstanding requests. The subsequent
+    // MaybeSendQueuedGetHeadersExt sends them subject to the normal rate limit.
+    {
+        std::set<std::pair<uint256, uint256>> pending;
+        {
+            LOCK(m_sidecar_backfill_mutex);
+            auto it = m_sidecar_backfill.find(pto->GetId());
+            if (it != m_sidecar_backfill.end()) { pending.swap(it->second); m_sidecar_backfill.erase(it); }
+        }
+        if (!pending.empty()) {
+            auto inflight_it = m_peer_ext_inflight.find(pto->GetId());
+            std::vector<VdfExtQueryItem> queries;
+            queries.reserve(pending.size());
+            for (const auto& hp : pending) {
+                if (inflight_it != m_peer_ext_inflight.end() && inflight_it->second.count(hp.first)) continue;
+                VdfExtQueryItem q; q.header_hash = hp.first; q.prev_hash = hp.second;
+                queries.push_back(std::move(q));
+            }
+            if (!queries.empty()) QueueGetHeadersExt(*peer, std::move(queries));
+        }
+    }
     MaybeSendQueuedGetHeadersExt(*pto, *peer, GetTime());
     MaybeSendFeefilter(*pto, *peer, current_time);
     return true;
