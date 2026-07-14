@@ -489,6 +489,7 @@ public:
 private:
     // Helpers
     ValidationResponseValue RunLocalQuick(const CBlock& block);
+    bool TrySetLocalQuickSmellFinalHashFailure(const CBlock& block);
     bool TryFetchPublicStatusSync(const uint256& req_id, const ValidationReqType& req_type);
     bool TryFetchAuthStatusSync(const uint256& req_id, const ValidationReqType& req_type);
     uint16_t SendHttpRequest(const uint256& req_id,

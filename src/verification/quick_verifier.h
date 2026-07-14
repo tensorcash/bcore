@@ -53,6 +53,13 @@ public:
     VerificationResult QuickVerify(const CProofBlob& proof);
     VerificationResult QuickVerify(const CProofBlob& proof, bool enforce_reuse_entropy);
 
+    // Hash-only fast path for ingress sanity checks. This recomputes the
+    // target-critical sampling hash using the same byte layout as QuickVerify,
+    // including the v3 admission nonce when SetV3Context makes v3 active. It
+    // intentionally does not check model registration, header PoW, sequence
+    // replay, or smell; callers should use it only as a reject-only preflight.
+    bool VerifyFinalHashOnly(const CProofBlob& proof);
+
     // Version-keyed reuse-entropy gate. Passes (returns true) for legacy proofs
     // below REUSE_GATE_VERSION; runs the q32 reuse-score gate for v2+ proofs.
     bool VerifyReuseEntropy(const CProofBlob& proof);
