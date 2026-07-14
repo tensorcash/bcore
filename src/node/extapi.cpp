@@ -470,12 +470,16 @@ void ExtAPI::SolutionReceiverLoop() {
             // admission-band own-solution. Mirror RunLocalQuick / the submit
             // RPC: height = parent + 1 (dormant at -1 when the parent is
             // unknown), registered difficulty from modeldb.
+            const int proof_height = WITH_LOCK(::cs_main, {
+                const CBlockIndex* pprev = chainman.m_blockman.LookupBlockIndex(blockToProcess.hashPrevBlock);
+                return pprev ? pprev->nHeight + 1 : -1;
+            });
+            // Parent known => proof_height is the real connect height, so the v3
+            // rules below run with the correct (non-dormant) context and the
+            // quick verdict faithfully mirrors what ConnectBlock will decide.
+            const bool parent_known = proof_height >= 0;
             {
                 const auto& pb = blockToProcess.pow;
-                const int proof_height = WITH_LOCK(::cs_main, {
-                    const CBlockIndex* pprev = chainman.m_blockman.LookupBlockIndex(blockToProcess.hashPrevBlock);
-                    return pprev ? pprev->nHeight + 1 : -1;
-                });
                 int64_t v3_difficulty{0};
                 if (pb.version >= 3 && g_modeldb && !pb.model_identifier.empty()) {
                     ModelRecord rec;
@@ -487,10 +491,25 @@ void ExtAPI::SolutionReceiverLoop() {
             }
             // Run quick verification on the mining solution before submitting
             // Version-keyed: enforces the reuse gate iff pow.version >= REUSE_GATE_VERSION.
-            VerificationResult qvResult = quickVerifier.QuickVerify(blockToProcess.pow);
+            const VerificationResult qvResult = quickVerifier.QuickVerify(blockToProcess.pow);
             if (qvResult != VerificationResult::Quick_OK) {
                 LogWarning("Quick verification FAILED for mining solution (result=%d): %s\n",
                            static_cast<int>(qvResult), quickVerifier.GetLastError());
+                // Gate (was advisory): a quick-fail is a deterministic, model-free
+                // self-consistency reject (bad final hash / sequence / params) that
+                // ProcessNewBlock would also reject, so drop the hopeless solution
+                // here instead of dispatching it into ProcessNewBlock and the
+                // external Quick_Smell verifier — mirroring submit_mining_response's
+                // hard gate. Guarded on parent_known: when the parent is UNKNOWN the
+                // v3 rules above ran DORMANT (proof_height = -1), so a nonce-bearing
+                // build-ahead own solution would false-fail the nonce-less final-hash
+                // recomputation here; in that window stay advisory (fall through to
+                // ProcessNewBlock, exactly as before) so a valid build-ahead block is
+                // never dropped. Build-ahead normally has the parent header known, so
+                // this still gates the realistic hopeless-solution cases.
+                if (parent_known) {
+                    continue;
+                }
             } else {
                 LogPrintf("Quick verification passed for mining solution\n");
             }
