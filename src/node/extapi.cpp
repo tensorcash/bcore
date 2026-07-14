@@ -47,6 +47,16 @@ private:
 };
 } // namespace
 
+uint32_t MaxMiningWorkUnitsFromArgs()
+{
+    const int64_t value{gArgs.GetIntArg("-maxminingworkunits", DEFAULT_MAX_MINING_WORK_UNITS)};
+    if (value < 1) {
+        LogPrintf("Warning: -maxminingworkunits=%lld is below the minimum; using 1\n", static_cast<long long>(value));
+        return 1;
+    }
+    return static_cast<uint32_t>(std::min<int64_t>(value, std::numeric_limits<uint32_t>::max()));
+}
+
 ExtAPI::ExtAPI(NodeContext& node)
     : m_node{node},
       config{EnvConfig::fromEnvironment("MINER", 6000, 7000)},
@@ -65,6 +75,7 @@ ExtAPI::ExtAPI(NodeContext& node)
       requestTracker{},
       jobThread{},
       solThread{} {
+    requestTracker.setMaxOpenRequests(MaxMiningWorkUnitsFromArgs());
     if (m_broker_mode) {
         LogPrintf("ExtAPI initialized in compute-broker mode: sovereign startmining/startminingwithrotation are refused; MINER PUSH/PULL sockets will not be bound. Mining is driven by create_mining_work_unit / submit_mining_response RPCs.\n");
     } else {
