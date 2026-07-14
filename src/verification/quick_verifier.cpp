@@ -25,6 +25,19 @@ VerificationResult QuickVerifier::QuickVerify(const CProofBlob& proof) {
     return QuickVerify(proof, /*enforce_reuse_entropy=*/proof.version >= REUSE_GATE_VERSION);
 }
 
+bool QuickVerifier::VerifyFinalHashOnly(const CProofBlob& proof) {
+    m_lastError.clear();
+
+    // Same v3 applicability/nonce extraction as the full quick path. Without
+    // this, active v3 admission-band proofs would be recomputed without the
+    // claimed nonce and could be falsely rejected.
+    if (!PrepareV3(proof)) {
+        return false;
+    }
+
+    return VerifyFinalHash(proof);
+}
+
 VerificationResult QuickVerifier::QuickVerify(const CProofBlob& proof, bool enforce_reuse_entropy) {
     // Clear previous error
     m_lastError.clear();
@@ -114,6 +127,23 @@ bool QuickVerifier::VerifyReuseEntropy(const CProofBlob& proof) {
         return false;
     }
     if (!VerifyParameters(proof)) {
+        return false;
+    }
+
+    // Enforce the sampling/final-hash commitment on the consensus entry too
+    // (§5/§7: no quick-pass/full-fail gap). VerifySequenceLightVectorized below
+    // recomputes each step digest internally, so it catches a *nonce* that
+    // perturbs the u draws — but it never compares the proof's committed
+    // `hash` against the recomputation. Without this, a proof whose `hash` is
+    // decoupled from the sampling (arbitrary 32 bytes that still meet the
+    // header-PoW target, with an otherwise-valid sampling sequence) passes the
+    // in-node consensus check and is only caught by the external validator
+    // (the "Sampling hash inconsistent with recomputation" reject). Placed
+    // before the reuse-gate replay so a decoupled hash fails fast. Nonce-bound
+    // and v2-clean via PrepareV3 (m_v3Active / m_v3Nonce); grandfathered v1
+    // proofs never reach here (version < REUSE_GATE_VERSION returns early).
+    if (!VerifyFinalHash(proof)) {
+        // m_lastError already set by VerifyFinalHash ("Final hash mismatch").
         return false;
     }
 

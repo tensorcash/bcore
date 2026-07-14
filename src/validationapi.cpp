@@ -594,6 +594,49 @@ ValidationResponseValue ValidationAPI::RunLocalQuick(const CBlock& block)
     }
 }
 
+bool ValidationAPI::TrySetLocalQuickSmellFinalHashFailure(const CBlock& block)
+{
+    const CProofBlob& pb = block.pow;
+    const bool has_final_hash_fields =
+        !pb.chosen_tokens.empty() &&
+        pb.header_prefix.size() == 76 &&
+        !pb.hash.empty();
+    if (!has_final_hash_fields) {
+        return false;
+    }
+
+    QuickVerifier verifier;
+    {
+        const int proof_height = WITH_LOCK(::cs_main, {
+            const CBlockIndex* pprev = m_chainman.m_blockman.LookupBlockIndex(block.hashPrevBlock);
+            return pprev ? pprev->nHeight + 1 : -1;
+        });
+        if (proof_height < 0 &&
+            pb.version >= pow_v3::V3_PROOF_VERSION &&
+            pow_v3::extract_admission_nonce_hex(pb.extra_flags)) {
+            return false;
+        }
+        int64_t v3_difficulty{0};
+        if (pb.version >= 3 && g_modeldb && !pb.model_identifier.empty()) {
+            ModelRecord rec;
+            if (g_modeldb->ReadModel(pb.GetModelHash(), rec)) {
+                v3_difficulty = rec.metadata.difficulty;
+            }
+        }
+        verifier.SetV3Context(m_chainman.GetConsensus(), proof_height, v3_difficulty);
+    }
+
+    if (verifier.VerifyFinalHashOnly(pb)) {
+        return false;
+    }
+
+    LogWarning("VALIDATOR: Local final-hash precheck FAILED for %s: %s\n",
+               block.GetHash().ToString().c_str(), verifier.GetLastError().c_str());
+    SetRequestStatus(block.GetHash(), ValidationReqType::Quick_Smell,
+                     ValidationResponseValue::Quick_Fail_Smell_Fail);
+    return true;
+}
+
 bool ValidationAPI::Initialize() {
     try {
         // Validate configuration first
@@ -2571,6 +2614,10 @@ void ValidationAPI::SendApiRequest(const CBlock& block, const ValidationReqType&
         return;
     }
 
+    if (type == ValidationReqType::Quick_Smell && TrySetLocalQuickSmellFinalHashFailure(block)) {
+        return;
+    }
+
     // Desktop/http mode: run Quick locally and enqueue Full for HTTP worker
     if (UseLocalQuick() && type == ValidationReqType::Quick) {
         const auto status = RunLocalQuick(block);
@@ -2599,6 +2646,10 @@ void ValidationAPI::EnqueueApiRequest(const CBlock& block, const ValidationReqTy
     if (type != ValidationReqType::Quick && type != ValidationReqType::Quick_Smell &&
         type != ValidationReqType::Full && type != ValidationReqType::Challenge) {
         LogError("VALIDATOR: wrong request type\n");
+        return;
+    }
+
+    if (type == ValidationReqType::Quick_Smell && TrySetLocalQuickSmellFinalHashFailure(block)) {
         return;
     }
 

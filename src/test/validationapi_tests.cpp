@@ -16,6 +16,7 @@
 #include <netgroup.h>
 #include <boost/test/unit_test.hpp>
 #include <chainparams.h>
+#include <kernel/genesis_proof.h>
 #include <protocol.h>
 #include <tinyformat.h>
 #include <sync.h>
@@ -65,6 +66,38 @@ constexpr int kAmberRetryCount = 4;
 } // namespace
 
 BOOST_FIXTURE_TEST_SUITE(validationapi_tests, RegTestingSetup)
+
+BOOST_AUTO_TEST_CASE(quick_smell_enqueue_rejects_bad_final_hash_locally)
+{
+    auto api = MakeValidationApi(m_node);
+    CBlock block = MakeDummyBlock();
+    block.pow = g_genesisBlob;
+    block.pow.hash[0] ^= 0x01;
+
+    api.EnqueueApiRequest(block, ValidationReqType::Quick_Smell,
+                          ValidationResponseBehavior::Nothing);
+
+    ValidationResponseValue status{ValidationResponseValue::Not_Checked};
+    BOOST_REQUIRE(api.GetRequestStatus(block.GetHash(), ValidationReqType::Quick_Smell, status));
+    BOOST_CHECK_EQUAL(static_cast<int>(status),
+                      static_cast<int>(ValidationResponseValue::Quick_Fail_Smell_Fail));
+    BOOST_CHECK_EQUAL(api.GetQuickSmellQueueSize(), 0U);
+}
+
+BOOST_AUTO_TEST_CASE(quick_smell_enqueue_keeps_good_final_hash_remote_queued)
+{
+    auto api = MakeValidationApi(m_node);
+    CBlock block = MakeDummyBlock();
+    block.nNonce = 42;
+    block.pow = g_genesisBlob;
+
+    api.EnqueueApiRequest(block, ValidationReqType::Quick_Smell,
+                          ValidationResponseBehavior::Nothing);
+
+    ValidationResponseValue status{ValidationResponseValue::Not_Checked};
+    BOOST_CHECK(!api.GetRequestStatus(block.GetHash(), ValidationReqType::Quick_Smell, status));
+    BOOST_CHECK_EQUAL(api.GetQuickSmellQueueSize(), 1U);
+}
 
 BOOST_AUTO_TEST_CASE(start_amber_flow_skips_nothing_behavior)
 {

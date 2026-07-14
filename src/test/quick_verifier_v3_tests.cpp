@@ -146,6 +146,93 @@ void RecomputeFinalHashWithNonce(CProofBlob& blob, const std::array<uint8_t, 32>
 
 BOOST_FIXTURE_TEST_SUITE(quick_verifier_v3_tests, BasicTestingSetup)
 
+BOOST_AUTO_TEST_CASE(final_hash_only_rejects_sampling_hash_mismatch)
+{
+    CProofBlob proof = g_genesisBlob;
+    QuickVerifier verifier;
+
+    BOOST_REQUIRE_MESSAGE(verifier.VerifyFinalHashOnly(proof),
+                          "fixture final hash must verify: " + verifier.GetLastError());
+
+    proof.hash[0] ^= 0x01;
+    BOOST_CHECK(!verifier.VerifyFinalHashOnly(proof));
+    BOOST_CHECK_MESSAGE(verifier.GetLastError().find("Final hash mismatch") != std::string::npos,
+                        "unexpected error: " + verifier.GetLastError());
+}
+
+BOOST_AUTO_TEST_CASE(final_hash_only_uses_active_v3_nonce)
+{
+    const auto nonce = TestNonce();
+    CProofBlob v3 = g_genesisBlob;
+    v3.version = 3;
+    v3.extra_flags = pow_v3::merge_extra_flags_v3("", NonceHex(nonce));
+
+    const Consensus::Params params = V3Params(0, 0);
+    QuickVerifier verifier;
+    verifier.SetV3Context(params, /*height=*/0, TEST_MODEL_DIFFICULTY);
+
+    BOOST_CHECK(!verifier.VerifyFinalHashOnly(v3));
+    BOOST_CHECK_MESSAGE(verifier.GetLastError().find("Final hash mismatch") != std::string::npos,
+                        "unexpected error: " + verifier.GetLastError());
+
+    RecomputeFinalHashWithNonce(v3, nonce);
+    BOOST_CHECK_MESSAGE(verifier.VerifyFinalHashOnly(v3),
+                        "nonce-inclusive final hash must verify: " + verifier.GetLastError());
+}
+
+// §5/§7 — the gap this closes: a proof whose committed final hash is DECOUPLED
+// from its sampling (in prod, arbitrary bytes that still meet the header-PoW
+// target while the sampling sequence replays) is exactly the "Sampling hash
+// inconsistent with recomputation" reject the external validator emits. The
+// consensus-path entry VerifyReuseEntropy (ConnectBlock / ContextualCheckBlock)
+// now catches it in-node rather than deferring solely to the external
+// validator, closing the quick-pass/full-fail gap.
+BOOST_AUTO_TEST_CASE(v3_reuse_entropy_rejects_decoupled_final_hash)
+{
+    RegisterV3TestModel();
+    const Consensus::Params params = V3Params(/*floor=*/0, /*free=*/0); // free tier
+
+    // Control: the unmodified v3 proof (no nonce) is NOT rejected at the
+    // final-hash stage — its valid committed hash passes. Any later reuse-gate
+    // verdict is orthogonal and must never surface as "Final hash mismatch".
+    {
+        CProofBlob v3 = g_genesisBlob;
+        v3.version = 3;
+        QuickVerifier verifier;
+        verifier.SetV3Context(params, /*height=*/0, TEST_MODEL_DIFFICULTY);
+        (void)verifier.VerifyReuseEntropy(v3);
+        BOOST_CHECK_MESSAGE(verifier.GetLastError().find("Final hash mismatch") == std::string::npos,
+                            "valid final hash must not be rejected: " + verifier.GetLastError());
+    }
+
+    // Decoupled hash: flip one committed-hash byte and change nothing else, so
+    // the sampling sequence is untouched and would replay — yet the consensus
+    // entry now rejects at the final-hash commitment.
+    {
+        CProofBlob v3 = g_genesisBlob;
+        v3.version = 3;
+        v3.hash[0] ^= 0x01;
+        QuickVerifier verifier;
+        verifier.SetV3Context(params, /*height=*/0, TEST_MODEL_DIFFICULTY);
+        BOOST_CHECK(!verifier.VerifyReuseEntropy(v3));
+        BOOST_CHECK_MESSAGE(verifier.GetLastError().find("Final hash mismatch") != std::string::npos,
+                            "consensus entry must reject a decoupled final hash: " + verifier.GetLastError());
+    }
+
+    // Safety: a legacy proof (version < REUSE_GATE_VERSION) is grandfathered —
+    // all chain history is v1, so the newly-enforced check can never
+    // retroactively reject a historical block, even with a corrupt hash.
+    {
+        CProofBlob v1 = g_genesisBlob;
+        v1.version = 1;
+        v1.hash[0] ^= 0x01;
+        QuickVerifier verifier;
+        verifier.SetV3Context(params, /*height=*/0, TEST_MODEL_DIFFICULTY);
+        BOOST_CHECK_MESSAGE(verifier.VerifyReuseEntropy(v1),
+                            "grandfathered legacy proof must not be entropy-gated: " + verifier.GetLastError());
+    }
+}
+
 // Pre-activation heights and missing context leave version-3 proofs verified
 // byte-identically to v2; v2 proofs are untouched at ANY height (§1).
 BOOST_AUTO_TEST_CASE(v3_rules_dormant_pre_activation_and_for_v2)
@@ -348,13 +435,14 @@ BOOST_AUTO_TEST_CASE(v3_claimed_nonce_changes_every_u_and_final_hash)
         BOOST_CHECK_MESSAGE(verifier.GetLastError().find("Final hash mismatch") != std::string::npos,
                             "unexpected error: " + verifier.GetLastError());
     }
-    // Consensus-path entry (no final-hash check): the recomputed u values are
-    // nonce-perturbed, so replay fails at step 0 already.
+    // Consensus-path entry: the final-hash commitment is now enforced here
+    // too, so the nonce-less stored hash is rejected at the final-hash stage
+    // (before the u-replay, which — being nonce-perturbed — would also fail).
     {
         QuickVerifier verifier;
         verifier.SetV3Context(params, /*height=*/0, TEST_MODEL_DIFFICULTY);
         BOOST_CHECK(!verifier.VerifyReuseEntropy(v3));
-        BOOST_CHECK_MESSAGE(verifier.GetLastError().find("U value mismatch") != std::string::npos,
+        BOOST_CHECK_MESSAGE(verifier.GetLastError().find("Final hash mismatch") != std::string::npos,
                             "unexpected error: " + verifier.GetLastError());
     }
     // Without a v3 context the same extra_flags are inert (§3: v2 semantics
@@ -402,6 +490,7 @@ BOOST_AUTO_TEST_CASE(v3_inadmissible_nonce_rejects_in_every_tier)
     ForceGreedy(v3); // recomputed u values always land in the chosen bucket
     v3.extra_flags = pow_v3::merge_extra_flags_v3("", NonceHex(nonce));
     RecomputeUsWithNonce(v3, nonce);
+    RecomputeFinalHashWithNonce(v3, nonce); // pass the (now-enforced) final-hash check to reach admission
 
     // difficulty=1 => expected_tries = 5e7 => a fixed arbitrary nonce is
     // inadmissible (except with probability 2^-25 by construction).
@@ -442,6 +531,7 @@ BOOST_AUTO_TEST_CASE(v3_admissible_nonce_passes_admission)
     ForceGreedy(v3);
     v3.extra_flags = pow_v3::merge_extra_flags_v3("", NonceHex(nonce));
     RecomputeUsWithNonce(v3, nonce);
+    RecomputeFinalHashWithNonce(v3, nonce); // pass the (now-enforced) final-hash check to reach admission
 
     constexpr int64_t easy_difficulty{1000000000000LL}; // expected_tries == 1
 
@@ -467,6 +557,7 @@ BOOST_AUTO_TEST_CASE(v3_claimed_nonce_without_difficulty_rejects)
     ForceGreedy(v3);
     v3.extra_flags = pow_v3::merge_extra_flags_v3("", NonceHex(nonce));
     RecomputeUsWithNonce(v3, nonce);
+    RecomputeFinalHashWithNonce(v3, nonce); // pass the (now-enforced) final-hash check to reach admission
 
     const Consensus::Params params = V3Params(0, 0);
     QuickVerifier verifier;
