@@ -320,4 +320,66 @@ BOOST_AUTO_TEST_CASE(validate_mining_response_valid_then_stale_after_mark_submit
     BOOST_CHECK(extapi.ValidateMiningResponse(resp, duplicate_out, nullptr) == ExtAPI::MiningResponseDisposition::Stale);
 }
 
+BOOST_AUTO_TEST_CASE(request_tracker_default_cap_retains_pool_scale_work_units)
+{
+    // Regression: the tracker used a hard cap of 50, so a pool minting one
+    // work unit per connected miner per tip lost roughly half its solutions
+    // past 50 miners (evicted ids come back as unknown_req_id).
+    node::RequestTracker tracker;
+    const CBlock block;
+    std::vector<uint32_t> ids;
+    for (int i = 0; i < 105; ++i) {
+        ids.push_back(tracker.incrementAndStore(block));
+    }
+    for (const uint32_t id : ids) {
+        BOOST_CHECK(tracker.getRequestForSolution(id).state == node::RequestTracker::LookupState::Available);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(request_tracker_evicts_oldest_beyond_cap)
+{
+    node::RequestTracker tracker;
+    tracker.setMaxOpenRequests(3);
+    const CBlock block;
+    const uint32_t first = tracker.incrementAndStore(block);
+    const uint32_t second = tracker.incrementAndStore(block);
+    const uint32_t third = tracker.incrementAndStore(block);
+    const uint32_t fourth = tracker.incrementAndStore(block);
+
+    BOOST_CHECK(tracker.getRequestForSolution(first).state == node::RequestTracker::LookupState::Missing);
+    BOOST_CHECK(tracker.getRequestForSolution(second).state == node::RequestTracker::LookupState::Available);
+    BOOST_CHECK(tracker.getRequestForSolution(third).state == node::RequestTracker::LookupState::Available);
+    BOOST_CHECK(tracker.getRequestForSolution(fourth).state == node::RequestTracker::LookupState::Available);
+}
+
+BOOST_AUTO_TEST_CASE(request_tracker_lowered_cap_drains_backlog_on_next_insert)
+{
+    node::RequestTracker tracker;
+    const CBlock block;
+    std::vector<uint32_t> ids;
+    for (int i = 0; i < 5; ++i) {
+        ids.push_back(tracker.incrementAndStore(block));
+    }
+    tracker.setMaxOpenRequests(2);
+    const uint32_t last = tracker.incrementAndStore(block);
+
+    for (size_t i = 0; i + 1 < ids.size(); ++i) {
+        BOOST_CHECK(tracker.getRequestForSolution(ids[i]).state == node::RequestTracker::LookupState::Missing);
+    }
+    BOOST_CHECK(tracker.getRequestForSolution(ids.back()).state == node::RequestTracker::LookupState::Available);
+    BOOST_CHECK(tracker.getRequestForSolution(last).state == node::RequestTracker::LookupState::Available);
+}
+
+BOOST_AUTO_TEST_CASE(request_tracker_cap_clamps_to_minimum_of_one)
+{
+    node::RequestTracker tracker;
+    tracker.setMaxOpenRequests(0);
+    const CBlock block;
+    const uint32_t first = tracker.incrementAndStore(block);
+    const uint32_t second = tracker.incrementAndStore(block);
+
+    BOOST_CHECK(tracker.getRequestForSolution(first).state == node::RequestTracker::LookupState::Missing);
+    BOOST_CHECK(tracker.getRequestForSolution(second).state == node::RequestTracker::LookupState::Available);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

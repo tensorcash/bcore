@@ -1676,6 +1676,15 @@ static RPCHelpMan create_mining_work_unit()
         }
     }
 
+    // Apply -maxminingworkunits on first mint. g_broker_work_units is
+    // constructed at static init before args are parsed, and the cap only
+    // matters at insert time, so first-mint is early enough.
+    static const bool cap_configured{[] {
+        g_broker_work_units.setMaxOpenRequests(node::MaxMiningWorkUnitsFromArgs());
+        return true;
+    }()};
+    (void)cap_configured;
+
     // Register in broker tracker -> mint req_id.
     const uint32_t req_id = g_broker_work_units.incrementAndStore(block);
 

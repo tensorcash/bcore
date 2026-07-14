@@ -23,12 +23,23 @@
 #include <mutex>
 
 static const uint64_t DELAY_BETWEEN_MINING_REQUESTS{10000};
+// Default for -maxminingworkunits: outstanding work units tracked per
+// RequestTracker before the oldest is evicted. Must exceed the number of
+// work units minted per REQUEST_EXPIRY window, or solutions for evicted
+// units are rejected as unknown_req_id — a pool minting one unit per
+// connected miner per tip needs this above (miners x blocks per window).
+static const uint32_t DEFAULT_MAX_MINING_WORK_UNITS{1024};
 static const uint32_t MAX_REQUEST_ID{10000000}; // Prevent unbounded growth
 static_assert(MAX_REQUEST_ID > 1, "Static MAX_REQUEST_ID const must be greater than 1");
 static const uint32_t MAX_REQUEST_ID_RESET_VALUE{MAX_REQUEST_ID - 1}; // Prevent unbounded growth
 static const int ZMQ_TIMEOUT_MS{600000}; // 10 minutes
 
 namespace node {
+
+// -maxminingworkunits from gArgs, clamped to >= 1 (default
+// DEFAULT_MAX_MINING_WORK_UNITS). Shared by ExtAPI's tracker and the
+// broker work-unit tracker in rpc/mining.cpp.
+uint32_t MaxMiningWorkUnitsFromArgs();
 
 // Thread-safe request tracker
 class RequestTracker {
@@ -60,9 +71,17 @@ private:
     mutable std::shared_mutex mutex_;
     std::unordered_map<uint32_t, RequestEntry> requests_;
     uint32_t current_id_{0};
+    uint32_t max_open_{DEFAULT_MAX_MINING_WORK_UNITS};
     static constexpr auto REQUEST_EXPIRY = std::chrono::minutes(10);
 
 public:
+    // Bound on tracked entries before oldest-first eviction (-maxminingworkunits).
+    // Clamped to >= 1 so the entry minted by the current insert always survives it.
+    void setMaxOpenRequests(uint32_t max_open) {
+        std::unique_lock lock(mutex_);
+        max_open_ = std::max<uint32_t>(max_open, 1);
+    }
+
     uint32_t incrementAndStore(const CBlock& newRequest) {
         std::unique_lock lock(mutex_);
         
@@ -81,10 +100,15 @@ public:
         current_id_ = new_id;
         requests_[new_id] = RequestEntry{newRequest, now, RequestState::Open};
 
-        // Keep size bounded
-        if (requests_.size() > 50) {
+        // Keep size bounded: evict oldest first. Ties on created_at (bulk
+        // minting within one clock tick) break on id so eviction order is
+        // deterministic and follows insertion order.
+        while (requests_.size() > max_open_) {
             auto oldest = std::min_element(requests_.begin(), requests_.end(),
-                [](const auto& a, const auto& b) { return a.second.created_at < b.second.created_at; });
+                [](const auto& a, const auto& b) {
+                    if (a.second.created_at != b.second.created_at) return a.second.created_at < b.second.created_at;
+                    return a.first < b.first;
+                });
             requests_.erase(oldest);
         }
 
