@@ -191,6 +191,7 @@ add_executable(test_bitcoin
   ../verification/test/test_quick_verify.cpp
   vdf_verify_tests.cpp
   spv_hysteresis_tests.cpp
+  spv_tick_anchor_tests.cpp
   headers_ext_branch_negative_tests.cpp
   net_processing_headers_ext_smoke_tests.cpp
   net_processing_vdf_eviction_tests.cpp

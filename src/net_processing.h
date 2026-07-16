@@ -52,8 +52,19 @@ static const unsigned int MAX_HEADERS_RESULTS = 2000;
 static constexpr uint64_t DEFAULT_SPV_MIN_CUMULATIVE_TICK_PER_BLOCK{40000 * 9 * 60};
 /** Expected block cadence used to convert slack days into block slack. */
 static constexpr uint32_t DEFAULT_SPV_MIN_CUMULATIVE_TICK_BLOCK_SECONDS{9 * 60};
-/** Default slack before enforcing the cumulative VDF tick floor. */
-static constexpr uint32_t DEFAULT_SPV_MIN_CUMULATIVE_TICK_SLACK_DAYS{2};
+/** Default slack before enforcing the cumulative VDF tick floor.
+ *
+ *  The slack absorbs TRANSIENT accrual deficits without touching the floor's
+ *  slope (which is what bounds a fabricated from-genesis chain at height).
+ *  During difficulty catch-up, block intervals compress between retargets and
+ *  per-block tick accrual (fleet tick rate x interval) drops below the slope,
+ *  eating headroom: on tensor mainnet 2026-07 a sustained hashrate ramp cost
+ *  ~28B ticks of headroom in one 2016-block window and ~40B across the
+ *  episode -- the previous 2-day slack (320 blocks = 6.9B offset) would have
+ *  had default-configured nodes refusing the honest chain. 21 days
+ *  (3360 blocks = 72.6B offset at the default slope) covers ~1.9x that
+ *  episode as a constant, non-height-scaling discount. */
+static constexpr uint32_t DEFAULT_SPV_MIN_CUMULATIVE_TICK_SLACK_DAYS{21};
 
 struct CNodeStateStats {
     int nSyncHeight = -1;
@@ -74,6 +85,24 @@ struct CNodeStateStats {
 struct PeerManagerInfo {
     std::chrono::seconds median_outbound_time_offset{0s};
     bool ignores_incoming_txs{false};
+};
+
+/** SPV cumulative-tick gate state, for getspvtickinfo. */
+struct SpvTickInfo {
+    //! Configured floor slope (ticks/block; 0 = gate disabled) and slack days.
+    uint64_t min_cumulative_tick_per_block{0};
+    uint32_t min_cumulative_tick_slack_days{0};
+    //! Floor value at the queried height (saturated to uint64).
+    uint64_t floor_at_height{0};
+    //! EMA-based expected tick per block used by the hysteresis margin.
+    uint64_t expected_tick_per_block{0};
+    //! Sidecar cache occupancy: total entries, VALID entries, cum_set anchors.
+    uint64_t vdf_header_entries{0};
+    uint64_t vdf_header_valid{0};
+    uint64_t vdf_header_anchored{0};
+    //! Backfill queue depths: sum over per-peer queues + peer-agnostic staging.
+    uint64_t backfill_peer_total{0};
+    uint64_t backfill_staged_any{0};
 };
 
 class PeerManager : public CValidationInterface, public NetEventsInterface
@@ -154,6 +183,9 @@ public:
     /** Get statistics from node state */
     virtual bool GetNodeStateStats(NodeId nodeid, CNodeStateStats& stats) const = 0;
 
+    /** Get SPV cumulative-tick gate state; floor evaluated at the given height. */
+    virtual SpvTickInfo GetSpvTickInfo(int height) = 0;
+
     virtual std::vector<TxOrphanage::OrphanTxBase> GetOrphanTransactions() = 0;
 
     /** Get peer manager info. */
@@ -214,6 +246,18 @@ struct PeerAccess {
     static bool HasVdfHeader(const PeerManager& peerman, const uint256& hash);
     static void TrackVdfHeader(PeerManager& peerman, const uint256& hash, bool on_active, int64_t ts, uint64_t tick);
     static void RunVdfHeaderPrune(PeerManager& peerman);
+    static void ClearVdfHeaders(PeerManager& peerman);
+    //! Apply anchor updates staged by BlockConnected/BlockDisconnected (in
+    //! production this runs from SendMessages on the message thread).
+    static void DrainPendingAnchors(PeerManager& peerman);
+    //! Drive ComputeCumFromGenesis for the block index entry with this hash.
+    //! Returns {ok, cum_tick low64}.
+    static std::pair<bool, uint64_t> ComputeCumFromGenesis(PeerManager& peerman, const uint256& tip_hash);
+    //! Drive CollectMissingSidecarPath for the block index entry with this hash.
+    static std::vector<std::pair<uint256, uint256>> CollectMissingSidecarPath(PeerManager& peerman, const uint256& tip_hash, size_t max_items);
+    //! Queue (header, prev) pairs into a peer's GETHEADERS_EXT backlog.
+    static void QueueHeadersExt(PeerManager& peerman, NodeId nodeid, const std::vector<std::pair<uint256, uint256>>& queries);
+    static size_t HeadersExtBacklogSize(PeerManager& peerman, NodeId nodeid);
 };
 }
 
