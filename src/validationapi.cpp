@@ -118,6 +118,31 @@ std::optional<ParsedHttpUrl> ParseHttpBaseUrl(const std::string& raw)
     if (parsed.host.empty() || parsed.port.empty()) return std::nullopt;
     return parsed;
 }
+
+bool StatusMatchesRequestedType(ValidationResponseValue st, ValidationReqType ty)
+{
+    switch (ty) {
+    case ValidationReqType::Quick:
+        return st == ValidationResponseValue::Quick_OK ||
+               st == ValidationResponseValue::Quick_Fail;
+    case ValidationReqType::Quick_Smell:
+        return st == ValidationResponseValue::Quick_OK_Smell_OK ||
+               st == ValidationResponseValue::Quick_OK_Smell_Fail ||
+               st == ValidationResponseValue::Quick_Fail_Smell_OK ||
+               st == ValidationResponseValue::Quick_Fail_Smell_Fail;
+    case ValidationReqType::Full:
+        return st == ValidationResponseValue::Full_Green ||
+               st == ValidationResponseValue::Full_Amber ||
+               st == ValidationResponseValue::Full_Red;
+    case ValidationReqType::Challenge:
+        return st == ValidationResponseValue::Challenge_OK ||
+               st == ValidationResponseValue::Challenge_Fail;
+    case ValidationReqType::Model:
+        return st == ValidationResponseValue::Model_OK ||
+               st == ValidationResponseValue::Model_Fail;
+    }
+    return false;
+}
 }
 
 ValidationResponseValue ValidationAPI::BlockValidationDB::BlockValidationRecord_Quick::getQuick() const
@@ -866,7 +891,10 @@ bool ValidationAPI::TryFetchPublicStatusSync(const uint256& req_id, const Valida
         if (val == "Full_Green") return ValidationResponseValue::Full_Green;
         if (val == "Full_Amber") return ValidationResponseValue::Full_Amber;
         if (val == "Full_Red") return ValidationResponseValue::Full_Red;
-        if (val == "Failed") return ValidationResponseValue::Full_Red;
+        // NOTE: "Failed" is deliberately NOT mapped — it is a validator-side
+        // infrastructure failure, not a consensus verdict. Callers treat it as
+        // retryable/pending; mapping it to Full_Red would poison the block as
+        // consensus-red on an infra outage.
         if (val == "Challenge_OK") return ValidationResponseValue::Challenge_OK;
         if (val == "Challenge_Fail") return ValidationResponseValue::Challenge_Fail;
         if (val == "Model_OK") return ValidationResponseValue::Model_OK;
@@ -967,9 +995,21 @@ bool ValidationAPI::TryFetchPublicStatusSync(const uint256& req_id, const Valida
             if (status_str == "NAN" || status_str == "pending" || status_str == "Model_Pending_Review") {
                 return false;
             }
+            if (status_str == "Failed") {
+                LogWarning("VALIDATOR HTTP public status sync: id=%s type=%d reported Failed (infra); treating as retryable, not consensus-red\n",
+                           req_id.ToString().c_str(), static_cast<int>(req_type));
+                return false;
+            }
 
             auto status_opt = parse_status_value(status_str);
             if (!status_opt) {
+                continue;
+            }
+            if (!StatusMatchesRequestedType(*status_opt, req_type)) {
+                LogDebug(BCLog::VALIDATION,
+                         "VALIDATOR HTTP public status sync ignoring status %s incompatible with type=%d for id=%s via %s\n",
+                         status_str.c_str(), static_cast<int>(req_type),
+                         req_id.ToString().c_str(), base_url.c_str());
                 continue;
             }
 
@@ -1001,7 +1041,10 @@ bool ValidationAPI::TryFetchAuthStatusSync(const uint256& req_id, const Validati
         if (val == "Full_Green") return ValidationResponseValue::Full_Green;
         if (val == "Full_Amber") return ValidationResponseValue::Full_Amber;
         if (val == "Full_Red") return ValidationResponseValue::Full_Red;
-        if (val == "Failed") return ValidationResponseValue::Full_Red;
+        // NOTE: "Failed" is deliberately NOT mapped — it is a validator-side
+        // infrastructure failure, not a consensus verdict. Callers treat it as
+        // retryable/pending; mapping it to Full_Red would poison the block as
+        // consensus-red on an infra outage.
         if (val == "Challenge_OK") return ValidationResponseValue::Challenge_OK;
         if (val == "Challenge_Fail") return ValidationResponseValue::Challenge_Fail;
         if (val == "Model_OK") return ValidationResponseValue::Model_OK;
@@ -1018,35 +1061,6 @@ bool ValidationAPI::TryFetchAuthStatusSync(const uint256& req_id, const Validati
         case ValidationReqType::Model: return "model";
         default: return "unknown";
         }
-    };
-
-    // Reject any terminal whose status family does not match the verification
-    // type we asked for. Defence in depth: the validator's batch endpoint is
-    // expected to filter by verification_type, but a stale or buggy server
-    // could return a Full_Green for a Quick_Smell request, which would
-    // otherwise be stored under the wrong key.
-    auto status_matches_type = [](ValidationResponseValue st, ValidationReqType ty) -> bool {
-        switch (ty) {
-        case ValidationReqType::Quick:
-            return st == ValidationResponseValue::Quick_OK ||
-                   st == ValidationResponseValue::Quick_Fail;
-        case ValidationReqType::Quick_Smell:
-            return st == ValidationResponseValue::Quick_OK_Smell_OK ||
-                   st == ValidationResponseValue::Quick_OK_Smell_Fail ||
-                   st == ValidationResponseValue::Quick_Fail_Smell_OK ||
-                   st == ValidationResponseValue::Quick_Fail_Smell_Fail;
-        case ValidationReqType::Full:
-            return st == ValidationResponseValue::Full_Green ||
-                   st == ValidationResponseValue::Full_Amber ||
-                   st == ValidationResponseValue::Full_Red;
-        case ValidationReqType::Challenge:
-            return st == ValidationResponseValue::Challenge_OK ||
-                   st == ValidationResponseValue::Challenge_Fail;
-        case ValidationReqType::Model:
-            return st == ValidationResponseValue::Model_OK ||
-                   st == ValidationResponseValue::Model_Fail;
-        }
-        return false;
     };
 
     namespace http = boost::beast::http;
@@ -1180,11 +1194,16 @@ bool ValidationAPI::TryFetchAuthStatusSync(const uint256& req_id, const Validati
                 if (status_str == "NAN" || status_str == "pending" || status_str == "Model_Pending_Review") {
                     return false;
                 }
+                if (status_str == "Failed") {
+                    LogWarning("VALIDATOR HTTP submit-path probe: id=%s type=%d reported Failed (infra); treating as retryable, not consensus-red\n",
+                               req_id.ToString().c_str(), static_cast<int>(req_type));
+                    return false;
+                }
                 auto status_opt = parse_status_value(status_str);
                 if (!status_opt) {
                     return false;
                 }
-                if (!status_matches_type(*status_opt, req_type)) {
+                if (!StatusMatchesRequestedType(*status_opt, req_type)) {
                     LogDebug(BCLog::VALIDATION,
                              "VALIDATOR HTTP submit-path probe ignoring status %s incompatible with type=%d for id=%s via %s\n",
                              status_str.c_str(), static_cast<int>(req_type),
@@ -1254,18 +1273,15 @@ uint16_t ValidationAPI::SendHttpRequest(const uint256& req_id,
     // starved/stalled and stops applying batch results, which would otherwise
     // strand the request in an infinite submit-retry loop. Bounded by
     // http_config_.timeout per endpoint, so cannot hang JobSchedulerLoop.
-    if ((req_type == ValidationReqType::Quick || req_type == ValidationReqType::Quick_Smell) &&
-        HasHttpApiKey() && TryFetchAuthStatusSync(req_id, req_type)) {
+    if (HasHttpApiKey() && TryFetchAuthStatusSync(req_id, req_type)) {
         return 200;
     }
 
     if (!HasHttpApiKey()) {
-        if (req_type == ValidationReqType::Quick || req_type == ValidationReqType::Quick_Smell) {
-            if (TryFetchPublicStatusSync(req_id, req_type)) {
-                LogPrintf("VALIDATOR: public status hit id=%s type=%d; using synchronous public result\n",
-                          req_id.ToString(), static_cast<int>(req_type));
-                return 200;
-            }
+        if (TryFetchPublicStatusSync(req_id, req_type)) {
+            LogPrintf("VALIDATOR: public status hit id=%s type=%d; using synchronous public result\n",
+                      req_id.ToString(), static_cast<int>(req_type));
+            return 200;
         }
         LogPrintf("VALIDATOR: No API key for id=%s type=%d; skipping submit and polling public status\n",
                   req_id.ToString(), static_cast<int>(req_type));
@@ -1491,7 +1507,10 @@ ValidationResponseBehavior ValidationAPI::GettHttpStatus(uint256& req_id, Valida
         if (val == "Full_Green") return ValidationResponseValue::Full_Green;
         if (val == "Full_Amber") return ValidationResponseValue::Full_Amber;
         if (val == "Full_Red") return ValidationResponseValue::Full_Red;
-        if (val == "Failed") return ValidationResponseValue::Full_Red;
+        // NOTE: "Failed" is deliberately NOT mapped — it is a validator-side
+        // infrastructure failure, not a consensus verdict. Callers treat it as
+        // retryable/pending; mapping it to Full_Red would poison the block as
+        // consensus-red on an infra outage.
         if (val == "Challenge_OK") return ValidationResponseValue::Challenge_OK;
         if (val == "Challenge_Fail") return ValidationResponseValue::Challenge_Fail;
         if (val == "Model_OK") return ValidationResponseValue::Model_OK;
@@ -1708,9 +1727,28 @@ ValidationResponseBehavior ValidationAPI::GettHttpStatus(uint256& req_id, Valida
                 return ValidationResponseBehavior::Unknown;
             }
 
+            if (status_str == "Failed") {
+                // Validator-side infrastructure failure, not a consensus
+                // verdict. Leave outcome as nan_miss so the normal
+                // backoff/eviction ladder applies and the request stays
+                // deferred for future retries instead of storing Full_Red.
+                LogWarning("VALIDATOR HTTP public status: id=%s type=%d reported Failed (infra); treating as retryable, not consensus-red\n",
+                           item.id.ToString().c_str(), static_cast<int>(item.type));
+                return ValidationResponseBehavior::Unknown;
+            }
+
             auto status_opt = parse_status_value(status_str);
             if (!status_opt) {
                 outcome = PublicOutcome::transport_error;
+                return ValidationResponseBehavior::Unknown;
+            }
+            if (!StatusMatchesRequestedType(*status_opt, item.type)) {
+                // Wrong-family terminal for this request type: do not store it
+                // and do not clear the queue entry. Leave outcome as nan_miss
+                // so the per-item backoff/eviction ladder bounds the retries.
+                LogDebug(BCLog::VALIDATION,
+                         "VALIDATOR HTTP public status ignoring status %s incompatible with type=%d for id=%s\n",
+                         status_str.c_str(), static_cast<int>(item.type), item.id.ToString().c_str());
                 return ValidationResponseBehavior::Unknown;
             }
 
@@ -1936,6 +1974,19 @@ ValidationResponseBehavior ValidationAPI::GettHttpStatus(uint256& req_id, Valida
         LogPrintf("VALIDATOR HTTP status batch completed=%zu still_pending=%zu snapshot=%zu via %s\n",
                   completed.getValues().size(), still_pending_count, snapshot.size(), base_url.c_str());
 
+        // Entries the server reports as completed but that we refuse to store
+        // (infra "Failed", wrong-family statuses, unrequested keys). If the
+        // batch yields nothing else, returning nullopt lets the caller
+        // escalate the auth error backoff instead of resetting it — otherwise
+        // a persistently bad entry re-polls at the receiver loop's 50ms
+        // cadence forever.
+        bool saw_retryable = false;
+        // Only accept terminals for {hash_id, verification_type} keys we
+        // actually asked about in this batch: type_opt comes from the server
+        // response, so a buggy/stale server could otherwise answer a different
+        // type for the same hash (e.g. we asked {hash, quick-smell}, it
+        // answers {hash, full, Full_Green}) and pass the family gate.
+        const std::unordered_set<StatusKey, StatusKeyHasher> snapshot_keys(snapshot.begin(), snapshot.end());
         for (const UniValue& item : completed.getValues()) {
             const UniValue& hash_val = item.find_value("hash_id");
             const UniValue& type_val = item.find_value("verification_type");
@@ -1945,8 +1996,21 @@ ValidationResponseBehavior ValidationAPI::GettHttpStatus(uint256& req_id, Valida
             }
 
             const auto type_opt = parse_type_name(type_val.get_str());
+            if (status_val.get_str() == "Failed") {
+                LogWarning("VALIDATOR HTTP status batch: id=%s type=%s reported Failed (infra); treating as retryable, not consensus-red\n",
+                           hash_val.get_str().c_str(), type_val.get_str().c_str());
+                saw_retryable = true;
+                continue;
+            }
             const auto status_opt = parse_status_value(status_val.get_str());
             if (!type_opt || !status_opt) {
+                continue;
+            }
+            if (!StatusMatchesRequestedType(*status_opt, *type_opt)) {
+                LogDebug(BCLog::VALIDATION,
+                         "VALIDATOR HTTP status batch ignoring status %s incompatible with type=%s for id=%s\n",
+                         status_val.get_str().c_str(), type_val.get_str().c_str(), hash_val.get_str().c_str());
+                saw_retryable = true;
                 continue;
             }
 
@@ -1958,9 +2022,16 @@ ValidationResponseBehavior ValidationAPI::GettHttpStatus(uint256& req_id, Valida
                 continue;
             }
 
+            const StatusKey key{*id_opt, *type_opt};
+            if (snapshot_keys.count(key) == 0) {
+                LogWarning("VALIDATOR HTTP status batch ignoring unrequested completed entry id=%s type=%s status=%s via %s\n",
+                           hash_val.get_str().c_str(), type_val.get_str().c_str(),
+                           status_val.get_str().c_str(), base_url.c_str());
+                saw_retryable = true;
+                continue;
+            }
             req_id = *id_opt;
             req_type = *type_opt;
-            const StatusKey key{req_id, req_type};
 
             // Terminal response — clear any review-pending state
             {
@@ -1989,6 +2060,12 @@ ValidationResponseBehavior ValidationAPI::GettHttpStatus(uint256& req_id, Valida
             return behavior;
         }
 
+        if (saw_retryable) {
+            // Nothing usable came out of this batch and at least one entry was
+            // a refused terminal — signal failure so the caller escalates the
+            // auth backoff (500ms→10s) instead of resetting it to 0.
+            return std::nullopt;
+        }
         return ValidationResponseBehavior::Unknown;
     };
 
@@ -2659,6 +2736,16 @@ void ValidationAPI::EnqueueApiRequest(const CBlock& block, const ValidationReqTy
         return;
     }
 
+    // A cached Full_Amber (e.g. persisted before a restart) has no live
+    // corroboration flow, and the scheduler skips requests whose status
+    // already reads as present — so a deferred block would never converge.
+    // Kick the amber flow here; try_emplace makes this a no-op if the flow
+    // is already tracked, and StartAmberFlow ignores behavior == Nothing.
+    if (type == ValidationReqType::Full &&
+        static_cast<ValidationResponseValue>(GetOwnFullStatus(block.GetHash())) == ValidationResponseValue::Full_Amber) {
+        StartAmberFlow(block.GetHash(), block, behavior);
+    }
+
     uint256 req_id;
     if (requestTracker.makeNewRequest(block, type, req_id, behavior)) {
         if (UseHttpTransport()) {
@@ -3183,7 +3270,14 @@ void ValidationAPI::RecordPeerFullStatus(const uint256& id, const std::string& p
     {
         std::lock_guard<std::mutex> lock(amber_mutex_);
         auto it = amber_requests_.find(id);
-        if (it != amber_requests_.end() && ShouldFinalizeAmber(id, it->second, false)) {
+        // While a getheaders dispatch is in flight the expected-peer count is
+        // not yet recorded (expected_peers still 0), so a fast Red vote would
+        // finalize as if no peers had been polled. The vote itself was
+        // recorded above; it is re-evaluated on the next
+        // ProcessAmberRequests() pass or the next vote after the dispatch
+        // loop records expected_peers.
+        if (it != amber_requests_.end() && !it->second.dispatch_in_flight &&
+            ShouldFinalizeAmber(id, it->second, false)) {
             finalized.emplace(std::move(it->second));
             amber_requests_.erase(it);
         }
@@ -3269,11 +3363,14 @@ bool ValidationAPI::ShouldFinalizeAmber(const uint256& id, const AmberRequest& r
     return has_red || enough_amber || all_responded || force_finalize;
 }
 
-int ValidationAPI::DispatchAmberGetHeaders(const uint256& id, AmberRequest& request)
+int ValidationAPI::DispatchAmberGetHeaders(const uint256& id)
 {
+    // MUST be called without amber_mutex_ held: this takes cs_main for the
+    // locator, and block-processing paths call StartAmberFlow (amber_mutex_)
+    // while holding cs_main — dispatching under amber_mutex_ is an ABBA
+    // deadlock (observed as feature_validation_amber_http.py wedging).
     CConnman* connman = m_connman;
     if (!connman) {
-        request.expected_peers = 0;
         return 0;
     }
 
@@ -3288,7 +3385,6 @@ int ValidationAPI::DispatchAmberGetHeaders(const uint256& id, AmberRequest& requ
         connman->PushMessage(node, NetMsg::Make(NetMsgType::GETHEADERS, locator, id));
         ++dispatched;
     });
-    request.expected_peers = dispatched;
 
     if (dispatched == 0) {
         LogPrintf("VALIDATOR: Amber follow-up %s has no peers to query\n", id.ToString());
@@ -3302,6 +3398,7 @@ void ValidationAPI::ProcessAmberRequests()
 {
     std::vector<std::pair<uint256, AmberRequest>> finalize;
     std::vector<std::pair<uint256, AmberRequest>> revalidate;
+    std::vector<uint256> dispatch;
     const auto now = std::chrono::steady_clock::now();
 
     auto count_peer_votes = [](const BlockValidationDB::BlockValidationRecord_Full& record) {
@@ -3378,7 +3475,17 @@ void ValidationAPI::ProcessAmberRequests()
             bool dispatched_final_attempt = false;
             if (request.attempts < static_cast<int>(AMBER_RETRY_DELAYS.size()) && now >= request.next_send) {
                 const int attempt_index = request.attempts;
-                DispatchAmberGetHeaders(it->first, request);
+                // Defer the actual getheaders send to after amber_mutex_ is
+                // released: DispatchAmberGetHeaders takes cs_main, and
+                // cs_main holders call StartAmberFlow (amber_mutex_), so
+                // dispatching here inverts the lock order and deadlocks.
+                // Mark the dispatch as in flight until the post-mutex loop
+                // records the peer count: in that window expected_peers is
+                // still 0, and a fast peer response through
+                // RecordPeerFullStatus() would otherwise finalize as if no
+                // peers had been polled.
+                request.dispatch_in_flight = true;
+                dispatch.push_back(it->first);
                 const auto next_delay = AMBER_RETRY_DELAYS[std::min(attempt_index, static_cast<int>(AMBER_RETRY_DELAYS.size()) - 1)];
                 request.next_send = now + next_delay;
                 ++request.attempts;
@@ -3400,6 +3507,18 @@ void ValidationAPI::ProcessAmberRequests()
             }
 
             ++it;
+        }
+    }
+
+    for (const uint256& id : dispatch) {
+        const int dispatched = DispatchAmberGetHeaders(id);
+        std::lock_guard<std::mutex> lock(amber_mutex_);
+        auto it = amber_requests_.find(id);
+        if (it != amber_requests_.end()) {
+            it->second.expected_peers = dispatched;
+            // Clear even when dispatched == 0: the send-vs-record window is
+            // over, so vote-driven finalization may resume.
+            it->second.dispatch_in_flight = false;
         }
     }
 

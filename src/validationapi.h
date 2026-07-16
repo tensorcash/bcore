@@ -445,6 +445,12 @@ private:
         std::chrono::steady_clock::time_point next_send;
         int attempts{0};
         int expected_peers{0};
+        // Set while a getheaders dispatch has been queued but its peer count
+        // is not yet recorded in expected_peers (the send happens outside
+        // amber_mutex_). Peer votes must not finalize against an unrecorded
+        // expected-peer set: with expected_peers still 0 a single fast Red
+        // response would read as "no peers were polled" and finalize alone.
+        bool dispatch_in_flight{false};
         bool force_finalize{false};
         std::optional<std::chrono::steady_clock::time_point> finalize_deadline;
     };
@@ -515,7 +521,7 @@ private:
     void StartAmberFlow(const uint256& id, const CBlock& block, ValidationResponseBehavior behavior, ValidationResponseValue initial_status = ValidationResponseValue::Full_Amber);
     void ProcessAmberRequests();
     bool ShouldFinalizeAmber(const uint256& id, const AmberRequest& request, bool force_finalize) const;
-    int DispatchAmberGetHeaders(const uint256& id, AmberRequest& request);
+    int DispatchAmberGetHeaders(const uint256& id);
     void FinalizeAmber(const uint256& id, AmberRequest&& request);
 
     // std::unordered_map<uint256, ValidationResponseValue, Hasher> short_status_;

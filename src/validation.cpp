@@ -9287,6 +9287,16 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
             full_red_chainwork = true;
             LogPrintf("%s: Full %s is RED; accepting block data with zero local work contribution\n",
                       __func__, block.GetHash().ToString());
+        } else if (status == ValidationResponseValue::Full_Amber) {
+            // Amber is adjudication-in-progress, not a rejection. Defer like a
+            // missing verdict: re-enqueue so the scheduler (re)starts the amber
+            // flow with ProcessNewBlock behavior, and FinalizeAmber re-fires
+            // block processing once the verdict settles to Green/Red.
+            LogPrintf("%s: Full %s is AMBER (adjudication pending); deferring block\n",
+                      __func__, block.GetHash().ToString());
+            g_ValidationApi->EnqueueApiRequest(block, ValidationReqType::Full,
+                                               ValidationResponseBehavior::ProcessNewBlock);
+            return state.Error("full-validation-pending");
         } else if (status != ValidationResponseValue::Full_Green) {
             LogError("%s: Incorrect Full validation status %d\n", __func__, static_cast<uint8_t>(status));
             return false;
@@ -9760,6 +9770,14 @@ VerifyDBResult CVerifyDB::VerifyDB(
             {
                 LogPrintf("Full Verification warning: block at %d, hash=%s is RED locally; verifying stored data with zero work contribution\n",
                         pindex->nHeight, pindex->GetBlockHash().ToString());
+            }
+            else if (status == ValidationResponseValue::Full_Amber)
+            {
+                // Amber means adjudication (peer corroboration) is still in
+                // progress — it is not corruption. Proceed with local checks
+                // and let the amber flow finalize to Green/Red later.
+                LogPrintf("%s: Full %s is AMBER (adjudication pending) at height %d; proceeding with local checks\n",
+                          __func__, block.GetHash().ToString(), pindex->nHeight);
             }
             else if (status != ValidationResponseValue::Full_Green)
             {
