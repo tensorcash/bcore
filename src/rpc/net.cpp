@@ -1213,7 +1213,7 @@ static RPCHelpMan getspvtickinfo()
                 {RPCResult::Type::NUM, "cumulative_tick", "consensus cumulative tick at this block"},
                 {RPCResult::Type::BOOL, "gate_enabled", "whether the minimum cumulative tick floor is enforced (min_tick_per_block > 0)"},
                 {RPCResult::Type::NUM, "min_tick_per_block", "configured floor slope, ticks per block"},
-                {RPCResult::Type::NUM, "slack_days", "configured slack before the floor applies"},
+                {RPCResult::Type::NUM, "slack_days", "configured slack in days before the floor applies (default 13, sized to one 2016-block retarget window)"},
                 {RPCResult::Type::NUM, "floor", "floor value at this height"},
                 {RPCResult::Type::NUM, "headroom", "cumulative_tick - floor (negative = below floor)"},
                 {RPCResult::Type::NUM, "expected_tick_per_block", "EMA of observed tick per block (hysteresis expectation)"},
