@@ -211,11 +211,249 @@ class ReorgGatingTest(BitcoinTestFramework):
         self.sync_blocks(self.nodes, timeout=120)
         assert n0.getpendingreorg() is None
 
+    # ------------------------------------------------------------------
+    # Non-blocking mask-mode scenarios (§3.1 test matrix)
+    # ------------------------------------------------------------------
+
+    MASK_ARGS = [
+        "-reorgadvisory=1", "-reorgadvisorydepth=3", "-reorgadvisorygating=1",
+        "-reorgadvisorygatingdepth=3", "-reorgadvisorygatingmode=mask",
+        "-reorgadvisorytimeout=600", "-reorgadvisoryvetottl=600",
+        "-reorgadvisoryvetogrowth=2", "-checkblockindex=1",
+        "-spv-asn-corroboration=0",
+    ]
+
+    def _resync_nodes(self):
+        """Restart both nodes gating-off, reconnect and fully sync them."""
+        self.restart_node(0, extra_args=[
+            "-reorgadvisory=1", "-reorgadvisorydepth=3", "-reorgadvisorygating=0",
+            "-checkblockindex=1", "-spv-asn-corroboration=0"])
+        self.restart_node(1, extra_args=[
+            "-reorgadvisory=1", "-reorgadvisorydepth=3", "-spv-asn-corroboration=0"])
+        self.connect_nodes(0, 1)
+        self._clear_pending_if_any(self.nodes[0])
+        self.sync_all()
+
+    def _arm_mask_gate(self, extra_args=None):
+        """Sync, enable mask gating on node0, diverge 4 vs 7 and wait for the gate."""
+        n0, n1 = self.nodes
+        self._resync_nodes()
+        self.generate(n0, 20)
+        self.sync_all()
+        self.restart_node(0, extra_args=(extra_args or self.MASK_ARGS))
+        self.connect_nodes(0, 1)
+        self.sync_all()
+        self._build_divergent_chains(4, 7)
+        return self._wait_for_pending(n0)
+
+    def test_mask_liveness_while_gated(self):
+        self.log.info("Testing mask mode: node stays fully live while a gate is pending")
+        n0, n1 = self.nodes
+        self._arm_mask_gate()
+        n0_tip_before = n0.getbestblockhash()
+        pending = n0.getpendingreorg()
+        gate = pending["gates"][0]
+        assert_equal(gate["state"], "pending")
+        anchor = gate["anchor"]
+
+        # Block submission while gated: mining on the current tip must succeed
+        # promptly (the old blocking gate hung submitblock/ProcessNewBlock).
+        start = time.time()
+        mined = self.generate(n0, 1, sync_fun=self.no_op)
+        assert time.time() - start < 60
+        assert_equal(n0.getbestblockhash(), mined[-1])
+        # The gate is still armed and the node did not follow the candidate.
+        assert n0.getpendingreorg() is not None
+
+        # invalidateblock while gated must not block: emergency-kill the
+        # candidate subtree at its anchor.
+        start = time.time()
+        n0.invalidateblock(anchor)
+        assert time.time() - start < 60
+        assert_equal(n0.getbestblockhash(), mined[-1])
+
+        # reconsiderblock while gated must not block either. The operator RPC
+        # carries sign-off, so it may switch to the (heavier) candidate branch
+        # without re-prompting - same override semantics as
+        # test_operator_rpcs_not_gated.
+        start = time.time()
+        n0.reconsiderblock(anchor)
+        assert time.time() - start < 60
+        assert_equal(n0.getbestblockhash(), n1.getbestblockhash())
+
+    def test_mask_gate_pruned_on_operator_invalidate(self):
+        self.log.info("Testing mask mode: raw invalidateblock of the candidate branch prunes the gate immediately")
+        n0, n1 = self.nodes
+        pending = self._arm_mask_gate()
+        anchor = pending["gates"][0]["anchor"]
+
+        # Raw operator invalidateblock (no submitreorgdecision involved) of the
+        # candidate subtree anchor: the gate is moot and must disappear
+        # immediately - no decision-timeout or veto-TTL wait.
+        n0.invalidateblock(anchor)
+        assert n0.getpendingreorg() is None
+
+        # Undo for teardown: reconsider restores the branch; the operator RPC
+        # may switch to it (heavier) and any re-armed gate whose anchor lands
+        # on the active chain is pruned eagerly too.
+        n0.reconsiderblock(anchor)
+        assert n0.getpendingreorg() is None
+        assert_equal(n0.getbestblockhash(), n1.getbestblockhash())
+
+    def test_mask_gate_pruned_on_operator_force_active(self):
+        self.log.info("Testing mask mode: reconsiderblock forcing the gated branch active prunes the gate immediately")
+        n0, n1 = self.nodes
+        pending = self._arm_mask_gate()
+        anchor = pending["gates"][0]["anchor"]
+
+        # reconsiderblock on the (not invalid) anchor runs an operator-guarded
+        # ActivateBestChain that bypasses the mask and switches to the heavier
+        # candidate branch. The gate's anchor is now on the active chain, so
+        # the gate must be gone as soon as the RPC returns.
+        n0.reconsiderblock(anchor)
+        assert_equal(n0.getbestblockhash(), n1.getbestblockhash())
+        assert n0.getpendingreorg() is None
+
+    def test_mask_reject_suppression_and_growth_escape(self):
+        self.log.info("Testing mask mode: reject vetoes without re-prompt; growth/raw-work escape re-prompts once")
+        n0, n1 = self.nodes
+        self._arm_mask_gate()
+
+        res = n0.submitreorgdecision("reject")
+        assert res["success"]
+        gate_id = res["gate_id"]
+
+        # The veto is visible and the node stayed on its own chain.
+        pending = n0.getpendingreorg()
+        assert_equal(pending["gates"][0]["state"], "vetoed")
+        assert n0.getblockcount() < n1.getblockcount()
+
+        # Identical re-prompt suppression: re-evaluations without candidate
+        # growth (e.g. mining on our own tip re-runs fork choice) must not
+        # resurrect the prompt.
+        self.generate(n0, 1, sync_fun=self.no_op)
+        time.sleep(2)
+        pending = n0.getpendingreorg()
+        assert pending is not None
+        assert_equal(pending["gates"][0]["state"], "vetoed")
+        assert_equal(pending["gates"][0]["gate_id"], gate_id)
+
+        # Growth escape: the vetoed branch extends by >= vetogrowth (2) blocks
+        # (its raw-work margin over our tip grows too - either escape is a
+        # correct re-prompt trigger). The veto expires early and re-prompts
+        # exactly once, with a fresh gate.
+        self.generate(n1, 2, sync_fun=self.no_op)
+        self.wait_until(
+            lambda: n0.getpendingreorg() is not None
+            and any(g["state"] == "pending" for g in n0.getpendingreorg()["gates"]),
+            timeout=30)
+        new_gate = [g for g in n0.getpendingreorg()["gates"] if g["state"] == "pending"][0]
+        assert new_gate["gate_id"] != gate_id
+
+        # Accept the re-prompted gate: the branch activates.
+        res = n0.submitreorgdecision("accept", new_gate["gate_id"])
+        assert res["success"]
+        self.wait_until(lambda: n0.getpendingreorg() is None, timeout=30)
+        self.sync_blocks(self.nodes, timeout=120)
+        assert_equal(n0.getbestblockhash(), n1.getbestblockhash())
+
+    def test_mask_clear_veto_then_accept(self):
+        self.log.info("Testing mask mode: clearreorgveto lifts the veto, accept then activates the branch")
+        n0, n1 = self.nodes
+        self._arm_mask_gate()
+
+        res = n0.submitreorgdecision("reject")
+        assert res["success"]
+        assert_equal(n0.getpendingreorg()["gates"][0]["state"], "vetoed")
+
+        # Lift the veto: the branch may prompt again (clearreorgveto kicks a
+        # re-activation, so no new block is needed).
+        res = n0.clearreorgveto()
+        assert res["success"]
+        self.wait_until(
+            lambda: n0.getpendingreorg() is not None
+            and any(g["state"] == "pending" for g in n0.getpendingreorg()["gates"]),
+            timeout=30)
+
+        # Accept after veto-clear activates the branch.
+        res = n0.submitreorgdecision("accept")
+        assert res["success"]
+        self.wait_until(lambda: n0.getpendingreorg() is None, timeout=30)
+        self.sync_blocks(self.nodes, timeout=120)
+        assert_equal(n0.getbestblockhash(), n1.getbestblockhash())
+
+    def test_mask_direction_fields(self):
+        self.log.info("Testing getpendingreorg direction fields (raw vs effective work)")
+        n0, n1 = self.nodes
+        pending = self._arm_mask_gate()
+
+        gate = pending["gates"][0]
+        # Legacy single-gate mirror stays populated for runbook compatibility.
+        assert_equal(pending["pending"], True)
+        assert_equal(pending["candidate_tip"], gate["candidate_tip"])
+        assert_equal(pending["gate_count"], 1)
+
+        # The 7-block candidate is genuinely heavier in raw work than our
+        # 4-block branch and no policy demotion is involved.
+        assert int(gate["candidate_raw_work"], 16) > int(gate["current_raw_work"], 16)
+        assert_equal(gate["penalty_or_policy_driven"], False)
+        assert_equal(gate["candidate_has_data"], True)
+        assert_equal(gate["tip_demoted_by_full_red"], False)
+        # Our stale tip is off the best-header chain (the candidate is best).
+        assert_equal(gate["tip_on_best_header_chain"], False)
+        assert_equal(int(gate["current_penalty"], 16), 0)
+        assert_equal(int(gate["candidate_penalty"], 16), 0)
+
+        # Clean up: accept and settle both nodes on one chain.
+        n0.submitreorgdecision("accept")
+        self.wait_until(lambda: n0.getpendingreorg() is None, timeout=30)
+        self.sync_blocks(self.nodes, timeout=120)
+
+    def test_block_mode_clean_shutdown_mid_gate(self):
+        self.log.info("Testing block mode: clean bounded shutdown while a gate is pending")
+        n0, n1 = self.nodes
+        block_args = [
+            "-reorgadvisory=1", "-reorgadvisorydepth=3", "-reorgadvisorygating=1",
+            "-reorgadvisorygatingdepth=3", "-reorgadvisorygatingmode=block",
+            "-reorgadvisorytimeout=600", "-checkblockindex=1",
+            "-spv-asn-corroboration=0",
+        ]
+        self._arm_mask_gate(extra_args=block_args)
+
+        # The gate parks the validation thread (legacy behavior). Shutdown
+        # must still complete promptly via the interrupt-aware sliced wait -
+        # before this fix it hung for the full 600s decision timeout.
+        start = time.time()
+        self.stop_node(0)
+        assert time.time() - start < 60
+
+        # A restart clears the in-memory gate; the node must NOT have
+        # auto-accepted the reorg on the way down.
+        self.start_node(0, extra_args=[
+            "-reorgadvisory=1", "-reorgadvisorydepth=3", "-reorgadvisorygating=0",
+            "-checkblockindex=1", "-spv-asn-corroboration=0"])
+        assert n0.getpendingreorg() is None
+        assert n0.getblockcount() < n1.getblockcount()
+
+        # Reconnect with gating off and let the nodes settle for teardown.
+        self.connect_nodes(0, 1)
+        self.sync_blocks(self.nodes, timeout=120)
+
     def run_test(self):
         self.test_reject_path()
         self.test_accept_path()
         self.test_timeout_accept()
         self.test_operator_rpcs_not_gated()
+        self.test_mask_liveness_while_gated()
+        self.test_mask_gate_pruned_on_operator_invalidate()
+        self.test_mask_gate_pruned_on_operator_force_active()
+        self.test_mask_reject_suppression_and_growth_escape()
+        self.test_mask_clear_veto_then_accept()
+        self.test_mask_direction_fields()
+        self.test_block_mode_clean_shutdown_mid_gate()
+        # Runs last: it advances mocktime by 7h and mines blocks with future
+        # timestamps, after which a plain restart (no -mocktime) refuses to
+        # start on the "block from the future" startup check.
         self.test_offline_autofollow()
 
 

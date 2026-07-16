@@ -480,33 +480,113 @@ enum class ReorgDecision {
     NONE,    //!< No decision yet (pending)
     ACCEPT,  //!< Accept the reorg, switch to fork
     REJECT,  //!< Reject the reorg, stay on current chain
-    TIMEOUT  //!< Decision timed out, use default action
+    TIMEOUT, //!< Decision timed out, use default action
+    ABORT    //!< Shutdown interrupt: no decision, no approval, stay on current tip
 };
 
 /**
- * State of a pending reorg awaiting operator decision.
+ * How an armed gate constrains the node.
  */
-struct PendingReorgState {
-    //! Whether there's a pending reorg.
-    bool is_pending{false};
+enum class ReorgGatingMode {
+    BLOCK, //!< Legacy: park ActivateBestChain until decision (interrupt-aware)
+    MASK   //!< Non-blocking: exclude the gated subtree from fork choice, keep validating
+};
 
-    //! The advisory for this reorg.
+/**
+ * Gate lifecycle state.
+ */
+enum class ReorgGateState {
+    PENDING, //!< Awaiting an operator decision; candidate subtree masked (mask mode)
+    VETOED   //!< Operator REJECT: TTL-bound local veto with growth/raw-work escape
+};
+
+/**
+ * Classification of a gate's anchor for moot-gate pruning.
+ */
+enum class ReorgGateAnchorStatus {
+    KEEP,            //!< Anchor is live and off the active chain: the gate stands
+    INVALIDATED,     //!< Anchor carries BLOCK_FAILED_MASK: the candidate subtree can never be selected
+    ON_ACTIVE_CHAIN, //!< Anchor is on the active chain: the operator already followed the branch
+};
+
+/**
+ * Work comparison between the active tip and a gate's candidate, taken under
+ * cs_main. Raw work (CBlockIndex::nChainWorkRaw) is the never-policy-mutated
+ * consensus chainwork; policy work is nChainWork after Full_Red / challenge
+ * zero-work demotion, with nChainPenalty subtracted by the fork-choice
+ * comparator on top.
+ */
+struct ReorgGateWorkSnapshot {
+    arith_uint256 current_work{};        //!< Policy nChainWork of the active tip
+    arith_uint256 candidate_work{};      //!< Policy nChainWork of the candidate tip
+    arith_uint256 current_penalty{};     //!< nChainPenalty of the active tip
+    arith_uint256 candidate_penalty{};   //!< nChainPenalty of the candidate tip
+    arith_uint256 current_raw_work{};    //!< nChainWorkRaw of the active tip
+    arith_uint256 candidate_raw_work{};  //!< nChainWorkRaw of the candidate tip
+
+    //! Candidate wins on policy-effective work but does not win on raw work:
+    //! the reorg is manufactured by local penalty/policy demotion, not by
+    //! genuine consensus work. Such a candidate must never be auto-accepted.
+    bool penalty_or_policy_driven{false};
+};
+
+/**
+ * One reorg gate, keyed by {fork point, candidate subtree anchor}. The anchor
+ * is the fork-point child on the candidate branch: the branch keeps growing
+ * while gated, so every extension stays covered by the same gate until a
+ * decision (or, for a veto, until the growth / raw-work escape fires). Same
+ * anchoring discipline as ReorgApprovalState.
+ */
+struct ReorgGateEntry {
+    //! Monotonic identifier; RPC decisions target a gate by id so a decision
+    //! can never hit the wrong fork when multiple gates exist.
+    uint64_t gate_id{0};
+
+    //! Generation nonce, bumped by every operator decision. A scheduler
+    //! timeout may only transition the gate if its armed generation still
+    //! matches, which makes timeout-vs-operator races no-ops by construction.
+    uint64_t generation{0};
+
+    ReorgGateState gate_state{ReorgGateState::PENDING};
+
+    //! The advisory computed when the gate was armed.
     ReorgAdvisory advisory;
-
-    //! Hash of the candidate (fork) tip.
-    uint256 candidate_tip_hash;
-
-    //! Hash of the current tip at time of detection.
-    uint256 current_tip_hash;
 
     //! Hash of the fork point (last common ancestor of current and candidate tips).
     uint256 fork_point_hash;
 
-    //! Timestamp when the pending state was set.
+    //! Hash of the candidate subtree anchor (fork-point child on the candidate branch).
+    uint256 anchor_hash;
+
+    //! Hash of the candidate (fork) tip when the gate was last armed/refreshed.
+    uint256 candidate_tip_hash;
+
+    //! Height of that candidate tip (growth-escape baseline bookkeeping).
+    int candidate_height{0};
+
+    //! Hash of the active tip at time of detection.
+    uint256 current_tip_hash;
+
+    //! Work comparison at arm/refresh time.
+    ReorgGateWorkSnapshot work;
+
+    //! Timestamp when the gate was armed.
     int64_t pending_since{0};
 
-    //! The operator's decision (NONE while pending).
+    //! The operator's decision (NONE while pending; consumed by the BLOCK-mode waiter).
     ReorgDecision decision{ReorgDecision::NONE};
+
+    // Veto state (gate_state == VETOED).
+    //! Timestamp when the veto was recorded.
+    int64_t vetoed_at{0};
+    //! Candidate tip height at veto time; the veto escapes early when the
+    //! branch extends >= veto_growth_blocks beyond this.
+    int veto_candidate_height{0};
+    //! Whether the candidate led the tip on raw work at veto time.
+    bool veto_margin_positive{false};
+    //! Raw-work margin of the candidate over the tip at veto time; the veto
+    //! escapes early when the live margin grows past this baseline.
+    arith_uint256 veto_raw_margin{};
 };
 
 /**
@@ -562,6 +642,19 @@ constexpr int64_t DEFAULT_REORG_AUTOFOLLOW_MIN_FIRST_BLOCK_DELAY_SECS = 20 * 60;
 //! Default validity window for a recorded reorg approval (1 hour).
 constexpr int64_t DEFAULT_REORG_APPROVAL_TTL_SECS = 60 * 60;
 
+//! Default gating mode. MASK keeps every validation thread live: a gated
+//! branch is excluded from fork choice until a decision instead of parking
+//! ActivateBestChain. BLOCK is the one-release escape hatch back to the old
+//! parked behavior (with an interrupt-aware wait).
+constexpr ReorgGatingMode DEFAULT_REORG_GATING_MODE = ReorgGatingMode::MASK;
+
+//! Default TTL for an operator REJECT veto (1 hour), clamped like the approval TTL.
+constexpr int64_t DEFAULT_REORG_VETO_TTL_SECS = 60 * 60;
+
+//! Default growth escape: a vetoed branch that extends this many blocks past
+//! its length at veto time escapes the veto early and re-prompts (once).
+constexpr int DEFAULT_REORG_VETO_GROWTH_BLOCKS = 6;
+
 /**
  * Gating configuration read from command-line args.
  */
@@ -593,6 +686,15 @@ struct ReorgGatingConfig {
 
     //! How long a recorded ACCEPT keeps covering later segments of the same reorg.
     int64_t approval_ttl_secs{DEFAULT_REORG_APPROVAL_TTL_SECS};
+
+    //! Whether the gate constrains fork choice (MASK) or parks activation (BLOCK).
+    ReorgGatingMode gating_mode{DEFAULT_REORG_GATING_MODE};
+
+    //! How long an operator REJECT veto masks the branch before it may re-prompt.
+    int64_t veto_ttl_secs{DEFAULT_REORG_VETO_TTL_SECS};
+
+    //! Blocks of growth beyond the veto-time candidate tip that escape the veto early.
+    int veto_growth_blocks{DEFAULT_REORG_VETO_GROWTH_BLOCKS};
 };
 
 /**
@@ -601,20 +703,78 @@ struct ReorgGatingConfig {
 ReorgGatingConfig GetReorgGatingConfig();
 
 /**
- * Thread-safe manager for pending reorg decisions.
- * Coordinates between validation (which blocks) and RPC/UI (which submits decisions).
+ * Thread-safe manager for reorg gates.
+ *
+ * Holds a keyed map {fork point, anchor} -> gate entry. In MASK mode no
+ * validation thread ever waits: FindMostWorkChain skips candidates that
+ * descend through a pending/vetoed anchor at selection time, and decisions
+ * (operator RPC, scheduler timeout) transition gates under m_mutex and kick
+ * ActivateBestChain from the scheduler thread. In BLOCK mode the legacy
+ * parked wait is kept, sliced into 1s ticks with an interrupt check.
+ *
+ * Gates, vetoes and masks are in-memory only: a restart clears them and may
+ * re-prompt for a still-live gated branch, but never auto-accepts one.
  */
 class ReorgGatingManager
 {
+public:
+    //! Outcome of resolving/applying an operator action against the gate map.
+    enum class SubmitStatus {
+        OK,           //!< Action applied
+        NO_GATE,      //!< No gate exists (or none in the required state)
+        UNKNOWN_GATE, //!< gate_id does not match any live gate
+        AMBIGUOUS,    //!< Bare form used while multiple gates are live
+        BAD_STATE     //!< Gate exists but is not in a state this action applies to
+    };
+
 private:
+    //! Gate key: {fork point hash, candidate subtree anchor hash}.
+    using GateKey = std::pair<uint256, uint256>;
+
     mutable Mutex m_mutex;
     std::condition_variable m_cv;
-    PendingReorgState m_pending GUARDED_BY(m_mutex);
+    std::map<GateKey, ReorgGateEntry> m_gates GUARDED_BY(m_mutex);
+    uint64_t m_next_gate_id GUARDED_BY(m_mutex){1};
+    uint64_t m_next_generation GUARDED_BY(m_mutex){1};
     ReorgApprovalState m_approval GUARDED_BY(m_mutex);
     ReorgGatingConfig m_config;
 
+    //! Scheduler hooks, wired at init; absent in unit tests (no timers fire,
+    //! tests drive HandleTimeout directly).
+    std::function<void(std::function<void()>, int64_t)> m_schedule_fn GUARDED_BY(m_mutex);
+    //! Runs ActivateBestChain after a gate clears. Executed on the dedicated
+    //! kick thread, NEVER on the scheduler thread: the scheduler drains the
+    //! validation-interface queue (SerialTaskRunner), and ActivateBestChain
+    //! waits on that queue, so running it there self-deadlocks.
+    std::function<void()> m_kick_fn GUARDED_BY(m_mutex);
+    //! Fresh work snapshot (takes cs_main) for decision-time guardrails.
+    std::function<std::optional<ReorgGateWorkSnapshot>(const uint256&)> m_snapshot_fn GUARDED_BY(m_mutex);
+
+    //! Dedicated one-task worker that runs m_kick_fn off both the RPC and
+    //! scheduler threads. Started by SetAsyncHooks, joined by ResetAsyncHooks
+    //! (i.e. before the chainman the kick references is torn down).
+    std::thread m_kick_thread;
+    bool m_kick_requested GUARDED_BY(m_mutex){false};
+    bool m_kick_stop GUARDED_BY(m_mutex){false};
+
+    void KickWorker();
+
+    ReorgGateEntry* FindGateById(uint64_t gate_id) EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
+    //! Resolve an optional gate_id to a live gate (bare form allowed only when
+    //! exactly one gate exists).
+    std::pair<SubmitStatus, ReorgGateEntry*> ResolveGate(const std::optional<uint64_t>& gate_id)
+        EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
+    void RecordApprovalFromEntry(const ReorgGateEntry& entry) EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
+    void ConvertToVeto(ReorgGateEntry& entry, const char* origin) EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
+    void ArmTimeout(uint64_t gate_id, uint64_t generation);
+
 public:
     ReorgGatingManager();
+    //! Test constructor: fixed config, never reads gArgs.
+    explicit ReorgGatingManager(const ReorgGatingConfig& config);
+    //! Joins the kick thread if ResetAsyncHooks was never reached (a joinable
+    //! std::thread at destruction would std::terminate).
+    ~ReorgGatingManager();
 
     /**
      * Check if gating is enabled.
@@ -622,60 +782,151 @@ public:
     bool IsEnabled() const;
 
     /**
-     * Set a pending reorg awaiting operator decision.
-     * Called from ActivateBestChainStep when a deep reorg is detected.
+     * The configured gating mode (BLOCK or MASK).
+     */
+    ReorgGatingMode GatingMode() const;
+
+    /**
+     * Wire the scheduler/chainstate hooks. Called once at init after the
+     * scheduler and chainman exist; reset before they are torn down.
+     */
+    void SetAsyncHooks(std::function<void(std::function<void()>, int64_t)> schedule_fn,
+                       std::function<void()> kick_fn,
+                       std::function<std::optional<ReorgGateWorkSnapshot>(const uint256&)> snapshot_fn);
+    void ResetAsyncHooks();
+
+    /**
+     * Arm (or refresh) the gate for {fork_point, anchor}. Idempotent: an
+     * existing entry keeps its gate_id/generation and only refreshes the
+     * candidate tip/advisory/work snapshot; a vetoed entry is left untouched.
+     * In MASK mode a newly armed gate also arms its scheduler timeout.
      *
-     * @param advisory The computed advisory.
-     * @param candidate_tip_hash Hash of the fork tip.
-     * @param current_tip_hash Hash of current active tip.
-     * @param fork_point_hash Hash of the fork point (last common ancestor).
+     * @return gate_id of the (new or existing) gate.
      */
-    void SetPending(const ReorgAdvisory& advisory,
-                    const uint256& candidate_tip_hash,
-                    const uint256& current_tip_hash,
-                    const uint256& fork_point_hash);
+    uint64_t SetPending(const ReorgAdvisory& advisory,
+                        const uint256& candidate_tip_hash,
+                        int candidate_height,
+                        const uint256& current_tip_hash,
+                        const uint256& fork_point_hash,
+                        const uint256& anchor_hash,
+                        const ReorgGateWorkSnapshot& work);
 
     /**
-     * Get the current pending state.
-     * Returns a copy to avoid holding the lock.
+     * Snapshot of all live gates (pending and vetoed), gate_id ascending.
      */
-    PendingReorgState GetPending() const;
+    std::vector<ReorgGateEntry> GetGates() const;
 
     /**
-     * Check if there's a pending decision.
+     * Copy of a single gate by id, if live.
+     */
+    std::optional<ReorgGateEntry> GetGate(uint64_t gate_id) const;
+
+    /**
+     * {gate_id, anchor hash} of every live gate. Cheap accessor for the
+     * FindMostWorkChain selection loop (GetGates copies full advisories).
+     */
+    std::vector<std::pair<uint64_t, uint256>> GetGateAnchors() const;
+
+    /**
+     * Number of live gates (pending and vetoed).
+     */
+    size_t GateCount() const;
+
+    /**
+     * Check if any gate is awaiting an operator decision.
      */
     bool HasPending() const;
 
     /**
-     * Submit an operator decision (accept or reject).
-     * Wakes up any thread blocked on WaitForDecision.
+     * Submit an operator decision (ACCEPT or REJECT) for one gate.
+     * Bare form (no gate_id) is sugar allowed only when exactly one gate is
+     * live. In MASK mode the transition is applied inline: ACCEPT records the
+     * durable approval, drops the gate and kicks ActivateBestChain; REJECT
+     * converts the gate to a TTL veto. In BLOCK mode the parked waiter applies
+     * the transition. Idempotent: a decision against a gate that already
+     * transitioned reports UNKNOWN_GATE and changes nothing. Every operator
+     * decision bumps the gate generation, so a stale armed timeout is a no-op.
      *
-     * @param decision The decision (ACCEPT or REJECT).
-     * @return true if decision was accepted (there was a pending reorg).
+     * @param[out] out_gate_id The resolved gate id (set on OK).
      */
-    bool SubmitDecision(ReorgDecision decision);
+    SubmitStatus SubmitDecision(const std::optional<uint64_t>& gate_id, ReorgDecision decision,
+                                uint64_t* out_gate_id = nullptr);
 
     /**
-     * Wait for an operator decision or timeout.
-     * Called from ActivateBestChainStep to block until decision.
+     * Drop a VETOED gate so the branch may re-prompt on the next activation.
+     * Kicks ActivateBestChain so the re-prompt does not wait for a new block.
+     */
+    SubmitStatus ClearVeto(const std::optional<uint64_t>& gate_id, uint64_t* out_gate_id = nullptr);
+
+    /**
+     * Drop a gate unconditionally (any state). Safe to call for an id that no
+     * longer exists.
      *
-     * @return The decision (ACCEPT, REJECT, or TIMEOUT).
+     * @return true if a gate was removed.
      */
-    ReorgDecision WaitForDecision();
+    bool RemoveGate(uint64_t gate_id, const std::string& reason);
 
     /**
-     * Clear the pending state.
-     * Called after the decision has been processed.
+     * Sweep gates (pending and vetoed) whose anchor the classifier reports as
+     * moot: INVALIDATED (the operator marked the anchor or an ancestor
+     * BLOCK_FAILED, so the candidate subtree can never be selected) or
+     * ON_ACTIVE_CHAIN (the operator already forced the branch active). The
+     * classifier runs without the gate mutex held, so it may take cs_main.
+     *
+     * @return number of gates removed.
      */
-    void ClearPending();
+    size_t PruneMootGates(const std::function<ReorgGateAnchorStatus(const uint256& anchor_hash)>& classify);
 
     /**
-     * Record a durable approval from the current pending reorg.
+     * BLOCK mode only: wait for an operator decision, timeout, or interrupt
+     * on the sole pending gate. The wait is sliced into 1s ticks; when
+     * interrupted() reports true the wait aborts WITHOUT deciding and returns
+     * ABORT (callers must clear the gate and stay on the current tip).
+     *
+     * @return ACCEPT, REJECT, TIMEOUT, ABORT, or NONE if no gate is pending.
+     */
+    ReorgDecision WaitForDecision(const std::function<bool()>& interrupted);
+
+    /**
+     * MASK mode selection-time check for one gate. PENDING gates always mask,
+     * and are refreshed from the live candidate seen here (the mask prevents
+     * ActivateBestChainStep from re-arming the gate, so this is where the
+     * gate tracks the growing branch the operator will decide on). A VETOED
+     * gate masks until its TTL expires or an escape fires (branch extended
+     * >= veto_growth_blocks, or its raw-work margin over the tip grew past
+     * the veto-time baseline); an expired/escaped veto is dropped here so the
+     * branch re-prompts (once) through ActivateBestChainStep.
+     *
+     * @return true if candidates descending through this gate's anchor must be
+     *         skipped by FindMostWorkChain.
+     */
+    bool EvaluateMask(uint64_t gate_id, const uint256& candidate_hash, int candidate_height,
+                      const arith_uint256& candidate_raw_work,
+                      const arith_uint256& tip_raw_work);
+
+    /**
+     * Scheduler timeout for a MASK-mode gate. Transitions the gate only if it
+     * is still PENDING and its generation matches the one the timer was armed
+     * with (an operator decision bumps the generation, so a stale timer is a
+     * no-op). Default action is veto-REJECT; with timeout_accept=1 the gate
+     * auto-accepts only when TimeoutAcceptAllowed passes on a fresh work
+     * snapshot, and vetoes otherwise.
+     */
+    void HandleTimeout(uint64_t gate_id, uint64_t generation);
+
+    /**
+     * BLOCK mode: record a durable approval from the sole gate.
      * Called on ACCEPT (operator or timeout-accept) BEFORE ClearPending, so
      * that later segments of the same reorg skip the gate instead of
      * re-prompting the operator once per segment.
      */
     void RecordApprovalFromPending();
+
+    /**
+     * BLOCK mode: drop the sole gate after its decision has been processed
+     * (or on interrupt, without any decision).
+     */
+    void ClearPending();
 
     /**
      * Get the recorded approval, if any.
@@ -695,16 +946,51 @@ public:
     void ReloadConfig();
 
     /**
-     * Get remaining time until timeout (seconds).
-     * Returns 0 if no pending or already timed out.
+     * Get remaining time until timeout (seconds) for the oldest pending gate.
+     * Returns 0 if no pending gate or already timed out.
      */
     int64_t GetTimeoutRemaining() const;
+
+    /**
+     * §3.5 timeout-accept guardrail: a timeout may auto-accept only a
+     * candidate that is strictly heavier in RAW consensus work and not
+     * penalty/policy-driven. Everything else times out as veto-REJECT.
+     */
+    static bool TimeoutAcceptAllowed(const ReorgGateWorkSnapshot& work);
 };
 
 /**
  * Global reorg gating manager instance.
  */
 ReorgGatingManager& GetReorgGatingManager();
+
+/**
+ * Work comparison between two block indexes (active tip vs candidate tip).
+ * Uses the policy comparator for the effective-work side and nChainWorkRaw for
+ * the raw side, so penalty_or_policy_driven is exactly "candidate wins on
+ * effective work but not on raw work".
+ */
+ReorgGateWorkSnapshot ComputeReorgGateWorkSnapshot(const CBlockIndex& current_tip,
+                                                   const CBlockIndex& candidate_tip);
+
+/**
+ * Fresh snapshot of a candidate against the CURRENT active tip; nullopt when
+ * either index is unavailable. Requires cs_main.
+ */
+std::optional<ReorgGateWorkSnapshot> ComputeReorgGateWorkSnapshot(ChainstateManager& chainman,
+                                                                  const uint256& candidate_tip_hash)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
+/**
+ * Eagerly drop gates made moot by an operator chain action: anchor (or an
+ * ancestor) marked BLOCK_FAILED by invalidateblock, or anchor forced onto the
+ * active chain by reconsiderblock. Called from the operator RPC wrappers
+ * after the chain action and ActivateBestChain complete, so a dead gate never
+ * lingers in getpendingreorg until timeout/TTL. The lazy check in
+ * Chainstate::IsReorgGateMaskedCandidate remains as a backstop.
+ * Lock order: cs_main outer, gate mutex inner.
+ */
+void PruneMootReorgGates(ChainstateManager& chainman) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
 /**
  * Check if a reorg should be gated (require operator decision).

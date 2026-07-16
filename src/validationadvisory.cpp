@@ -759,11 +759,30 @@ ReorgGatingConfig GetReorgGatingConfig()
     config.autofollow_min_first_block_delay_secs = gArgs.GetIntArg("-reorgadvisoryautofollowmindelay", DEFAULT_REORG_AUTOFOLLOW_MIN_FIRST_BLOCK_DELAY_SECS);
     config.approval_ttl_secs = gArgs.GetIntArg("-reorgadvisoryapprovalttl", DEFAULT_REORG_APPROVAL_TTL_SECS);
 
+    // Anything other than the explicit legacy escape hatch selects the
+    // non-blocking mask: an operator typo must not silently re-enable thread
+    // parking.
+    const std::string mode_str{gArgs.GetArg("-reorgadvisorygatingmode",
+                                            DEFAULT_REORG_GATING_MODE == ReorgGatingMode::MASK ? "mask" : "block")};
+    if (mode_str == "block") {
+        config.gating_mode = ReorgGatingMode::BLOCK;
+    } else {
+        if (mode_str != "mask") {
+            LogPrintf("REORG GATING: Unknown -reorgadvisorygatingmode=%s; using 'mask'.\n", mode_str);
+        }
+        config.gating_mode = ReorgGatingMode::MASK;
+    }
+    config.veto_ttl_secs = gArgs.GetIntArg("-reorgadvisoryvetottl", DEFAULT_REORG_VETO_TTL_SECS);
+    config.veto_growth_blocks = gArgs.GetIntArg("-reorgadvisoryvetogrowth", DEFAULT_REORG_VETO_GROWTH_BLOCKS);
+
     // Clamp timeout to reasonable range (1 minute to 24 hours)
     if (config.timeout_secs < 60) config.timeout_secs = 60;
     if (config.timeout_secs > 24 * 60 * 60) config.timeout_secs = 24 * 60 * 60;
     if (config.approval_ttl_secs < 60) config.approval_ttl_secs = 60;
     if (config.approval_ttl_secs > 24 * 60 * 60) config.approval_ttl_secs = 24 * 60 * 60;
+    if (config.veto_ttl_secs < 60) config.veto_ttl_secs = 60;
+    if (config.veto_ttl_secs > 24 * 60 * 60) config.veto_ttl_secs = 24 * 60 * 60;
+    if (config.veto_growth_blocks < 1) config.veto_growth_blocks = 1;
     if (config.autofollow_min_fork_hashrate_pct < 1) config.autofollow_min_fork_hashrate_pct = 1;
     if (config.autofollow_max_fork_hashrate_pct < config.autofollow_min_fork_hashrate_pct) {
         config.autofollow_max_fork_hashrate_pct = config.autofollow_min_fork_hashrate_pct;
@@ -774,9 +793,40 @@ ReorgGatingConfig GetReorgGatingConfig()
     return config;
 }
 
+namespace {
+const char* DecisionName(ReorgDecision decision)
+{
+    switch (decision) {
+    case ReorgDecision::NONE: return "NONE";
+    case ReorgDecision::ACCEPT: return "ACCEPT";
+    case ReorgDecision::REJECT: return "REJECT";
+    case ReorgDecision::TIMEOUT: return "TIMEOUT";
+    case ReorgDecision::ABORT: return "ABORT";
+    }
+    return "UNKNOWN";
+}
+} // namespace
+
 ReorgGatingManager::ReorgGatingManager()
 {
     ReloadConfig();
+}
+
+ReorgGatingManager::ReorgGatingManager(const ReorgGatingConfig& config)
+{
+    m_config = config;
+}
+
+ReorgGatingManager::~ReorgGatingManager()
+{
+    {
+        LOCK(m_mutex);
+        m_kick_stop = true;
+    }
+    m_cv.notify_all();
+    if (m_kick_thread.joinable()) {
+        m_kick_thread.join();
+    }
 }
 
 void ReorgGatingManager::ReloadConfig()
@@ -789,116 +839,99 @@ bool ReorgGatingManager::IsEnabled() const
     return m_config.enabled;
 }
 
-void ReorgGatingManager::SetPending(const ReorgAdvisory& advisory,
-                                     const uint256& candidate_tip_hash,
-                                     const uint256& current_tip_hash,
-                                     const uint256& fork_point_hash)
+ReorgGatingMode ReorgGatingManager::GatingMode() const
 {
-    LOCK(m_mutex);
-
-    m_pending.is_pending = true;
-    m_pending.advisory = advisory;
-    m_pending.candidate_tip_hash = candidate_tip_hash;
-    m_pending.current_tip_hash = current_tip_hash;
-    m_pending.fork_point_hash = fork_point_hash;
-    m_pending.pending_since = GetTime();
-    m_pending.decision = ReorgDecision::NONE;
-
-    LogPrintf("REORG GATING: Deep reorg detected (depth=%d). Awaiting operator decision.\n",
-              advisory.depth_current);
-    LogPrintf("REORG GATING: Current tip: %s, Candidate tip: %s\n",
-              current_tip_hash.ToString(), candidate_tip_hash.ToString());
-    LogPrintf("REORG GATING: Timeout in %d seconds. Use RPC 'submitreorgdecision' to accept or reject.\n",
-              m_config.timeout_secs);
+    return m_config.gating_mode;
 }
 
-PendingReorgState ReorgGatingManager::GetPending() const
-{
-    LOCK(m_mutex);
-    return m_pending;
-}
-
-bool ReorgGatingManager::HasPending() const
-{
-    LOCK(m_mutex);
-    return m_pending.is_pending;
-}
-
-bool ReorgGatingManager::SubmitDecision(ReorgDecision decision)
+void ReorgGatingManager::SetAsyncHooks(std::function<void(std::function<void()>, int64_t)> schedule_fn,
+                                       std::function<void()> kick_fn,
+                                       std::function<std::optional<ReorgGateWorkSnapshot>(const uint256&)> snapshot_fn)
 {
     {
         LOCK(m_mutex);
-        if (!m_pending.is_pending) {
-            LogPrintf("REORG GATING: No pending reorg decision to submit.\n");
-            return false;
-        }
-
-        if (decision != ReorgDecision::ACCEPT && decision != ReorgDecision::REJECT) {
-            LogPrintf("REORG GATING: Invalid decision. Must be ACCEPT or REJECT.\n");
-            return false;
-        }
-
-        m_pending.decision = decision;
-        LogPrintf("REORG GATING: Operator decision received: %s\n",
-                  decision == ReorgDecision::ACCEPT ? "ACCEPT" : "REJECT");
+        m_schedule_fn = std::move(schedule_fn);
+        m_kick_fn = std::move(kick_fn);
+        m_snapshot_fn = std::move(snapshot_fn);
+        m_kick_stop = false;
+        m_kick_requested = false;
     }
+    if (!m_kick_thread.joinable()) {
+        m_kick_thread = std::thread([this] { KickWorker(); });
+    }
+}
 
-    // Wake up any waiting thread
+void ReorgGatingManager::ResetAsyncHooks()
+{
+    {
+        LOCK(m_mutex);
+        m_kick_stop = true;
+    }
     m_cv.notify_all();
-    return true;
-}
-
-ReorgDecision ReorgGatingManager::WaitForDecision()
-{
-    WAIT_LOCK(m_mutex, lock);
-
-    if (!m_pending.is_pending) {
-        return ReorgDecision::NONE;
+    if (m_kick_thread.joinable()) {
+        m_kick_thread.join();
     }
-
-    // Calculate absolute deadline
-    auto deadline = std::chrono::system_clock::now() +
-                    std::chrono::seconds(m_config.timeout_secs);
-
-    // Wait until decision is made or timeout
-    while (m_pending.decision == ReorgDecision::NONE) {
-        auto status = m_cv.wait_until(lock, deadline);
-
-        if (status == std::cv_status::timeout) {
-            // Timeout reached - use default action
-            m_pending.decision = ReorgDecision::TIMEOUT;
-            LogPrintf("REORG GATING: Decision timeout. Default action: %s\n",
-                      m_config.timeout_accept ? "ACCEPT" : "REJECT");
-            break;
-        }
-
-        // Check if decision was made while waiting
-        if (m_pending.decision != ReorgDecision::NONE) {
-            break;
-        }
-    }
-
-    return m_pending.decision;
-}
-
-void ReorgGatingManager::ClearPending()
-{
     LOCK(m_mutex);
-    m_pending = PendingReorgState{};
-    LogDebug(BCLog::VALIDATION, "REORG GATING: Pending state cleared.\n");
+    m_schedule_fn = nullptr;
+    m_kick_fn = nullptr;
+    m_snapshot_fn = nullptr;
+    m_kick_stop = false;
+    m_kick_requested = false;
 }
 
-void ReorgGatingManager::RecordApprovalFromPending()
+void ReorgGatingManager::KickWorker()
 {
-    LOCK(m_mutex);
-    if (!m_pending.is_pending) {
-        return;
+    util::ThreadRename("reorggate-kick");
+    while (true) {
+        std::function<void()> kick;
+        {
+            WAIT_LOCK(m_mutex, lock);
+            m_cv.wait(lock, [this]() EXCLUSIVE_LOCKS_REQUIRED(m_mutex) {
+                return m_kick_stop || m_kick_requested;
+            });
+            if (m_kick_stop) break;
+            m_kick_requested = false;
+            kick = m_kick_fn;
+        }
+        // Run ActivateBestChain outside m_mutex on this dedicated thread: the
+        // scheduler thread must stay free to drain the validation-interface
+        // queue that ActivateBestChain waits on.
+        if (kick) kick();
     }
+}
 
+ReorgGateEntry* ReorgGatingManager::FindGateById(uint64_t gate_id)
+{
+    for (auto& [key, entry] : m_gates) {
+        if (entry.gate_id == gate_id) return &entry;
+    }
+    return nullptr;
+}
+
+std::pair<ReorgGatingManager::SubmitStatus, ReorgGateEntry*>
+ReorgGatingManager::ResolveGate(const std::optional<uint64_t>& gate_id)
+{
+    if (gate_id) {
+        // An explicit id that no longer resolves is "unknown gate" even when
+        // the map is empty: the gate most likely already transitioned, which
+        // is the message the operator needs.
+        ReorgGateEntry* entry = FindGateById(*gate_id);
+        if (!entry) return {SubmitStatus::UNKNOWN_GATE, nullptr};
+        return {SubmitStatus::OK, entry};
+    }
+    if (m_gates.empty()) return {SubmitStatus::NO_GATE, nullptr};
+    // Bare form is sugar for the single-gate case only: with several live
+    // gates a decision must name its target so it can never hit the wrong fork.
+    if (m_gates.size() > 1) return {SubmitStatus::AMBIGUOUS, nullptr};
+    return {SubmitStatus::OK, &m_gates.begin()->second};
+}
+
+void ReorgGatingManager::RecordApprovalFromEntry(const ReorgGateEntry& entry)
+{
     m_approval.is_valid = true;
-    m_approval.fork_point_hash = m_pending.fork_point_hash;
-    m_approval.candidate_tip_hash = m_pending.candidate_tip_hash;
-    m_approval.current_tip_hash = m_pending.current_tip_hash;
+    m_approval.fork_point_hash = entry.fork_point_hash;
+    m_approval.candidate_tip_hash = entry.candidate_tip_hash;
+    m_approval.current_tip_hash = entry.current_tip_hash;
     m_approval.approved_at = GetTime();
 
     LogPrintf("REORG GATING: Recorded approval for reorg at fork point %s (candidate %s, valid for %d seconds). "
@@ -906,6 +939,395 @@ void ReorgGatingManager::RecordApprovalFromPending()
               m_approval.fork_point_hash.ToString(),
               m_approval.candidate_tip_hash.ToString(),
               m_config.approval_ttl_secs);
+}
+
+void ReorgGatingManager::ConvertToVeto(ReorgGateEntry& entry, const char* origin)
+{
+    entry.gate_state = ReorgGateState::VETOED;
+    entry.decision = ReorgDecision::REJECT;
+    entry.vetoed_at = GetTime();
+    entry.veto_candidate_height = entry.candidate_height;
+    entry.veto_margin_positive = entry.work.candidate_raw_work > entry.work.current_raw_work;
+    entry.veto_raw_margin = entry.veto_margin_positive
+                                ? entry.work.candidate_raw_work - entry.work.current_raw_work
+                                : arith_uint256{};
+
+    LogPrintf("REORG GATING: Gate %d REJECTED (%s): candidate %s vetoed for %d seconds; "
+              "escapes early if the branch extends >=%d blocks or its raw-work margin over the tip grows.\n",
+              entry.gate_id, origin, entry.candidate_tip_hash.ToString(),
+              m_config.veto_ttl_secs, m_config.veto_growth_blocks);
+}
+
+void ReorgGatingManager::ArmTimeout(uint64_t gate_id, uint64_t generation)
+{
+    std::function<void(std::function<void()>, int64_t)> schedule_fn;
+    {
+        LOCK(m_mutex);
+        schedule_fn = m_schedule_fn;
+    }
+    if (!schedule_fn) return; // unit tests drive HandleTimeout directly
+    schedule_fn([this, gate_id, generation] { HandleTimeout(gate_id, generation); },
+                m_config.timeout_secs);
+}
+
+uint64_t ReorgGatingManager::SetPending(const ReorgAdvisory& advisory,
+                                        const uint256& candidate_tip_hash,
+                                        int candidate_height,
+                                        const uint256& current_tip_hash,
+                                        const uint256& fork_point_hash,
+                                        const uint256& anchor_hash,
+                                        const ReorgGateWorkSnapshot& work)
+{
+    uint64_t gate_id{0};
+    uint64_t generation{0};
+    bool arm{false};
+    {
+        LOCK(m_mutex);
+        const GateKey key{fork_point_hash, anchor_hash};
+        auto it = m_gates.find(key);
+        if (it != m_gates.end()) {
+            ReorgGateEntry& entry = it->second;
+            if (entry.gate_state == ReorgGateState::PENDING) {
+                // Same reorg, longer segment: refresh what the operator sees.
+                // The gate keeps its identity, generation and armed timeout.
+                entry.advisory = advisory;
+                entry.candidate_tip_hash = candidate_tip_hash;
+                entry.candidate_height = candidate_height;
+                entry.current_tip_hash = current_tip_hash;
+                entry.work = work;
+                LogDebug(BCLog::VALIDATION, "REORG GATING: Gate %d refreshed (candidate %s, height %d).\n",
+                         entry.gate_id, candidate_tip_hash.ToString(), candidate_height);
+            }
+            // A VETOED entry is authoritative: the operator said no. Do not
+            // resurrect the prompt until the veto expires or escapes.
+            return entry.gate_id;
+        }
+
+        ReorgGateEntry entry;
+        entry.gate_id = m_next_gate_id++;
+        entry.generation = ++m_next_generation;
+        entry.gate_state = ReorgGateState::PENDING;
+        entry.advisory = advisory;
+        entry.fork_point_hash = fork_point_hash;
+        entry.anchor_hash = anchor_hash;
+        entry.candidate_tip_hash = candidate_tip_hash;
+        entry.candidate_height = candidate_height;
+        entry.current_tip_hash = current_tip_hash;
+        entry.work = work;
+        entry.pending_since = GetTime();
+        gate_id = entry.gate_id;
+        generation = entry.generation;
+        m_gates.emplace(key, std::move(entry));
+        arm = m_config.gating_mode == ReorgGatingMode::MASK;
+
+        LogPrintf("REORG GATING: Deep reorg detected (gate %d, depth=%d). Awaiting operator decision.\n",
+                  gate_id, advisory.depth_current);
+        LogPrintf("REORG GATING: Current tip: %s, Candidate tip: %s, Fork point: %s\n",
+                  current_tip_hash.ToString(), candidate_tip_hash.ToString(), fork_point_hash.ToString());
+        LogPrintf("REORG GATING: Timeout in %d seconds. Use RPC 'submitreorgdecision' to accept or reject.\n",
+                  m_config.timeout_secs);
+    }
+    // Arm outside m_mutex: the scheduler owns the timeout, and a stale timer
+    // is neutralized by the generation check in HandleTimeout.
+    if (arm) ArmTimeout(gate_id, generation);
+    return gate_id;
+}
+
+std::vector<ReorgGateEntry> ReorgGatingManager::GetGates() const
+{
+    LOCK(m_mutex);
+    std::vector<ReorgGateEntry> gates;
+    gates.reserve(m_gates.size());
+    for (const auto& [key, entry] : m_gates) {
+        gates.push_back(entry);
+    }
+    std::sort(gates.begin(), gates.end(),
+              [](const ReorgGateEntry& a, const ReorgGateEntry& b) { return a.gate_id < b.gate_id; });
+    return gates;
+}
+
+std::optional<ReorgGateEntry> ReorgGatingManager::GetGate(uint64_t gate_id) const
+{
+    LOCK(m_mutex);
+    for (const auto& [key, entry] : m_gates) {
+        if (entry.gate_id == gate_id) return entry;
+    }
+    return std::nullopt;
+}
+
+std::vector<std::pair<uint64_t, uint256>> ReorgGatingManager::GetGateAnchors() const
+{
+    LOCK(m_mutex);
+    std::vector<std::pair<uint64_t, uint256>> anchors;
+    anchors.reserve(m_gates.size());
+    for (const auto& [key, entry] : m_gates) {
+        anchors.emplace_back(entry.gate_id, entry.anchor_hash);
+    }
+    return anchors;
+}
+
+size_t ReorgGatingManager::GateCount() const
+{
+    LOCK(m_mutex);
+    return m_gates.size();
+}
+
+bool ReorgGatingManager::HasPending() const
+{
+    LOCK(m_mutex);
+    for (const auto& [key, entry] : m_gates) {
+        if (entry.gate_state == ReorgGateState::PENDING) return true;
+    }
+    return false;
+}
+
+ReorgGatingManager::SubmitStatus ReorgGatingManager::SubmitDecision(const std::optional<uint64_t>& gate_id,
+                                                                    ReorgDecision decision,
+                                                                    uint64_t* out_gate_id)
+{
+    if (decision != ReorgDecision::ACCEPT && decision != ReorgDecision::REJECT) {
+        LogPrintf("REORG GATING: Invalid decision. Must be ACCEPT or REJECT.\n");
+        return SubmitStatus::BAD_STATE;
+    }
+
+    {
+        LOCK(m_mutex);
+        auto [status, entry] = ResolveGate(gate_id);
+        if (status != SubmitStatus::OK) return status;
+        if (out_gate_id) *out_gate_id = entry->gate_id;
+
+        // Operator decisions bump the generation so any armed timeout for the
+        // previous generation fires as a no-op.
+        entry->generation = ++m_next_generation;
+
+        if (m_config.gating_mode == ReorgGatingMode::BLOCK) {
+            if (entry->gate_state != ReorgGateState::PENDING) return SubmitStatus::BAD_STATE;
+            entry->decision = decision;
+            LogPrintf("REORG GATING: Operator decision received for gate %d: %s\n",
+                      entry->gate_id, DecisionName(decision));
+        } else if (decision == ReorgDecision::ACCEPT) {
+            // ACCEPT clears the mask (works on a vetoed gate too: an explicit
+            // accept overrides an earlier reject).
+            LogPrintf("REORG GATING: Gate %d ACCEPTED by operator; unmasking candidate %s.\n",
+                      entry->gate_id, entry->candidate_tip_hash.ToString());
+            RecordApprovalFromEntry(*entry);
+            m_gates.erase(GateKey{entry->fork_point_hash, entry->anchor_hash});
+            // Re-activation runs on the dedicated kick thread, never on the
+            // RPC or scheduler thread.
+            m_kick_requested = true;
+        } else {
+            // REJECT converts the mask into (or refreshes) a TTL-bound veto.
+            ConvertToVeto(*entry, "operator REJECT");
+        }
+    }
+    m_cv.notify_all();
+    return SubmitStatus::OK;
+}
+
+ReorgGatingManager::SubmitStatus ReorgGatingManager::ClearVeto(const std::optional<uint64_t>& gate_id,
+                                                               uint64_t* out_gate_id)
+{
+    {
+        LOCK(m_mutex);
+        auto [status, entry] = ResolveGate(gate_id);
+        if (status != SubmitStatus::OK) return status;
+        if (entry->gate_state != ReorgGateState::VETOED) return SubmitStatus::BAD_STATE;
+        if (out_gate_id) *out_gate_id = entry->gate_id;
+        LogPrintf("REORG GATING: Gate %d veto cleared by operator; branch may re-prompt.\n", entry->gate_id);
+        m_gates.erase(GateKey{entry->fork_point_hash, entry->anchor_hash});
+        // Kick so the branch re-prompts without waiting for a new block.
+        m_kick_requested = true;
+    }
+    m_cv.notify_all();
+    return SubmitStatus::OK;
+}
+
+bool ReorgGatingManager::RemoveGate(uint64_t gate_id, const std::string& reason)
+{
+    LOCK(m_mutex);
+    for (auto it = m_gates.begin(); it != m_gates.end(); ++it) {
+        if (it->second.gate_id == gate_id) {
+            LogPrintf("REORG GATING: Gate %d removed (%s).\n", gate_id, reason);
+            m_gates.erase(it);
+            return true;
+        }
+    }
+    return false;
+}
+
+size_t ReorgGatingManager::PruneMootGates(const std::function<ReorgGateAnchorStatus(const uint256&)>& classify)
+{
+    // Classify against a snapshot of anchors, then remove per gate id: the
+    // classifier may take cs_main, which must never be acquired under m_mutex.
+    size_t removed{0};
+    for (const auto& [gate_id, anchor_hash] : GetGateAnchors()) {
+        switch (classify(anchor_hash)) {
+        case ReorgGateAnchorStatus::KEEP:
+            break;
+        case ReorgGateAnchorStatus::INVALIDATED:
+            if (RemoveGate(gate_id, "candidate subtree invalidated by operator")) ++removed;
+            break;
+        case ReorgGateAnchorStatus::ON_ACTIVE_CHAIN:
+            if (RemoveGate(gate_id, "anchor is on the active chain")) ++removed;
+            break;
+        }
+    }
+    return removed;
+}
+
+ReorgDecision ReorgGatingManager::WaitForDecision(const std::function<bool()>& interrupted)
+{
+    WAIT_LOCK(m_mutex, lock);
+
+    // BLOCK mode parks the single ActivateBestChain caller (serialized by
+    // m_chainstate_mutex), so at most one gate is pending; wait on the oldest.
+    uint64_t gate_id{0};
+    {
+        const ReorgGateEntry* found{nullptr};
+        for (const auto& [key, entry] : m_gates) {
+            if (entry.gate_state != ReorgGateState::PENDING) continue;
+            if (!found || entry.gate_id < found->gate_id) found = &entry;
+        }
+        if (!found) return ReorgDecision::NONE;
+        gate_id = found->gate_id;
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(m_config.timeout_secs);
+
+    while (true) {
+        // Re-resolve each tick: the gate can be cleared underneath the wait.
+        ReorgGateEntry* entry = FindGateById(gate_id);
+        if (!entry) return ReorgDecision::NONE;
+        if (entry->decision != ReorgDecision::NONE) return entry->decision;
+        if (interrupted && interrupted()) {
+            // Shutdown must never hang behind the gate: abort WITHOUT deciding.
+            LogPrintf("REORG GATING: Interrupt during gate wait; aborting without a decision.\n");
+            return ReorgDecision::ABORT;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            entry->decision = ReorgDecision::TIMEOUT;
+            LogPrintf("REORG GATING: Decision timeout. Default action: %s\n",
+                      m_config.timeout_accept ? "ACCEPT (subject to raw-work guardrail)" : "REJECT");
+            return ReorgDecision::TIMEOUT;
+        }
+        // Slice the wait so the interrupt is observed within a second.
+        m_cv.wait_for(lock, std::chrono::seconds(1));
+    }
+}
+
+bool ReorgGatingManager::EvaluateMask(uint64_t gate_id, const uint256& candidate_hash, int candidate_height,
+                                      const arith_uint256& candidate_raw_work,
+                                      const arith_uint256& tip_raw_work)
+{
+    LOCK(m_mutex);
+    if (m_config.gating_mode != ReorgGatingMode::MASK) return false;
+    ReorgGateEntry* entry = FindGateById(gate_id);
+    if (!entry) return false;
+    if (entry->gate_state == ReorgGateState::PENDING) {
+        // Track the growing branch: the mask keeps ActivateBestChainStep from
+        // re-arming this gate, so the best candidate seen at selection time is
+        // what keeps the operator view - and any later veto baseline - fresh.
+        if (candidate_height >= entry->candidate_height) {
+            entry->candidate_tip_hash = candidate_hash;
+            entry->candidate_height = candidate_height;
+            entry->work.candidate_raw_work = candidate_raw_work;
+            entry->work.current_raw_work = tip_raw_work;
+        }
+        return true;
+    }
+
+    // VETOED: drop the veto when it expires or an escape fires, so the branch
+    // re-prompts (once) through ActivateBestChainStep. A fresh reject then
+    // records a fresh veto with fresh baselines.
+    const auto erase_and_unmask = [&](const char* why) EXCLUSIVE_LOCKS_REQUIRED(m_mutex) {
+        LogPrintf("REORG GATING: Gate %d veto %s; branch will re-prompt.\n", entry->gate_id, why);
+        m_gates.erase(GateKey{entry->fork_point_hash, entry->anchor_hash});
+        return false;
+    };
+    if (GetTime() - entry->vetoed_at > m_config.veto_ttl_secs) {
+        return erase_and_unmask("TTL expired");
+    }
+    if (candidate_height - entry->veto_candidate_height >= m_config.veto_growth_blocks) {
+        return erase_and_unmask("growth escape (branch extended)");
+    }
+    if (candidate_raw_work > tip_raw_work) {
+        const arith_uint256 margin{candidate_raw_work - tip_raw_work};
+        if (!entry->veto_margin_positive || margin > entry->veto_raw_margin) {
+            return erase_and_unmask("raw-work escape (margin over tip grew)");
+        }
+    }
+    return true;
+}
+
+void ReorgGatingManager::HandleTimeout(uint64_t gate_id, uint64_t generation)
+{
+    // Take a fresh work snapshot first (needs cs_main); never under m_mutex.
+    uint256 candidate_hash;
+    std::function<std::optional<ReorgGateWorkSnapshot>(const uint256&)> snapshot_fn;
+    {
+        LOCK(m_mutex);
+        ReorgGateEntry* entry = FindGateById(gate_id);
+        if (!entry || entry->generation != generation || entry->gate_state != ReorgGateState::PENDING) {
+            return; // stale timer: the operator (or another transition) won the race
+        }
+        candidate_hash = entry->candidate_tip_hash;
+        snapshot_fn = m_snapshot_fn;
+    }
+    std::optional<ReorgGateWorkSnapshot> fresh;
+    if (snapshot_fn) fresh = snapshot_fn(candidate_hash);
+
+    {
+        LOCK(m_mutex);
+        ReorgGateEntry* entry = FindGateById(gate_id);
+        if (!entry || entry->generation != generation || entry->gate_state != ReorgGateState::PENDING) {
+            return; // decision landed while the snapshot was being taken
+        }
+        if (fresh) entry->work = *fresh;
+
+        const bool accept = m_config.timeout_accept && TimeoutAcceptAllowed(entry->work);
+        if (accept) {
+            LogPrintf("REORG GATING: Gate %d decision timeout; auto-accepting raw-work-heavier candidate %s.\n",
+                      entry->gate_id, entry->candidate_tip_hash.ToString());
+            RecordApprovalFromEntry(*entry);
+            m_gates.erase(GateKey{entry->fork_point_hash, entry->anchor_hash});
+            m_kick_requested = true;
+        } else {
+            if (m_config.timeout_accept) {
+                LogPrintf("REORG GATING: Gate %d timeout-accept blocked by raw-work guardrail "
+                          "(candidate not strictly raw-work-heavier, or penalty/policy-driven); "
+                          "treating timeout as REJECT.\n",
+                          entry->gate_id);
+            }
+            entry->generation = ++m_next_generation;
+            ConvertToVeto(*entry, "decision timeout");
+        }
+    }
+    m_cv.notify_all();
+}
+
+void ReorgGatingManager::RecordApprovalFromPending()
+{
+    LOCK(m_mutex);
+    // BLOCK-mode helper: the sole (oldest) gate carries the decision.
+    ReorgGateEntry* found{nullptr};
+    for (auto& [key, entry] : m_gates) {
+        if (!found || entry.gate_id < found->gate_id) found = &entry;
+    }
+    if (!found) return;
+    RecordApprovalFromEntry(*found);
+}
+
+void ReorgGatingManager::ClearPending()
+{
+    LOCK(m_mutex);
+    auto oldest = m_gates.end();
+    for (auto it = m_gates.begin(); it != m_gates.end(); ++it) {
+        if (oldest == m_gates.end() || it->second.gate_id < oldest->second.gate_id) oldest = it;
+    }
+    if (oldest == m_gates.end()) return;
+    m_gates.erase(oldest);
+    LogDebug(BCLog::VALIDATION, "REORG GATING: Pending state cleared.\n");
 }
 
 ReorgApprovalState ReorgGatingManager::GetApproval() const
@@ -930,19 +1352,76 @@ void ReorgGatingManager::ClearApproval()
 int64_t ReorgGatingManager::GetTimeoutRemaining() const
 {
     LOCK(m_mutex);
-    if (!m_pending.is_pending) {
-        return 0;
+    const ReorgGateEntry* found{nullptr};
+    for (const auto& [key, entry] : m_gates) {
+        if (entry.gate_state != ReorgGateState::PENDING) continue;
+        if (!found || entry.gate_id < found->gate_id) found = &entry;
     }
+    if (!found) return 0;
 
-    int64_t elapsed = GetTime() - m_pending.pending_since;
+    int64_t elapsed = GetTime() - found->pending_since;
     int64_t remaining = m_config.timeout_secs - elapsed;
     return remaining > 0 ? remaining : 0;
+}
+
+bool ReorgGatingManager::TimeoutAcceptAllowed(const ReorgGateWorkSnapshot& work)
+{
+    // Auto-accept must never follow a penalty/policy-manufactured reorg: only
+    // a candidate that is strictly heavier in never-mutated raw consensus
+    // work may be followed unattended.
+    return work.candidate_raw_work > work.current_raw_work && !work.penalty_or_policy_driven;
 }
 
 ReorgGatingManager& GetReorgGatingManager()
 {
     static ReorgGatingManager manager;
     return manager;
+}
+
+ReorgGateWorkSnapshot ComputeReorgGateWorkSnapshot(const CBlockIndex& current_tip,
+                                                   const CBlockIndex& candidate_tip)
+{
+    ReorgGateWorkSnapshot work;
+    work.current_work = current_tip.nChainWork;
+    work.candidate_work = candidate_tip.nChainWork;
+    work.current_penalty = current_tip.nChainPenalty;
+    work.candidate_penalty = candidate_tip.nChainPenalty;
+    work.current_raw_work = current_tip.nChainWorkRaw;
+    work.candidate_raw_work = candidate_tip.nChainWorkRaw;
+    // "Wins on effective work" uses the same comparator fork choice uses, so
+    // the flag reflects exactly the ordering that promoted the candidate.
+    work.penalty_or_policy_driven =
+        node::CBlockIndexPolicyComparator()(&current_tip, &candidate_tip) &&
+        !(candidate_tip.nChainWorkRaw > current_tip.nChainWorkRaw);
+    return work;
+}
+
+std::optional<ReorgGateWorkSnapshot> ComputeReorgGateWorkSnapshot(ChainstateManager& chainman,
+                                                                  const uint256& candidate_tip_hash)
+{
+    AssertLockHeld(::cs_main);
+    const CBlockIndex* candidate{chainman.m_blockman.LookupBlockIndex(candidate_tip_hash)};
+    const CBlockIndex* tip{chainman.ActiveChain().Tip()};
+    if (!candidate || !tip) return std::nullopt;
+    return ComputeReorgGateWorkSnapshot(*tip, *candidate);
+}
+
+void PruneMootReorgGates(ChainstateManager& chainman)
+{
+    AssertLockHeld(::cs_main);
+    ReorgGatingManager& mgr = GetReorgGatingManager();
+    if (mgr.GateCount() == 0) return;
+    mgr.PruneMootGates([&chainman](const uint256& anchor_hash) {
+        AssertLockHeld(::cs_main);
+        const CBlockIndex* anchor{chainman.m_blockman.LookupBlockIndex(anchor_hash)};
+        if (!anchor) return ReorgGateAnchorStatus::KEEP;
+        // BLOCK_FAILED_MASK covers both FAILED_VALID (the anchor itself was
+        // invalidated) and FAILED_CHILD (an ancestor was): either way the
+        // candidate subtree can never be selected again.
+        if (anchor->nStatus & BLOCK_FAILED_MASK) return ReorgGateAnchorStatus::INVALIDATED;
+        if (chainman.ActiveChain().Contains(anchor)) return ReorgGateAnchorStatus::ON_ACTIVE_CHAIN;
+        return ReorgGateAnchorStatus::KEEP;
+    });
 }
 
 namespace {

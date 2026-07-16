@@ -314,6 +314,7 @@ CBlockIndex* BlockManager::AddToBlockIndex(const CBlockHeader& block, CBlockInde
     pindexNew->nTimeMax = (pindexNew->pprev ? std::max(pindexNew->pprev->nTimeMax, pindexNew->nTime) : pindexNew->nTime);
     pindexNew->nChainPenalty = pindexNew->pprev ? pindexNew->pprev->nChainPenalty : arith_uint256{};
     pindexNew->nChainWork = (pindexNew->pprev ? pindexNew->pprev->nChainWork : arith_uint256{}) + GetBlockProof(*pindexNew);
+    pindexNew->nChainWorkRaw = (pindexNew->pprev ? pindexNew->pprev->nChainWorkRaw : arith_uint256{}) + GetBlockProof(*pindexNew);
     pindexNew->RaiseValidity(BLOCK_VALID_TREE);
     if (best_header == nullptr || best_header->nChainWork < pindexNew->nChainWork) {
         best_header = pindexNew;
@@ -548,6 +549,7 @@ bool BlockManager::LoadBlockIndex(const std::optional<uint256>& snapshot_blockha
         previous_index = pindex;
         pindex->nChainPenalty = pindex->pprev ? pindex->pprev->nChainPenalty : arith_uint256{};
         pindex->nChainWork = (pindex->pprev ? pindex->pprev->nChainWork : arith_uint256{}) + GetBlockProof(*pindex);
+        pindex->nChainWorkRaw = (pindex->pprev ? pindex->pprev->nChainWorkRaw : arith_uint256{}) + GetBlockProof(*pindex);
         pindex->nTimeMax = (pindex->pprev ? std::max(pindex->pprev->nTimeMax, pindex->nTime) : pindex->nTime);
 
         // We can link the chain of blocks for which we've received transactions at some point, or
