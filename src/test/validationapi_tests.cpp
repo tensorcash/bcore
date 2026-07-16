@@ -341,8 +341,11 @@ BOOST_AUTO_TEST_CASE(dispatch_getheaders_uses_connman)
     }
 
     request.next_send = std::chrono::steady_clock::time_point::min();
-    int sent = api.DispatchAmberGetHeaders(id, request);
+    // DispatchAmberGetHeaders no longer mutates the request (it runs outside
+    // amber_mutex_ now); the caller records expected_peers from the return.
+    int sent = api.DispatchAmberGetHeaders(id);
     BOOST_CHECK_EQUAL(sent, 2);
+    request.expected_peers = sent;
     BOOST_CHECK_EQUAL(request.expected_peers, 2);
 
     {
@@ -360,8 +363,9 @@ BOOST_AUTO_TEST_CASE(dispatch_getheaders_uses_connman)
     api.SetConnman(nullptr);
     request.expected_peers = 7;
     request.attempts = 0;
-    int none = api.DispatchAmberGetHeaders(id, request);
+    int none = api.DispatchAmberGetHeaders(id);
     BOOST_CHECK_EQUAL(none, 0);
+    request.expected_peers = none;
     BOOST_CHECK_EQUAL(request.expected_peers, 0);
 
     // Integration: ProcessAmberRequests should use connman when present
@@ -455,6 +459,49 @@ BOOST_AUTO_TEST_CASE(process_amber_requests_schedule_and_responses)
     request.finalize_deadline = std::chrono::steady_clock::time_point::min();
     api.ProcessAmberRequests();
     BOOST_CHECK(api.amber_requests_.count(id) == 0);
+}
+
+BOOST_AUTO_TEST_CASE(record_peer_status_defers_finalize_while_dispatch_in_flight)
+{
+    auto api = MakeValidationApi(m_node);
+    const uint256 id = DeterministicId();
+    BOOST_CHECK(api.SetRequestStatus(id, ValidationReqType::Full, ValidationResponseValue::Full_Amber));
+    api.StartAmberFlow(id, MakeDummyBlock(), ValidationResponseBehavior::AcceptBlock);
+
+    auto& request = api.amber_requests_[id];
+    // Simulate the send-vs-record window: ProcessAmberRequests() queued a
+    // getheaders dispatch and released amber_mutex_, but has not yet
+    // re-taken it to record the dispatched peer count — expected_peers is
+    // still 0 while getheaders is already on the wire.
+    request.dispatch_in_flight = true;
+    BOOST_CHECK_EQUAL(request.expected_peers, 0);
+
+    // A fast Red response lands in the window. Without the sentinel,
+    // expected_peers == 0 reads as "no peers were polled" and this lone Red
+    // vote would finalize the verdict. The vote must be recorded but must
+    // not finalize.
+    api.RecordPeerFullStatus(id, "peer-fast", ValidationResponseValue::Full_Red);
+    BOOST_CHECK_EQUAL(api.amber_requests_.count(id), 1U);
+    BOOST_CHECK(api.behaviors.empty());
+    ValidationAPI::BlockValidationDB::BlockValidationRecord_Full record(id);
+    BOOST_CHECK(api.m_validatedBlocks.ReadRes(id, record));
+    BOOST_CHECK_EQUAL(record.nExtFull, 1); // vote kept, not lost
+    BOOST_CHECK_EQUAL(static_cast<int>(record.FullValidation),
+                      static_cast<int>(ValidationResponseValue::Full_Amber)); // own status untouched
+
+    // The dispatch loop re-takes amber_mutex_, records the peer count and
+    // clears the sentinel; vote-driven finalization resumes.
+    request.expected_peers = 2;
+    request.dispatch_in_flight = false;
+
+    // Second vote completes the expected set (has_red + all_responded).
+    api.RecordPeerFullStatus(id, "peer-slow", ValidationResponseValue::Full_Green);
+    BOOST_CHECK_EQUAL(api.amber_requests_.count(id), 0U);
+    BOOST_CHECK_EQUAL(api.behaviors.size(), 1U);
+    BOOST_CHECK(api.m_validatedBlocks.ReadRes(id, record));
+    BOOST_CHECK_EQUAL(record.nExtFull, 2);
+    BOOST_CHECK_EQUAL(static_cast<int>(record.getFull(false)),
+                      static_cast<int>(ValidationResponseValue::Full_Red));
 }
 
 BOOST_AUTO_TEST_CASE(block_validation_db_boundaries)

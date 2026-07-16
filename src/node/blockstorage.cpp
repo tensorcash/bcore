@@ -1508,22 +1508,18 @@ void ImportBlocks(ChainstateManager& chainman, std::span<const fs::path> import_
                         }
                     }
                 }
-                if (need_rescan || !have_full_status ||
-                    status != ValidationResponseValue::Full_Green)
+                if (!have_full_status ||
+                    (status != ValidationResponseValue::Full_Green &&
+                     status != ValidationResponseValue::Full_Red))
                 {
-                    LogPrintf("%s: Full %s Failed — invalidating block\n", __func__, block.GetHash().ToString());
-                    BlockValidationState inv_state;
-                    if (!chainman.ActiveChainstate().InvalidateBlock(inv_state, const_cast<CBlockIndex*>(idx))) {
-                        LogError("%s: InvalidateBlock FAILED at height %d (%s)\n", __func__, idx->nHeight, inv_state.ToString());
-                    } else {
-                        if (!chainman.ActiveChainstate().ActivateBestChain(inv_state)) {
-                            LogError("%s: ActivateBestChain after invalidation FAILED (%s)\n", __func__, inv_state.ToString());
-                        }
-                    }
-                    need_rescan = true;
+                    // A missing verdict or Full_Amber (adjudication still in
+                    // progress) is NOT corruption or rejection: never
+                    // InvalidateBlock canonical blocks over it. Red is already
+                    // replayed above as zero-work, Green as normal work; leave
+                    // everything else to the deferred validation pipeline.
+                    LogPrintf("%s: Full %s verdict missing or pending (status=%d) at height %d; leaving block for deferred validation\n",
+                              __func__, block.GetHash().ToString(), static_cast<int>(status), idx->nHeight);
                 }
-                if (need_rescan)
-                    g_ValidationApi->RemoveRes_Full(block.GetHash());
             }
         }
     }
