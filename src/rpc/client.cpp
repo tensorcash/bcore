@@ -264,6 +264,7 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "getreorgadvisories", 0, "count" },
     { "getblockstats", 0, "hash_or_height" },
     { "getblockstats", 1, "stats" },
+    { "getspvtickinfo", 0, "height" },
     { "pruneblockchain", 0, "height" },
     { "keypoolrefill", 0, "newsize" },
     { "getrawmempool", 0, "verbose" },

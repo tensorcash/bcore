@@ -32,6 +32,7 @@
 #include <util/translation.h>
 #include <validation.h>
 
+#include <limits>
 #include <optional>
 
 #include <univalue.h>
@@ -1193,6 +1194,105 @@ static RPCHelpMan getrawaddrman()
     };
 }
 
+static RPCHelpMan getspvtickinfo()
+{
+    return RPCHelpMan{
+        "getspvtickinfo",
+        "Returns the state of the SPV cumulative-tick gate: the chain's consensus cumulative VDF tick at a height, the configured minimum floor there, and sidecar cache / backfill occupancy.\n"
+        "Tick rate over an interval can be derived from two calls: (cumulative_tick2 - cumulative_tick1) / (time2 - time1).\n",
+        {
+            {"height", RPCArg::Type::NUM, RPCArg::DefaultHint{"tip height"}, "Active-chain height to evaluate (block data must be available)"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::NUM, "height", "evaluated active-chain height"},
+                {RPCResult::Type::STR_HEX, "blockhash", "hash of the block at that height"},
+                {RPCResult::Type::NUM_TIME, "time", "block time"},
+                {RPCResult::Type::NUM, "block_tick", "this block's pow tick"},
+                {RPCResult::Type::NUM, "cumulative_tick", "consensus cumulative tick at this block"},
+                {RPCResult::Type::BOOL, "gate_enabled", "whether the minimum cumulative tick floor is enforced (min_tick_per_block > 0)"},
+                {RPCResult::Type::NUM, "min_tick_per_block", "configured floor slope, ticks per block"},
+                {RPCResult::Type::NUM, "slack_days", "configured slack before the floor applies"},
+                {RPCResult::Type::NUM, "floor", "floor value at this height"},
+                {RPCResult::Type::NUM, "headroom", "cumulative_tick - floor (negative = below floor)"},
+                {RPCResult::Type::NUM, "expected_tick_per_block", "EMA of observed tick per block (hysteresis expectation)"},
+                {RPCResult::Type::NUM, "vdf_header_entries", "sidecar cache entries"},
+                {RPCResult::Type::NUM, "vdf_header_valid", "cache entries with a verified sidecar"},
+                {RPCResult::Type::NUM, "vdf_header_anchored", "cache entries with a proven cumulative value"},
+                {RPCResult::Type::NUM, "backfill_peer_total", "queued sidecar backfill requests across peers"},
+                {RPCResult::Type::NUM, "backfill_staged_any", "staged backfill requests awaiting a NODE_VDFSPV peer"},
+            }
+        },
+        RPCExamples{
+            HelpExampleCli("getspvtickinfo", "")
+            + HelpExampleRpc("getspvtickinfo", "")
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue {
+            NodeContext& node = EnsureAnyNodeContext(request.context);
+            ChainstateManager& chainman = EnsureChainman(node);
+            PeerManager& peerman = EnsurePeerman(node);
+
+            int height;
+            uint256 hash;
+            int64_t block_time;
+            uint64_t block_tick;
+            uint64_t cumulative_tick;
+            {
+                LOCK(cs_main);
+                const CChain& active = chainman.ActiveChain();
+                height = request.params[0].isNull() ? active.Height() : request.params[0].getInt<int>();
+                if (height < 0 || height > active.Height()) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Height %d out of range (tip=%d)", height, active.Height()));
+                }
+                const CBlockIndex* pindex = active[height];
+                CHECK_NONFATAL(pindex);
+                CBlock block;
+                if (!(pindex->nStatus & BLOCK_HAVE_DATA) || !chainman.m_blockman.ReadBlock(block, *pindex)) {
+                    throw JSONRPCError(RPC_MISC_ERROR, "Block data not available (pruned?)");
+                }
+                hash = pindex->GetBlockHash();
+                block_time = pindex->GetBlockTime();
+                block_tick = block.pow.tick;
+                cumulative_tick = block.cumulative_tick;
+            }
+
+            // Outside cs_main: GetSpvTickInfo acquires g_msgproc_mutex, and the
+            // message-processing order is g_msgproc_mutex -> cs_main.
+            const SpvTickInfo info = peerman.GetSpvTickInfo(height);
+
+            int64_t headroom;
+            constexpr uint64_t max_i64{static_cast<uint64_t>(std::numeric_limits<int64_t>::max())};
+            if (cumulative_tick >= info.floor_at_height) {
+                const uint64_t d = cumulative_tick - info.floor_at_height;
+                headroom = d > max_i64 ? std::numeric_limits<int64_t>::max() : static_cast<int64_t>(d);
+            } else {
+                const uint64_t d = info.floor_at_height - cumulative_tick;
+                headroom = d > max_i64 ? std::numeric_limits<int64_t>::min() : -static_cast<int64_t>(d);
+            }
+
+            UniValue obj(UniValue::VOBJ);
+            obj.pushKV("height", height);
+            obj.pushKV("blockhash", hash.GetHex());
+            obj.pushKV("time", block_time);
+            obj.pushKV("block_tick", block_tick);
+            obj.pushKV("cumulative_tick", cumulative_tick);
+            obj.pushKV("gate_enabled", info.min_cumulative_tick_per_block > 0);
+            obj.pushKV("min_tick_per_block", info.min_cumulative_tick_per_block);
+            obj.pushKV("slack_days", static_cast<uint64_t>(info.min_cumulative_tick_slack_days));
+            obj.pushKV("floor", info.floor_at_height);
+            obj.pushKV("headroom", headroom);
+            obj.pushKV("expected_tick_per_block", info.expected_tick_per_block);
+            obj.pushKV("vdf_header_entries", info.vdf_header_entries);
+            obj.pushKV("vdf_header_valid", info.vdf_header_valid);
+            obj.pushKV("vdf_header_anchored", info.vdf_header_anchored);
+            obj.pushKV("backfill_peer_total", info.backfill_peer_total);
+            obj.pushKV("backfill_staged_any", info.backfill_staged_any);
+            return obj;
+        },
+    };
+}
+
 void RegisterNetRPCCommands(CRPCTable& t)
 {
     static const CRPCCommand commands[]{
@@ -1210,6 +1310,7 @@ void RegisterNetRPCCommands(CRPCTable& t)
         {"network", &setnetworkactive},
         {"network", &getnodeaddresses},
         {"network", &getaddrmaninfo},
+        {"network", &getspvtickinfo},
         {"hidden", &addconnection},
         {"hidden", &addpeeraddress},
         {"hidden", &sendmsgtopeer},

@@ -565,6 +565,7 @@ public:
     std::optional<std::string> FetchBlock(NodeId peer_id, const CBlockIndex& block_index) override
         EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
     bool GetNodeStateStats(NodeId nodeid, CNodeStateStats& stats) const override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
+    SpvTickInfo GetSpvTickInfo(int height) override EXCLUSIVE_LOCKS_REQUIRED(!m_sidecar_backfill_mutex, !m_spv_stats_mutex);
     std::vector<TxOrphanage::OrphanTxBase> GetOrphanTransactions() override EXCLUSIVE_LOCKS_REQUIRED(!m_tx_download_mutex);
     PeerManagerInfo GetInfo() const override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
     void SendPings() override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
@@ -832,6 +833,12 @@ private:
     static constexpr size_t VDF_MAX_SIDECAR_BYTES{1024};
     static constexpr size_t VDF_HEADERS_MAX_ENTRIES{60000};
     static constexpr int64_t VDF_HEADER_TTL_SEC{1800};
+    /** Depth below the active tip within which on_active entries stay pinned in
+     *  m_vdf_headers. Anchors deeper than this become evictable again: they are
+     *  recreated on demand from our own block storage (TryAnchorFromDisk), so
+     *  pruning them is harmless, whereas pinning every connected block forever
+     *  would grow the map without bound (~52k blocks/year at target cadence). */
+    static constexpr int VDF_ANCHOR_PIN_DEPTH{4032};
     static constexpr size_t VDF_VERIFY_CACHE_MAX{64000};
     static constexpr int64_t VDF_VERIFY_CACHE_TTL_SEC{600};
 
@@ -860,6 +867,11 @@ private:
     static constexpr int64_t EXT_REQUEST_TIMEOUT_SEC{30};
     static constexpr int EXT_MAX_RETRIES{3};
     static constexpr size_t MAX_HEADERS_EXT_PER_MIN{2000};
+    /** Per-peer cap on the queued (not yet sent) GETHEADERS_EXT backlog. Sized
+     *  for several full HEADERS batches (2000 each); beyond it the newest
+     *  entries are dropped with a log line -- a re-announcement or the gate
+     *  backfill re-queues them later. */
+    static constexpr size_t MAX_HEADERS_EXT_BACKLOG_PER_PEER{8000};
 
     // Sidecar backfill: (header_hash, prev_hash) pairs for headers already in
     // the index whose VDF sidecar bucket the block-download gate found missing
@@ -874,6 +886,91 @@ private:
     Mutex m_sidecar_backfill_mutex;
     std::unordered_map<NodeId, std::set<std::pair<uint256, uint256>>> m_sidecar_backfill GUARDED_BY(m_sidecar_backfill_mutex);
     static constexpr size_t MAX_SIDECAR_BACKFILL_PER_PEER{2000};
+    // Peer-agnostic staging for backfill pairs whose announcer does not
+    // advertise NODE_VDFSPV (it cannot be asked for sidecars at all). Drained
+    // in SendMessages into the per-peer backfill of the next NODE_VDFSPV peer
+    // whose cycle runs, so a non-advertising announcer cannot wedge the
+    // min-cumulative-tick gate. Best-effort: a peer without the candidate
+    // bodies won't answer, but each new announcement re-arms the walk.
+    std::set<std::pair<uint256, uint256>> m_sidecar_backfill_any GUARDED_BY(m_sidecar_backfill_mutex);
+
+    // Anchor updates staged by validation-interface callbacks. BlockConnected/
+    // BlockDisconnected must NEVER take g_msgproc_mutex: ActivateBestChain --
+    // run by the message-processing thread while it holds g_msgproc_mutex --
+    // drains the validation queue via LimitValidationInterfaceQueue, so a
+    // callback blocking on g_msgproc_mutex deadlocks the whole node (P2P and
+    // RPC). Callbacks stage here under a leaf mutex; DrainPendingAnchors
+    // applies them on the message thread.
+    struct PendingAnchor {
+        uint256 hash;
+        uint64_t tick{0};
+        uint64_t cum_tick{0};
+        int32_t height{-1};
+        bool pin_candidate{false}; //!< non-background connect: eligible for the active pin
+        bool demote_only{false};   //!< disconnect: only drop the active pin
+    };
+    Mutex m_pending_anchors_mutex;
+    std::vector<PendingAnchor> m_pending_anchors GUARDED_BY(m_pending_anchors_mutex);
+    static constexpr size_t MAX_PENDING_ANCHORS{4096};
+
+    // Stats snapshot for getspvtickinfo. The RPC thread must not take
+    // g_msgproc_mutex either -- a busy message loop can starve it long enough
+    // to exhaust every RPC worker. Refreshed under g_msgproc_mutex by
+    // DrainPendingAnchors/PruneVdfHeaders; read under this leaf mutex.
+    Mutex m_spv_stats_mutex;
+    uint64_t m_spv_stat_entries GUARDED_BY(m_spv_stats_mutex){0};
+    uint64_t m_spv_stat_valid GUARDED_BY(m_spv_stats_mutex){0};
+    uint64_t m_spv_stat_anchored GUARDED_BY(m_spv_stats_mutex){0};
+    uint64_t m_spv_stat_expected_tick GUARDED_BY(m_spv_stats_mutex){0};
+
+    void UpdateSpvStatsSnapshot() EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex)
+    {
+        const uint64_t entries{m_vdf_headers.size()};
+        uint64_t valid{0}, anchored{0};
+        for (const auto& [hash, info] : m_vdf_headers) {
+            if (info.status == VdfBucketStatus::VALID) ++valid;
+            if (info.cum_set) ++anchored;
+        }
+        const uint64_t expected{ExpectedTickPerBlock()};
+        LOCK(m_spv_stats_mutex);
+        m_spv_stat_entries = entries;
+        m_spv_stat_valid = valid;
+        m_spv_stat_anchored = anchored;
+        m_spv_stat_expected_tick = expected;
+    }
+
+    void DrainPendingAnchors() EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex)
+    {
+        std::vector<PendingAnchor> pending;
+        {
+            LOCK(m_pending_anchors_mutex);
+            pending.swap(m_pending_anchors);
+        }
+        if (pending.empty()) return;
+        const int64_t now = GetTime();
+        LOCK(cs_main);
+        for (const auto& pa : pending) {
+            if (pa.demote_only) {
+                auto it = m_vdf_headers.find(pa.hash);
+                if (it != m_vdf_headers.end()) {
+                    it->second.on_active = false;
+                    it->second.ts = now;
+                }
+                continue;
+            }
+            const CBlockIndex* idx = m_chainman.m_blockman.LookupBlockIndex(pa.hash);
+            VdfHeaderInfo& info = m_vdf_headers[pa.hash];
+            info.status = VdfBucketStatus::VALID;
+            info.tick = pa.tick;
+            info.cum_tick = arith_uint256(pa.cum_tick);
+            info.cum_set = true;
+            info.height = pa.height;
+            info.ts = now;
+            // Pin only what is genuinely on the active chain at apply time.
+            info.on_active = pa.pin_candidate && idx != nullptr && m_chainman.ActiveChain().Contains(idx);
+        }
+        UpdateSpvStatsSnapshot();
+    }
 
     /** Queue HEADERS_EXT queries and drain them respecting the per-minute cap. */
     void QueueGetHeadersExt(Peer& peer, std::vector<VdfExtQueryItem>&& queries) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
@@ -1029,6 +1126,43 @@ private:
         it->second.ts = now;
     }
 
+    // A block trustable as a cumulative-tick anchor without sidecar gossip:
+    // body on disk AND validated -- active-chain membership, or a validity
+    // level proving the block was connected at some point.
+    bool IsDiskAnchorable(const CBlockIndex* pindex) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+    {
+        if (!(pindex->nStatus & BLOCK_HAVE_DATA)) return false;
+        return m_chainman.ActiveChain().Contains(pindex) || pindex->IsValid(BLOCK_VALID_SCRIPTS);
+    }
+
+    // Anchor a header's cumulative tick from our own block storage, inserting a
+    // VALID cum_set entry into m_vdf_headers. Only blocks whose cumulative_tick
+    // passed contextual validation qualify: active-chain membership, or a
+    // validity level proving the block was connected at some point
+    // (BLOCK_VALID_SCRIPTS). BLOCK_HAVE_DATA alone is NOT sufficient -- stored
+    // candidate/sampled bodies carry an unchecked cumulative_tick and must not
+    // become cum_set shortcuts. (BLOCK_VALID_TRANSACTIONS is also insufficient:
+    // ContextualCheckBlock skips the bad-cumulative-tick rule when the parent
+    // body is not yet on disk.) Returns the anchored cumulative tick on success.
+    std::optional<arith_uint256> TryAnchorFromDisk(const CBlockIndex* pindex, int64_t now)
+        EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+    {
+        if (!IsDiskAnchorable(pindex)) return std::nullopt;
+        const bool on_active = m_chainman.ActiveChain().Contains(pindex);
+        CBlock block;
+        if (!m_chainman.m_blockman.ReadBlock(block, *pindex)) return std::nullopt;
+        VdfHeaderInfo& info = m_vdf_headers[pindex->GetBlockHash()];
+        info.status = VdfBucketStatus::VALID;
+        info.tick = block.pow.tick;
+        if (info.vdf.empty()) info.vdf.assign(block.pow.vdf.begin(), block.pow.vdf.end());
+        info.cum_tick = arith_uint256(block.cumulative_tick);
+        info.cum_set = true;
+        info.height = pindex->nHeight;
+        info.ts = now;
+        info.on_active = on_active;
+        return info.cum_tick;
+    }
+
     // Compute cum_tick from genesis for the candidate tip. Returns {ok, cum_tick}.
     // ok=false if any header on the path to genesis lacks a VALID sidecar or cum cannot be proven back to genesis.
     std::pair<bool, arith_uint256> ComputeCumFromGenesis(const CBlockIndex* tip, int64_t now) EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
@@ -1038,7 +1172,16 @@ private:
         while (cur != nullptr) {
             const uint256& hdr = cur->GetBlockHash();
             auto it = m_vdf_headers.find(hdr);
-            if (it == m_vdf_headers.end() || it->second.status != VdfBucketStatus::VALID) return {false, arith_uint256{0}};
+            if (it == m_vdf_headers.end() || it->second.status != VdfBucketStatus::VALID) {
+                // Not in the sidecar cache (restart, TTL expiry, eviction) or
+                // never verified from gossip. A block this node itself already
+                // validated is a trusted anchor regardless of cache state.
+                if (auto anchored = TryAnchorFromDisk(cur, now)) {
+                    accum += *anchored;
+                    return {true, accum};
+                }
+                return {false, arith_uint256{0}};
+            }
             VdfHeaderInfo& info = it->second;
             info.ts = now;
             info.height = cur->nHeight;
@@ -1053,6 +1196,30 @@ private:
         // Reached pre-genesis null: only valid if final header had cum_set (should be genesis if tracked), else accept accum as full if we verified every step.
         // Since we required every step to have VALID sidecar, and no gaps, accept accum.
         return {true, accum};
+    }
+
+    // Walk tip -> parent collecting headers whose sidecar is absent or
+    // unverified, stopping at the first proven cumulative anchor (VALID +
+    // cum_set) or at a block our own storage can anchor. These are exactly the
+    // (header, prev) pairs a GETHEADERS_EXT backfill must fetch before
+    // ComputeCumFromGenesis can succeed on this branch.
+    std::vector<std::pair<uint256, uint256>> CollectMissingSidecarPath(const CBlockIndex* tip, size_t max_items)
+        EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+    {
+        std::vector<std::pair<uint256, uint256>> missing;
+        const CBlockIndex* cur = tip;
+        while (cur && missing.size() < max_items) {
+            auto it = m_vdf_headers.find(cur->GetBlockHash());
+            const bool valid = it != m_vdf_headers.end() && it->second.status == VdfBucketStatus::VALID;
+            if (valid && it->second.cum_set) break;
+            if (!valid) {
+                if (IsDiskAnchorable(cur)) break;
+                missing.emplace_back(cur->GetBlockHash(), cur->pprev ? cur->pprev->GetBlockHash() : uint256());
+            }
+            // VALID-but-not-cum_set headers need their ancestors, keep walking.
+            cur = cur->pprev;
+        }
+        return missing;
     }
 
     void PruneVdfBuckets() {
@@ -1102,20 +1269,34 @@ private:
     void PruneVdfHeaders(int64_t now) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex)
     {
         AssertLockHeld(g_msgproc_mutex);
+        // Pin on_active entries only within VDF_ANCHOR_PIN_DEPTH of the tip.
+        // Deeper entries are evictable: TryAnchorFromDisk recreates them on
+        // demand, and an unbounded pin would grow the map with chain height.
+        const int tip_height{WITH_LOCK(::cs_main, return m_chainman.ActiveChain().Height())};
+        const auto is_pinned = [tip_height](const VdfHeaderInfo& info) {
+            if (!info.on_active) return false;
+            if (info.height < 0 || tip_height < 0) return true;
+            return tip_height - info.height <= VDF_ANCHOR_PIN_DEPTH;
+        };
         for (auto it = m_vdf_headers.begin(); it != m_vdf_headers.end();) {
             VdfHeaderInfo& info = it->second;
-            const bool pinned = info.on_active;
-            if (!pinned && info.ts > 0 && now - info.ts > VDF_HEADER_TTL_SEC) {
+            if (!is_pinned(info) && info.ts > 0 && now - info.ts > VDF_HEADER_TTL_SEC) {
                 it = m_vdf_headers.erase(it);
             } else {
                 ++it;
             }
         }
 
-        if (m_vdf_headers.size() <= VDF_HEADERS_MAX_ENTRIES) return;
+        if (m_vdf_headers.size() <= VDF_HEADERS_MAX_ENTRIES) {
+            UpdateSpvStatsSnapshot();
+            return;
+        }
 
         size_t need = m_vdf_headers.size() - VDF_HEADERS_MAX_ENTRIES;
-        if (need == 0) return;
+        if (need == 0) {
+            UpdateSpvStatsSnapshot();
+            return;
+        }
 
         struct Victim {
             int64_t ts;
@@ -1125,7 +1306,7 @@ private:
         std::vector<Victim> candidates;
         candidates.reserve(m_vdf_headers.size());
         for (const auto& [hash, info] : m_vdf_headers) {
-            if (info.on_active) continue;
+            if (is_pinned(info)) continue;
             candidates.push_back(Victim{info.ts, hash});
         }
         std::sort(candidates.begin(), candidates.end(), [](const Victim& a, const Victim& b) {
@@ -1136,10 +1317,12 @@ private:
             if (need == 0) break;
             auto it = m_vdf_headers.find(victim.hash);
             if (it == m_vdf_headers.end()) continue;
-            if (it->second.on_active) continue;
+            if (is_pinned(it->second)) continue;
             m_vdf_headers.erase(it);
             --need;
         }
+
+        UpdateSpvStatsSnapshot();
     }
 
     void PruneVerifyCache(int64_t now) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex)
@@ -2400,6 +2583,34 @@ std::vector<TxOrphanage::OrphanTxBase> PeerManagerImpl::GetOrphanTransactions()
     return m_txdownloadman.GetOrphanTransactions();
 }
 
+SpvTickInfo PeerManagerImpl::GetSpvTickInfo(int height)
+{
+    // RPC-thread safe by construction: leaf mutexes only. Never touch
+    // g_msgproc_mutex here -- a busy message loop starves the RPC thread and a
+    // handful of stuck calls exhausts every RPC worker.
+    SpvTickInfo info;
+    info.min_cumulative_tick_per_block = m_min_cumulative_tick_per_block;
+    info.min_cumulative_tick_slack_days = m_min_cumulative_tick_slack_days;
+    {
+        const arith_uint256 floor{MinimumCumulativeTickFloor(height)};
+        const arith_uint256 max64{std::numeric_limits<uint64_t>::max()};
+        info.floor_at_height = floor > max64 ? std::numeric_limits<uint64_t>::max() : floor.GetLow64();
+    }
+    {
+        LOCK(m_spv_stats_mutex);
+        info.expected_tick_per_block = m_spv_stat_expected_tick;
+        info.vdf_header_entries = m_spv_stat_entries;
+        info.vdf_header_valid = m_spv_stat_valid;
+        info.vdf_header_anchored = m_spv_stat_anchored;
+    }
+    {
+        LOCK(m_sidecar_backfill_mutex);
+        for (const auto& [nodeid, q] : m_sidecar_backfill) info.backfill_peer_total += q.size();
+        info.backfill_staged_any = m_sidecar_backfill_any.size();
+    }
+    return info;
+}
+
 PeerManagerInfo PeerManagerImpl::GetInfo() const
 {
     return PeerManagerInfo{
@@ -2682,6 +2893,26 @@ void PeerManagerImpl::BlockConnected(
         }
     }
 
+    // Stage a verified cumulative-tick anchor for the connected block: its
+    // body's cumulative_tick has just passed consensus validation, so the
+    // sidecar cache can trust it as a cum_set anchor. Staged only -- taking
+    // g_msgproc_mutex from a validation callback deadlocks against
+    // LimitValidationInterfaceQueue (see m_pending_anchors). Applied by
+    // DrainPendingAnchors on the message thread.
+    {
+        LOCK(m_pending_anchors_mutex);
+        if (m_pending_anchors.size() < MAX_PENDING_ANCHORS) {
+            m_pending_anchors.push_back(PendingAnchor{pindex->GetBlockHash(),
+                                                      pblock->pow.tick,
+                                                      pblock->cumulative_tick,
+                                                      pindex->nHeight,
+                                                      /*pin_candidate=*/role != ChainstateRole::BACKGROUND,
+                                                      /*demote_only=*/false});
+        }
+        // Overflow entries are simply dropped: anchors are recreatable from
+        // disk on demand (TryAnchorFromDisk).
+    }
+
     // The following task can be skipped since we don't maintain a mempool for
     // the ibd/background chainstate.
     if (role == ChainstateRole::BACKGROUND) {
@@ -2693,6 +2924,19 @@ void PeerManagerImpl::BlockConnected(
 
 void PeerManagerImpl::BlockDisconnected(const std::shared_ptr<const CBlock> &block, const CBlockIndex* pindex)
 {
+    // Reorged-out block: keep the anchor (its cumulative_tick was validated
+    // when it connected, and remains correct for its own branch) but drop the
+    // active pin so TTL/cap pruning applies to it again. Staged, not applied
+    // -- same g_msgproc_mutex deadlock hazard as BlockConnected.
+    {
+        LOCK(m_pending_anchors_mutex);
+        if (m_pending_anchors.size() < MAX_PENDING_ANCHORS) {
+            m_pending_anchors.push_back(PendingAnchor{pindex->GetBlockHash(), 0, 0, pindex->nHeight,
+                                                      /*pin_candidate=*/false,
+                                                      /*demote_only=*/true});
+        }
+    }
+
     LOCK(m_tx_download_mutex);
     m_txdownloadman.BlockDisconnected();
 }
@@ -3472,6 +3716,26 @@ void PeerManagerImpl::HeadersDirectFetchBlocks(CNode& pfrom, const Peer& peer, c
                 if (!ok_cand) {
                     LogInfo("SPV min cumulative tick gate: candidate %s has no verified cumulative tick sidecar path\n",
                             last_header.GetBlockHash().ToString());
+                    // Self-heal instead of only refusing: request the sidecars
+                    // the path verification is missing. Security is unchanged
+                    // -- the candidate stays refused until the path verifies.
+                    auto missing = CollectMissingSidecarPath(&last_header, MAX_SIDECAR_BACKFILL_PER_PEER);
+                    if (!missing.empty()) {
+                        const bool announcer_vdfspv = (peer.m_their_services.load() & NODE_VDFSPV) == NODE_VDFSPV;
+                        LOCK(m_sidecar_backfill_mutex);
+                        if (announcer_vdfspv) {
+                            auto& q = m_sidecar_backfill[pfrom.GetId()];
+                            for (const auto& hp : missing) {
+                                if (q.size() >= MAX_SIDECAR_BACKFILL_PER_PEER) break;
+                                q.insert(hp);
+                            }
+                        } else {
+                            for (const auto& hp : missing) {
+                                if (m_sidecar_backfill_any.size() >= MAX_SIDECAR_BACKFILL_PER_PEER) break;
+                                m_sidecar_backfill_any.insert(hp);
+                            }
+                        }
+                    }
                     return;
                 }
                 if (cand_val < required_tick) {
@@ -5638,48 +5902,25 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
             }
         }
         // Phase 1: request VDF sidecars for these headers (if peer supports NODE_VDFSPV).
+        // Queue the whole batch; MaybeSendQueuedGetHeadersExt owns the
+        // per-minute send budget when draining. Truncating here (the old
+        // behavior) permanently dropped the overflow of a large HEADERS batch
+        // -- nothing ever re-requested those sidecars, leaving unverifiable
+        // holes in cumulative-tick paths.
         try {
             ServiceFlags srv = peer->m_their_services.load();
             if ((srv & NODE_VDFSPV) == NODE_VDFSPV) {
-                // Check our send rate limit window to avoid sending more HEADERS_EXT requests
-                // than the receive rate limit allows
-                auto& send_window = m_peer_ext_send_limits[pfrom.GetId()];
-                const int64_t now = GetTime();
-                if (send_window.window_start == 0 || now - send_window.window_start >= 60) {
-                    send_window.window_start = now;
-                    send_window.count = 0;
+                std::vector<VdfExtQueryItem> queries;
+                queries.reserve(nCount);
+                for (unsigned int n = 0; n < nCount; ++n) {
+                    VdfExtQueryItem it;
+                    it.header_hash = headers[n].GetHash();
+                    it.prev_hash = headers[n].hashPrevBlock;
+                    queries.push_back(it);
                 }
-
-                // Calculate how many HEADERS_EXT requests we can send without exceeding limits
-                // Leave some margin (100) for protocol overhead and other requests
-                const size_t safe_limit = MAX_HEADERS_EXT_PER_MIN - 100;
-                const size_t can_request = send_window.count < safe_limit ?
-                                          safe_limit - send_window.count : 0;
-
-                if (can_request > 0) {
-                    std::vector<VdfExtQueryItem> queries;
-                    const size_t request_count = std::min(static_cast<size_t>(nCount), can_request);
-                    queries.reserve(request_count);
-
-                    for (unsigned int n = 0; n < request_count; ++n) {
-                        VdfExtQueryItem it;
-                        it.header_hash = headers[n].GetHash();
-                        it.prev_hash = headers[n].hashPrevBlock;
-                        queries.push_back(it);
-                    }
-
-                    if (!queries.empty()) {
-                        QueueGetHeadersExt(*peer, std::move(queries));
-                        MaybeSendQueuedGetHeadersExt(pfrom, *peer, GetTime());
-
-                        if (request_count < nCount) {
-                            LogDebug(BCLog::NET, "Rate limited HEADERS_EXT requests: queued %zu of %u headers for peer=%d\n",
-                                     request_count, nCount, pfrom.GetId());
-                        }
-                    }
-                } else {
-                    LogDebug(BCLog::NET, "Skipping HEADERS_EXT requests for %u headers from peer=%d due to send rate limit\n",
-                             nCount, pfrom.GetId());
+                if (!queries.empty()) {
+                    QueueGetHeadersExt(*peer, std::move(queries));
+                    MaybeSendQueuedGetHeadersExt(pfrom, *peer, GetTime());
                 }
             }
         } catch (const std::exception&) {}
@@ -6732,8 +6973,24 @@ void PeerManagerImpl::QueueGetHeadersExt(Peer& peer, std::vector<VdfExtQueryItem
 {
     if (queries.empty()) return;
     LOCK(peer.m_headers_ext_mutex);
+    // Dedupe against what is already backlogged: overlapping HEADERS batches
+    // and gate backfills would otherwise queue (and send) the same header
+    // repeatedly within one drain window.
+    std::unordered_set<uint256, BlockHasher> queued;
+    queued.reserve(peer.m_headers_ext_backlog.size() + queries.size());
+    for (const auto& item : peer.m_headers_ext_backlog) queued.insert(item.header_hash);
+    size_t dropped{0};
     for (auto& q : queries) {
+        if (peer.m_headers_ext_backlog.size() >= MAX_HEADERS_EXT_BACKLOG_PER_PEER) {
+            ++dropped;
+            continue;
+        }
+        if (!queued.insert(q.header_hash).second) continue;
         peer.m_headers_ext_backlog.push_back(VdfExtBacklogItem{std::move(q.header_hash), std::move(q.prev_hash), 0});
+    }
+    if (dropped > 0) {
+        LogDebug(BCLog::NET, "headers-ext backlog full (%zu entries), dropped %zu queries\n",
+                 peer.m_headers_ext_backlog.size(), dropped);
     }
 }
 
@@ -6741,8 +6998,25 @@ void PeerManagerImpl::RequeueHeadersExt(Peer& peer, std::vector<VdfExtBacklogIte
 {
     if (queries.empty()) return;
     LOCK(peer.m_headers_ext_mutex);
+    // Same dedupe/cap discipline as QueueGetHeadersExt: retries re-enter at
+    // the front (they were already inflight once) but must not duplicate a
+    // backlogged entry or breach the per-peer bound. A dropped retry is
+    // recovered later by the gate backfill or a re-announcement.
+    std::unordered_set<uint256, BlockHasher> queued;
+    queued.reserve(peer.m_headers_ext_backlog.size() + queries.size());
+    for (const auto& item : peer.m_headers_ext_backlog) queued.insert(item.header_hash);
+    size_t dropped{0};
     for (auto it = queries.rbegin(); it != queries.rend(); ++it) {
+        if (peer.m_headers_ext_backlog.size() >= MAX_HEADERS_EXT_BACKLOG_PER_PEER) {
+            ++dropped;
+            continue;
+        }
+        if (!queued.insert(it->header_hash).second) continue;
         peer.m_headers_ext_backlog.push_front(std::move(*it));
+    }
+    if (dropped > 0) {
+        LogDebug(BCLog::NET, "headers-ext backlog full (%zu entries), dropped %zu retries\n",
+                 peer.m_headers_ext_backlog.size(), dropped);
     }
 }
 
@@ -6785,7 +7059,13 @@ void PeerManagerImpl::MaybeSendQueuedGetHeadersExt(CNode& node, Peer& peer, int6
         window.count = 0;
     }
 
-    const size_t available = window.count < MAX_HEADERS_EXT_PER_MIN ? MAX_HEADERS_EXT_PER_MIN - window.count : 0;
+    // Leave margin under the peer's receive limit (MAX_HEADERS_EXT_PER_MIN):
+    // sender and receiver minute-windows never align exactly, so sending the
+    // full budget can land >MAX inside the peer's window and draw a
+    // Misbehaving penalty. The fresh-HEADERS path used to enforce this
+    // margin before queueing moved here.
+    constexpr size_t SEND_BUDGET{MAX_HEADERS_EXT_PER_MIN - 100};
+    const size_t available = window.count < SEND_BUDGET ? SEND_BUDGET - window.count : 0;
     if (available == 0) return;
 
     std::vector<VdfExtQueryItem> batch;
@@ -6871,6 +7151,10 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
 {
     AssertLockNotHeld(m_tx_download_mutex);
     AssertLockHeld(g_msgproc_mutex);
+
+    // Apply anchor updates staged by validation callbacks (cheap no-op when
+    // empty; see m_pending_anchors for why callbacks cannot apply directly).
+    DrainPendingAnchors();
 
     PeerRef peer = GetPeerRef(pto->GetId());
     if (!peer) return false;
@@ -7372,6 +7656,18 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
         std::set<std::pair<uint256, uint256>> pending;
         {
             LOCK(m_sidecar_backfill_mutex);
+            // Hand peer-agnostic staged backfill (announcer without
+            // NODE_VDFSPV) to this peer if it advertises the service; it is
+            // then requested via the normal per-peer path below.
+            if (!m_sidecar_backfill_any.empty() &&
+                (peer->m_their_services.load() & NODE_VDFSPV) == NODE_VDFSPV) {
+                auto& q = m_sidecar_backfill[pto->GetId()];
+                for (auto any_it = m_sidecar_backfill_any.begin();
+                     any_it != m_sidecar_backfill_any.end() && q.size() < MAX_SIDECAR_BACKFILL_PER_PEER;) {
+                    q.insert(*any_it);
+                    any_it = m_sidecar_backfill_any.erase(any_it);
+                }
+            }
             auto it = m_sidecar_backfill.find(pto->GetId());
             if (it != m_sidecar_backfill.end()) { pending.swap(it->second); m_sidecar_backfill.erase(it); }
         }
@@ -7444,6 +7740,74 @@ void PeerAccess::RunVdfHeaderPrune(PeerManager& peerman)
     Assume(impl != nullptr);
     LOCK(NetEventsInterface::g_msgproc_mutex);
     impl->PruneVdfHeaders(GetTime());
+}
+
+void PeerAccess::ClearVdfHeaders(PeerManager& peerman)
+{
+    auto* impl = dynamic_cast<PeerManagerImpl*>(&peerman);
+    Assume(impl != nullptr);
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    impl->m_vdf_headers.clear();
+}
+
+void PeerAccess::DrainPendingAnchors(PeerManager& peerman)
+{
+    auto* impl = dynamic_cast<PeerManagerImpl*>(&peerman);
+    Assume(impl != nullptr);
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    impl->DrainPendingAnchors();
+}
+
+std::pair<bool, uint64_t> PeerAccess::ComputeCumFromGenesis(PeerManager& peerman, const uint256& tip_hash)
+{
+    auto* impl = dynamic_cast<PeerManagerImpl*>(&peerman);
+    Assume(impl != nullptr);
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    LOCK(cs_main);
+    const CBlockIndex* tip = impl->m_chainman.m_blockman.LookupBlockIndex(tip_hash);
+    if (!tip) return {false, 0};
+    auto [ok, cum] = impl->ComputeCumFromGenesis(tip, GetTime());
+    return {ok, cum.GetLow64()};
+}
+
+std::vector<std::pair<uint256, uint256>> PeerAccess::CollectMissingSidecarPath(PeerManager& peerman, const uint256& tip_hash, size_t max_items)
+{
+    auto* impl = dynamic_cast<PeerManagerImpl*>(&peerman);
+    Assume(impl != nullptr);
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    LOCK(cs_main);
+    const CBlockIndex* tip = impl->m_chainman.m_blockman.LookupBlockIndex(tip_hash);
+    if (!tip) return {};
+    return impl->CollectMissingSidecarPath(tip, max_items);
+}
+
+void PeerAccess::QueueHeadersExt(PeerManager& peerman, NodeId nodeid, const std::vector<std::pair<uint256, uint256>>& queries)
+{
+    auto* impl = dynamic_cast<PeerManagerImpl*>(&peerman);
+    Assume(impl != nullptr);
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    PeerRef peer = impl->GetPeerRef(nodeid);
+    if (!peer) return;
+    std::vector<PeerManagerImpl::VdfExtQueryItem> items;
+    items.reserve(queries.size());
+    for (const auto& [hash, prev] : queries) {
+        PeerManagerImpl::VdfExtQueryItem q;
+        q.header_hash = hash;
+        q.prev_hash = prev;
+        items.push_back(std::move(q));
+    }
+    impl->QueueGetHeadersExt(*peer, std::move(items));
+}
+
+size_t PeerAccess::HeadersExtBacklogSize(PeerManager& peerman, NodeId nodeid)
+{
+    auto* impl = dynamic_cast<PeerManagerImpl*>(&peerman);
+    Assume(impl != nullptr);
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    PeerRef peer = impl->GetPeerRef(nodeid);
+    if (!peer) return 0;
+    LOCK(peer->m_headers_ext_mutex);
+    return peer->m_headers_ext_backlog.size();
 }
 
 } // namespace net_processing_testing
