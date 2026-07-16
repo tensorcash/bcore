@@ -22,6 +22,8 @@
 const QString AddressTableModel::Send = "S";
 const QString AddressTableModel::Receive = "R";
 
+static constexpr int MAX_VISIBLE_UNLABELED_RECEIVE_ADDRESSES = 2000;
+
 struct AddressTableEntry
 {
     enum Type {
@@ -73,26 +75,45 @@ class AddressTablePriv
 public:
     QList<AddressTableEntry> cachedAddressTable;
     AddressTableModel *parent;
+    bool m_pk_hash_only{false};
+    bool m_hide_unlabeled_receives{false};
 
-    explicit AddressTablePriv(AddressTableModel *_parent):
-        parent(_parent) {}
+    explicit AddressTablePriv(AddressTableModel *_parent, bool pk_hash_only):
+        parent(_parent), m_pk_hash_only(pk_hash_only) {}
 
-    void refreshAddressTable(interfaces::Wallet& wallet, bool pk_hash_only = false)
+    bool shouldShowAddress(const CTxDestination& dest, const std::string& label, wallet::AddressPurpose purpose) const
+    {
+        if (m_pk_hash_only && !std::holds_alternative<PKHash>(dest)) {
+            return false;
+        }
+        if (m_hide_unlabeled_receives && purpose == wallet::AddressPurpose::RECEIVE && label.empty()) {
+            return false;
+        }
+        return true;
+    }
+
+    void refreshAddressTable(interfaces::Wallet& wallet)
     {
         cachedAddressTable.clear();
         {
-            for (const auto& address : wallet.getAddresses())
-            {
-                // Skip ML-DSA addresses if pk_hash_only filter is active
-                if (pk_hash_only && std::holds_alternative<WitnessV2Taproot>(address.dest)) {
-                    continue;
-                }
-                if (pk_hash_only && !std::holds_alternative<PKHash>(address.dest)) {
-                    continue;
-                }
+            const auto addresses = wallet.getAddresses();
+            const auto unlabeled_receive_count = std::count_if(addresses.begin(), addresses.end(), [](const auto& address) {
+                return address.purpose == wallet::AddressPurpose::RECEIVE && address.name.empty();
+            });
+            m_hide_unlabeled_receives = unlabeled_receive_count > MAX_VISIBLE_UNLABELED_RECEIVE_ADDRESSES;
+            if (m_hide_unlabeled_receives) {
+                qWarning() << "AddressTablePriv::refreshAddressTable: hiding"
+                           << unlabeled_receive_count
+                           << "unlabeled receive addresses from the GUI address table";
+            }
 
+            for (const auto& address : addresses)
+            {
                 AddressTableEntry::Type addressType = translateTransactionType(
                         address.purpose, address.is_mine);
+                if (!shouldShowAddress(address.dest, address.name, address.purpose)) {
+                    continue;
+                }
 
                 // Add [PQ] badge to label if it's a witness v2 ML-DSA address
                 QString label = QString::fromStdString(address.name);
@@ -122,6 +143,17 @@ public:
         int upperIndex = (upper - cachedAddressTable.begin());
         bool inModel = (lower != upper);
         AddressTableEntry::Type newEntryType = translateTransactionType(purpose, isMine);
+        const CTxDestination dest = DecodeDestination(address.toStdString());
+        const bool showEntry = shouldShowAddress(dest, label.toStdString(), purpose);
+
+        if (!showEntry) {
+            if (inModel) {
+                parent->beginRemoveRows(QModelIndex(), lowerIndex, upperIndex - 1);
+                cachedAddressTable.erase(lower, upper);
+                parent->endRemoveRows();
+            }
+            return;
+        }
 
         switch(status)
         {
@@ -138,7 +170,9 @@ public:
         case CT_UPDATED:
             if(!inModel)
             {
-                qWarning() << "AddressTablePriv::updateEntry: Warning: Got CT_UPDATED, but entry is not in model";
+                parent->beginInsertRows(QModelIndex(), lowerIndex, lowerIndex);
+                cachedAddressTable.insert(lowerIndex, AddressTableEntry(newEntryType, label, address));
+                parent->endInsertRows();
                 break;
             }
             lower->type = newEntryType;
@@ -180,8 +214,8 @@ AddressTableModel::AddressTableModel(WalletModel *parent, bool pk_hash_only) :
     QAbstractTableModel(parent), walletModel(parent)
 {
     columns << tr("Label") << tr("Address") << tr("Type");
-    priv = new AddressTablePriv(this);
-    priv->refreshAddressTable(parent->wallet(), pk_hash_only);
+    priv = new AddressTablePriv(this, pk_hash_only);
+    priv->refreshAddressTable(parent->wallet());
 }
 
 AddressTableModel::~AddressTableModel()
