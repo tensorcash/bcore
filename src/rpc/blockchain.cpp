@@ -1647,6 +1647,14 @@ void InvalidateBlock(ChainstateManager& chainman, const uint256 block_hash) {
         chainman.ActiveChainstate().ActivateBestChain(state);
     }
 
+    // The invalidation may have killed a gated candidate subtree (or promoted
+    // a gated branch's competitor): drop moot gates now instead of leaving
+    // them in getpendingreorg until timeout/TTL.
+    {
+        LOCK(chainman.GetMutex());
+        PruneMootReorgGates(chainman);
+    }
+
     if (!state.IsValid()) {
         throw JSONRPCError(RPC_DATABASE_ERROR, state.ToString());
     }
@@ -1692,6 +1700,13 @@ void ReconsiderBlock(ChainstateManager& chainman, uint256 block_hash) {
     ReorgGateOperatorAction operator_action;
     BlockValidationState state;
     chainman.ActiveChainstate().ActivateBestChain(state);
+
+    // Reconsidering may have forced a gated branch active: drop moot gates
+    // now instead of leaving them in getpendingreorg until timeout/TTL.
+    {
+        LOCK(chainman.GetMutex());
+        PruneMootReorgGates(chainman);
+    }
 
     if (!state.IsValid()) {
         throw JSONRPCError(RPC_DATABASE_ERROR, state.ToString());
@@ -3692,28 +3707,151 @@ static RPCHelpMan getlatestreorgadvisory()
     };
 }
 
+//! Serialize one reorg gate, including the §3.3 direction fields computed
+//! against the LIVE active tip so an operator (or automation) can tell a
+//! policy/penalty-manufactured reorg from a genuine raw-work deficit.
+static UniValue ReorgGateToJSON(ChainstateManager& chainman, const ReorgGateEntry& gate,
+                                const ReorgGatingConfig& config)
+    EXCLUSIVE_LOCKS_REQUIRED(cs_main)
+{
+    AssertLockHeld(cs_main);
+    const int64_t now{GetTime()};
+
+    UniValue obj(UniValue::VOBJ);
+    obj.pushKV("gate_id", gate.gate_id);
+    obj.pushKV("state", gate.gate_state == ReorgGateState::PENDING ? "pending" : "vetoed");
+    obj.pushKV("candidate_tip", gate.candidate_tip_hash.ToString());
+    obj.pushKV("current_tip", gate.current_tip_hash.ToString());
+    obj.pushKV("fork_point", gate.fork_point_hash.ToString());
+    obj.pushKV("anchor", gate.anchor_hash.ToString());
+    obj.pushKV("pending_since", gate.pending_since);
+    if (gate.gate_state == ReorgGateState::PENDING) {
+        const int64_t remaining{config.timeout_secs - (now - gate.pending_since)};
+        obj.pushKV("timeout_remaining", remaining > 0 ? remaining : 0);
+    } else {
+        obj.pushKV("vetoed_at", gate.vetoed_at);
+        const int64_t remaining{config.veto_ttl_secs - (now - gate.vetoed_at)};
+        obj.pushKV("veto_expires_in", remaining > 0 ? remaining : 0);
+    }
+    obj.pushKV("depth_current", gate.advisory.depth_current);
+    obj.pushKV("depth_fork", gate.advisory.depth_fork);
+    obj.pushKV("tx_overlap_pct", gate.advisory.tx_overlap_pct);
+    obj.pushKV("hashrate_current_pct", gate.advisory.hashrate_current_pct);
+    obj.pushKV("hashrate_fork_pct", gate.advisory.hashrate_fork_pct);
+
+    const CBlockIndex* tip{chainman.ActiveChain().Tip()};
+    const CBlockIndex* candidate{chainman.m_blockman.LookupBlockIndex(gate.candidate_tip_hash)};
+    const CBlockIndex* fork_point{chainman.m_blockman.LookupBlockIndex(gate.fork_point_hash)};
+
+    // Work comparison: fresh when both indexes are available, else the
+    // snapshot recorded when the gate was armed.
+    ReorgGateWorkSnapshot work{gate.work};
+    if (tip && candidate) {
+        work = ComputeReorgGateWorkSnapshot(*tip, *candidate);
+    }
+    const auto effective{[](const arith_uint256& w, const arith_uint256& p) {
+        return w >= p ? w - p : arith_uint256{};
+    }};
+    obj.pushKV("current_effective_work", effective(work.current_work, work.current_penalty).GetHex());
+    obj.pushKV("candidate_effective_work", effective(work.candidate_work, work.candidate_penalty).GetHex());
+    obj.pushKV("current_raw_work", work.current_raw_work.GetHex());
+    obj.pushKV("candidate_raw_work", work.candidate_raw_work.GetHex());
+    obj.pushKV("current_policy_work", work.current_work.GetHex());
+    obj.pushKV("candidate_policy_work", work.candidate_work.GetHex());
+    obj.pushKV("current_penalty", work.current_penalty.GetHex());
+    obj.pushKV("candidate_penalty", work.candidate_penalty.GetHex());
+    obj.pushKV("penalty_or_policy_driven", work.penalty_or_policy_driven);
+
+    // Is our own tip on the best-header chain? If not, the runbook rule is
+    // reconsider/accept - refuse blind invalidation.
+    bool tip_on_best_header{false};
+    if (tip && chainman.m_best_header) {
+        tip_on_best_header = chainman.m_best_header->GetAncestor(tip->nHeight) == tip;
+    }
+    obj.pushKV("tip_on_best_header_chain", tip_on_best_header);
+
+    // Candidate body availability (headers-only branches cannot connect).
+    bool candidate_has_data{candidate != nullptr};
+    for (const CBlockIndex* walk{candidate}; walk && fork_point && walk != fork_point && walk->nHeight > fork_point->nHeight; walk = walk->pprev) {
+        if (!(walk->nStatus & BLOCK_HAVE_DATA)) {
+            candidate_has_data = false;
+            break;
+        }
+    }
+    obj.pushKV("candidate_has_data", candidate_has_data);
+
+    // Was the active side locally demoted by a Full_Red verdict? A true here
+    // means the "reorg" may be manufactured by local policy, not by work.
+    bool tip_demoted{false};
+    for (const CBlockIndex* walk{tip}; walk && fork_point && walk != fork_point && walk->nHeight > fork_point->nHeight; walk = walk->pprev) {
+        if (walk->nStatus & BLOCK_FULL_RED_LOCAL) {
+            tip_demoted = true;
+            break;
+        }
+    }
+    obj.pushKV("tip_demoted_by_full_red", tip_demoted);
+
+    return obj;
+}
+
 static RPCHelpMan getpendingreorg()
 {
     return RPCHelpMan{"getpendingreorg",
-                "\nReturns the pending reorg awaiting operator decision, or null if none.\n"
+                "\nReturns the reorg gates awaiting operator decision (and active vetoes), or null if none.\n"
                 "This only returns a value when -reorgadvisorygating=1 is set and a deep reorg\n"
-                "has been detected that requires operator approval.\n",
+                "has been detected that requires operator approval.\n"
+                "When exactly one gate exists its fields are additionally mirrored at the top\n"
+                "level for compatibility with existing runbooks.\n",
                 {},
                 {
-                    RPCResult{"If no pending reorg", RPCResult::Type::NONE, "", ""},
+                    RPCResult{"If no gate", RPCResult::Type::NONE, "", ""},
                     RPCResult{"Otherwise", RPCResult::Type::OBJ, "", "",
                     {
-                        {RPCResult::Type::BOOL, "pending", "Whether there is a pending reorg"},
-                        {RPCResult::Type::STR_HEX, "candidate_tip", "Hash of the candidate (fork) tip"},
-                        {RPCResult::Type::STR_HEX, "current_tip", "Hash of the current chain tip"},
-                        {RPCResult::Type::STR_HEX, "fork_point", "Hash of the fork point (last common ancestor)"},
-                        {RPCResult::Type::NUM, "pending_since", "Unix timestamp when pending state was set"},
-                        {RPCResult::Type::NUM, "timeout_remaining", "Seconds remaining until timeout"},
-                        {RPCResult::Type::NUM, "depth_current", "Reorg depth on current chain"},
-                        {RPCResult::Type::NUM, "depth_fork", "Reorg depth on fork chain"},
-                        {RPCResult::Type::NUM, "tx_overlap_pct", "Transaction overlap percentage"},
-                        {RPCResult::Type::NUM, "hashrate_current_pct", "Hashrate on current chain as % of baseline"},
-                        {RPCResult::Type::NUM, "hashrate_fork_pct", "Hashrate on fork chain as % of baseline"},
+                        {RPCResult::Type::NUM, "gate_count", "Number of live gates (pending and vetoed)"},
+                        {RPCResult::Type::ARR, "gates", "One entry per live gate",
+                        {
+                            {RPCResult::Type::OBJ, "", "",
+                            {
+                                {RPCResult::Type::NUM, "gate_id", "Gate identifier; pass to submitreorgdecision/clearreorgveto"},
+                                {RPCResult::Type::STR, "state", "\"pending\" (awaiting decision) or \"vetoed\" (operator rejected, TTL running)"},
+                                {RPCResult::Type::STR_HEX, "candidate_tip", "Hash of the candidate (fork) tip"},
+                                {RPCResult::Type::STR_HEX, "current_tip", "Hash of the chain tip when the gate was armed"},
+                                {RPCResult::Type::STR_HEX, "fork_point", "Hash of the fork point (last common ancestor)"},
+                                {RPCResult::Type::STR_HEX, "anchor", "Hash of the candidate subtree anchor (fork-point child)"},
+                                {RPCResult::Type::NUM, "pending_since", "Unix timestamp when the gate was armed"},
+                                {RPCResult::Type::NUM, "timeout_remaining", /*optional=*/true, "Seconds until the timeout default action (pending gates)"},
+                                {RPCResult::Type::NUM, "vetoed_at", /*optional=*/true, "Unix timestamp of the operator REJECT (vetoed gates)"},
+                                {RPCResult::Type::NUM, "veto_expires_in", /*optional=*/true, "Seconds until the veto expires and the branch may re-prompt (vetoed gates)"},
+                                {RPCResult::Type::NUM, "depth_current", "Reorg depth on current chain"},
+                                {RPCResult::Type::NUM, "depth_fork", "Reorg depth on fork chain"},
+                                {RPCResult::Type::NUM, "tx_overlap_pct", "Transaction overlap percentage"},
+                                {RPCResult::Type::NUM, "hashrate_current_pct", "Hashrate on current chain as % of baseline"},
+                                {RPCResult::Type::NUM, "hashrate_fork_pct", "Hashrate on fork chain as % of baseline"},
+                                {RPCResult::Type::STR_HEX, "current_effective_work", "Active tip chainwork as the fork-choice comparator sees it (policy work minus penalty)"},
+                                {RPCResult::Type::STR_HEX, "candidate_effective_work", "Candidate tip effective chainwork"},
+                                {RPCResult::Type::STR_HEX, "current_raw_work", "Active tip RAW consensus chainwork (never policy-mutated)"},
+                                {RPCResult::Type::STR_HEX, "candidate_raw_work", "Candidate tip RAW consensus chainwork"},
+                                {RPCResult::Type::STR_HEX, "current_policy_work", "Active tip policy chainwork (after Full_Red/zero-work demotion)"},
+                                {RPCResult::Type::STR_HEX, "candidate_policy_work", "Candidate tip policy chainwork"},
+                                {RPCResult::Type::STR_HEX, "current_penalty", "Active tip cumulative full-red penalty"},
+                                {RPCResult::Type::STR_HEX, "candidate_penalty", "Candidate tip cumulative full-red penalty"},
+                                {RPCResult::Type::BOOL, "penalty_or_policy_driven", "Candidate wins on effective work but NOT on raw work: the reorg is manufactured by local penalty/policy, not by consensus work"},
+                                {RPCResult::Type::BOOL, "tip_on_best_header_chain", "Whether our tip is on the best-header chain. If false, prefer reconsider/accept over invalidation"},
+                                {RPCResult::Type::BOOL, "candidate_has_data", "Whether all candidate-branch blocks down to the fork point have bodies"},
+                                {RPCResult::Type::BOOL, "tip_demoted_by_full_red", "Whether a block on the active side above the fork point was locally demoted by Full_Red"},
+                            }},
+                        }},
+                        {RPCResult::Type::BOOL, "pending", /*optional=*/true, "(exactly one gate) legacy mirror: whether that gate awaits a decision"},
+                        {RPCResult::Type::STR_HEX, "candidate_tip", /*optional=*/true, "(exactly one gate) legacy mirror of gates[0].candidate_tip"},
+                        {RPCResult::Type::STR_HEX, "current_tip", /*optional=*/true, "(exactly one gate) legacy mirror of gates[0].current_tip"},
+                        {RPCResult::Type::STR_HEX, "fork_point", /*optional=*/true, "(exactly one gate) legacy mirror of gates[0].fork_point"},
+                        {RPCResult::Type::NUM, "pending_since", /*optional=*/true, "(exactly one gate) legacy mirror of gates[0].pending_since"},
+                        {RPCResult::Type::NUM, "timeout_remaining", /*optional=*/true, "(exactly one gate) legacy mirror: seconds until the timeout default action"},
+                        {RPCResult::Type::NUM, "depth_current", /*optional=*/true, "(exactly one gate) legacy mirror of gates[0].depth_current"},
+                        {RPCResult::Type::NUM, "depth_fork", /*optional=*/true, "(exactly one gate) legacy mirror of gates[0].depth_fork"},
+                        {RPCResult::Type::NUM, "tx_overlap_pct", /*optional=*/true, "(exactly one gate) legacy mirror of gates[0].tx_overlap_pct"},
+                        {RPCResult::Type::NUM, "hashrate_current_pct", /*optional=*/true, "(exactly one gate) legacy mirror of gates[0].hashrate_current_pct"},
+                        {RPCResult::Type::NUM, "hashrate_fork_pct", /*optional=*/true, "(exactly one gate) legacy mirror of gates[0].hashrate_fork_pct"},
                     }},
                 },
                 RPCExamples{
@@ -3722,26 +3860,39 @@ static RPCHelpMan getpendingreorg()
                 },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
+    ChainstateManager& chainman = EnsureAnyChainman(request.context);
     ReorgGatingManager& mgr = GetReorgGatingManager();
 
-    if (!mgr.HasPending()) {
+    const std::vector<ReorgGateEntry> gates = mgr.GetGates();
+    if (gates.empty()) {
         return UniValue(UniValue::VNULL);
     }
+    const ReorgGatingConfig config = GetReorgGatingConfig();
 
-    PendingReorgState pending = mgr.GetPending();
-
+    LOCK(cs_main);
     UniValue obj(UniValue::VOBJ);
-    obj.pushKV("pending", pending.is_pending);
-    obj.pushKV("candidate_tip", pending.candidate_tip_hash.ToString());
-    obj.pushKV("current_tip", pending.current_tip_hash.ToString());
-    obj.pushKV("fork_point", pending.fork_point_hash.ToString());
-    obj.pushKV("pending_since", pending.pending_since);
-    obj.pushKV("timeout_remaining", mgr.GetTimeoutRemaining());
-    obj.pushKV("depth_current", pending.advisory.depth_current);
-    obj.pushKV("depth_fork", pending.advisory.depth_fork);
-    obj.pushKV("tx_overlap_pct", pending.advisory.tx_overlap_pct);
-    obj.pushKV("hashrate_current_pct", pending.advisory.hashrate_current_pct);
-    obj.pushKV("hashrate_fork_pct", pending.advisory.hashrate_fork_pct);
+    obj.pushKV("gate_count", static_cast<uint64_t>(gates.size()));
+    UniValue arr(UniValue::VARR);
+    for (const ReorgGateEntry& gate : gates) {
+        arr.push_back(ReorgGateToJSON(chainman, gate, config));
+    }
+    obj.pushKV("gates", arr);
+
+    if (gates.size() == 1) {
+        // Legacy single-gate shape at the top level, for runbook compatibility.
+        const ReorgGateEntry& gate = gates.front();
+        obj.pushKV("pending", gate.gate_state == ReorgGateState::PENDING);
+        obj.pushKV("candidate_tip", gate.candidate_tip_hash.ToString());
+        obj.pushKV("current_tip", gate.current_tip_hash.ToString());
+        obj.pushKV("fork_point", gate.fork_point_hash.ToString());
+        obj.pushKV("pending_since", gate.pending_since);
+        obj.pushKV("timeout_remaining", mgr.GetTimeoutRemaining());
+        obj.pushKV("depth_current", gate.advisory.depth_current);
+        obj.pushKV("depth_fork", gate.advisory.depth_fork);
+        obj.pushKV("tx_overlap_pct", gate.advisory.tx_overlap_pct);
+        obj.pushKV("hashrate_current_pct", gate.advisory.hashrate_current_pct);
+        obj.pushKV("hashrate_fork_pct", gate.advisory.hashrate_fork_pct);
+    }
 
     return obj;
 },
@@ -3751,21 +3902,29 @@ static RPCHelpMan getpendingreorg()
 static RPCHelpMan submitreorgdecision()
 {
     return RPCHelpMan{"submitreorgdecision",
-                "\nSubmit an operator decision for a pending deep reorg.\n"
-                "This command is used when -reorgadvisorygating=1 is enabled and the node\n"
-                "has paused awaiting operator approval for a chain reorganization.\n",
+                "\nSubmit an operator decision for a reorg gate.\n"
+                "This command is used when -reorgadvisorygating=1 is enabled and a deep reorg\n"
+                "awaits operator approval (see getpendingreorg).\n"
+                "'accept' records a durable approval and lets the switch proceed; 'reject'\n"
+                "records a TTL-bound local veto that expires early if the branch keeps growing\n"
+                "or its raw-work margin over our tip grows (it can also be lifted with\n"
+                "clearreorgveto). gate_id may be omitted only while exactly one gate exists.\n",
                 {
                     {"action", RPCArg::Type::STR, RPCArg::Optional::NO, "The decision: 'accept' to switch to the fork, 'reject' to stay on current chain"},
+                    {"gate_id", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Gate to decide (from getpendingreorg). Required when more than one gate exists."},
+                    {"invalidate", RPCArg::Type::BOOL, RPCArg::Default{false}, "EMERGENCY, 'reject' only: additionally mark the candidate subtree invalid (BLOCK_FAILED) in the same operation. This is a local consensus-invalid mark, NOT a reversible veto - reserve it for confirmed-garbage branches and undo only via reconsiderblock."},
                 },
                 RPCResult{RPCResult::Type::OBJ, "", "",
                 {
                     {RPCResult::Type::BOOL, "success", "Whether the decision was accepted"},
                     {RPCResult::Type::STR, "action", "The action that was submitted"},
+                    {RPCResult::Type::NUM, "gate_id", /*optional=*/true, "The gate the decision was applied to"},
                     {RPCResult::Type::STR, "message", "Status message"},
                 }},
                 RPCExamples{
                     HelpExampleCli("submitreorgdecision", "accept")
-                    + HelpExampleCli("submitreorgdecision", "reject")
+                    + HelpExampleCli("submitreorgdecision", "reject 3")
+                    + HelpExampleCli("submitreorgdecision", "reject 3 true")
                     + HelpExampleRpc("submitreorgdecision", "\"accept\"")
                 },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
@@ -3781,25 +3940,144 @@ static RPCHelpMan submitreorgdecision()
         throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid action. Must be 'accept' or 'reject'.");
     }
 
+    std::optional<uint64_t> gate_id;
+    if (!request.params[1].isNull()) {
+        gate_id = request.params[1].getInt<uint64_t>();
+    }
+    const bool invalidate{request.params[2].isNull() ? false : request.params[2].get_bool()};
+    if (invalidate && decision != ReorgDecision::REJECT) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "invalidate=true is only valid with action 'reject'.");
+    }
+
     ReorgGatingManager& mgr = GetReorgGatingManager();
 
     UniValue result(UniValue::VOBJ);
     result.pushKV("action", action);
 
-    if (!mgr.HasPending()) {
+    // Capture the anchor before the transition: in BLOCK mode the parked
+    // waiter erases the gate as soon as the decision lands.
+    uint256 anchor_hash;
+    if (invalidate) {
+        const std::vector<ReorgGateEntry> gates = mgr.GetGates();
+        const ReorgGateEntry* target{nullptr};
+        if (gate_id) {
+            for (const ReorgGateEntry& gate : gates) {
+                if (gate.gate_id == *gate_id) target = &gate;
+            }
+        } else if (gates.size() == 1) {
+            target = &gates.front();
+        }
+        if (!target) {
+            result.pushKV("success", false);
+            result.pushKV("message", gates.empty()
+                ? "No reorg gate exists. Either gating is disabled or no deep reorg was detected."
+                : "Multiple gates exist; pass the gate_id from getpendingreorg.");
+            return result;
+        }
+        anchor_hash = target->anchor_hash;
+    }
+
+    uint64_t resolved_id{0};
+    const ReorgGatingManager::SubmitStatus status = mgr.SubmitDecision(gate_id, decision, &resolved_id);
+
+    switch (status) {
+    case ReorgGatingManager::SubmitStatus::OK:
+        break;
+    case ReorgGatingManager::SubmitStatus::NO_GATE:
         result.pushKV("success", false);
         result.pushKV("message", "No pending reorg decision. Either gating is disabled or no deep reorg was detected.");
         return result;
+    case ReorgGatingManager::SubmitStatus::UNKNOWN_GATE:
+        result.pushKV("success", false);
+        result.pushKV("message", strprintf("No gate with id %d. It may already have been decided; see getpendingreorg.", gate_id.value_or(0)));
+        return result;
+    case ReorgGatingManager::SubmitStatus::AMBIGUOUS:
+        result.pushKV("success", false);
+        result.pushKV("message", "Multiple gates exist; pass the gate_id from getpendingreorg.");
+        return result;
+    case ReorgGatingManager::SubmitStatus::BAD_STATE:
+        result.pushKV("success", false);
+        result.pushKV("message", "Failed to submit decision. The gate state may have changed.");
+        return result;
     }
 
-    bool submitted = mgr.SubmitDecision(decision);
-    result.pushKV("success", submitted);
+    result.pushKV("gate_id", resolved_id);
 
-    if (submitted) {
-        result.pushKV("message", strprintf("Decision '%s' submitted. The node will now %s.",
-            action, action == "accept" ? "proceed with the chain switch" : "stay on the current chain"));
-    } else {
-        result.pushKV("message", "Failed to submit decision. The pending state may have changed.");
+    if (invalidate) {
+        // Emergency path: kill the whole candidate subtree with a durable
+        // BLOCK_FAILED mark in the same operation, so the reject cannot race
+        // a re-arm. InvalidateBlock carries the operator RAII guard.
+        ChainstateManager& chainman = EnsureAnyChainman(request.context);
+        InvalidateBlock(chainman, anchor_hash);
+        mgr.RemoveGate(resolved_id, "reject with invalidate: candidate subtree marked BLOCK_FAILED");
+        result.pushKV("success", true);
+        result.pushKV("message", strprintf("Decision 'reject' submitted and candidate subtree at anchor %s marked invalid. Undo with reconsiderblock if mistaken.", anchor_hash.ToString()));
+        return result;
+    }
+
+    result.pushKV("success", true);
+    result.pushKV("message", strprintf("Decision '%s' submitted. The node will now %s.",
+        action, action == "accept" ? "proceed with the chain switch" : "stay on the current chain"));
+
+    return result;
+},
+    };
+}
+
+static RPCHelpMan clearreorgveto()
+{
+    return RPCHelpMan{"clearreorgveto",
+                "\nLift the veto recorded by a 'submitreorgdecision reject' so the branch may\n"
+                "prompt again on the next chain activation. gate_id may be omitted only while\n"
+                "exactly one gate exists.\n",
+                {
+                    {"gate_id", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Vetoed gate to clear (from getpendingreorg)"},
+                },
+                RPCResult{RPCResult::Type::OBJ, "", "",
+                {
+                    {RPCResult::Type::BOOL, "success", "Whether a veto was cleared"},
+                    {RPCResult::Type::NUM, "gate_id", /*optional=*/true, "The gate whose veto was cleared"},
+                    {RPCResult::Type::STR, "message", "Status message"},
+                }},
+                RPCExamples{
+                    HelpExampleCli("clearreorgveto", "")
+                    + HelpExampleCli("clearreorgveto", "3")
+                    + HelpExampleRpc("clearreorgveto", "3")
+                },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    std::optional<uint64_t> gate_id;
+    if (!request.params[0].isNull()) {
+        gate_id = request.params[0].getInt<uint64_t>();
+    }
+
+    ReorgGatingManager& mgr = GetReorgGatingManager();
+    uint64_t resolved_id{0};
+    const ReorgGatingManager::SubmitStatus status = mgr.ClearVeto(gate_id, &resolved_id);
+
+    UniValue result(UniValue::VOBJ);
+    switch (status) {
+    case ReorgGatingManager::SubmitStatus::OK:
+        result.pushKV("success", true);
+        result.pushKV("gate_id", resolved_id);
+        result.pushKV("message", "Veto cleared. The branch may prompt again on the next chain activation.");
+        break;
+    case ReorgGatingManager::SubmitStatus::NO_GATE:
+        result.pushKV("success", false);
+        result.pushKV("message", "No reorg gate exists.");
+        break;
+    case ReorgGatingManager::SubmitStatus::UNKNOWN_GATE:
+        result.pushKV("success", false);
+        result.pushKV("message", strprintf("No gate with id %d; see getpendingreorg.", gate_id.value_or(0)));
+        break;
+    case ReorgGatingManager::SubmitStatus::AMBIGUOUS:
+        result.pushKV("success", false);
+        result.pushKV("message", "Multiple gates exist; pass the gate_id from getpendingreorg.");
+        break;
+    case ReorgGatingManager::SubmitStatus::BAD_STATE:
+        result.pushKV("success", false);
+        result.pushKV("message", "That gate is not vetoed (it is still awaiting a decision).");
+        break;
     }
 
     return result;
@@ -3839,6 +4117,7 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"blockchain", &getlatestreorgadvisory},
         {"blockchain", &getpendingreorg},
         {"blockchain", &submitreorgdecision},
+        {"blockchain", &clearreorgveto},
         {"hidden", &invalidateblock},
         {"hidden", &reconsiderblock},
         {"hidden", &waitfornewblock},

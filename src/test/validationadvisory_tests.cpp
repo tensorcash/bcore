@@ -298,13 +298,66 @@ BOOST_AUTO_TEST_CASE(should_gate_reorg_skips_operator_initiated_actions)
     BOOST_CHECK(ShouldGateReorg(ADVISORY_DEPTH_THRESHOLD + 1, 0, /*disconnect_only=*/false, config));
 }
 
+namespace {
+
+//! Deterministic gating config for manager tests (never reads gArgs).
+ReorgGatingConfig TestGatingConfig(ReorgGatingMode mode)
+{
+    ReorgGatingConfig config;
+    config.enabled = true;
+    config.gating_depth_threshold = ADVISORY_DEPTH_THRESHOLD;
+    config.timeout_secs = 600;
+    config.timeout_accept = false;
+    config.approval_ttl_secs = DEFAULT_REORG_APPROVAL_TTL_SECS;
+    config.gating_mode = mode;
+    config.veto_ttl_secs = 600;
+    config.veto_growth_blocks = 3;
+    return config;
+}
+
+//! Work snapshot from small integers (raw sides drive the guardrails).
+ReorgGateWorkSnapshot TestWork(uint64_t current_raw, uint64_t candidate_raw, bool penalty_driven = false)
+{
+    ReorgGateWorkSnapshot work;
+    work.current_raw_work = arith_uint256{current_raw};
+    work.candidate_raw_work = arith_uint256{candidate_raw};
+    work.current_work = arith_uint256{current_raw};
+    work.candidate_work = arith_uint256{candidate_raw};
+    work.penalty_or_policy_driven = penalty_driven;
+    return work;
+}
+
+uint256 TestHash(uint8_t tag)
+{
+    return uint256::FromHex(strprintf("%062x%02x", 0, tag)).value();
+}
+
+//! Arm a gate on mgr with distinct hashes derived from tag.
+uint64_t ArmTestGate(ReorgGatingManager& mgr, uint8_t tag, int candidate_height = 100,
+                     const ReorgGateWorkSnapshot& work = TestWork(50, 60))
+{
+    ReorgAdvisory advisory;
+    advisory.is_valid = true;
+    advisory.depth_current = 7;
+    return mgr.SetPending(advisory,
+                          /*candidate_tip_hash=*/TestHash(tag),
+                          candidate_height,
+                          /*current_tip_hash=*/TestHash(0xb0),
+                          /*fork_point_hash=*/TestHash(0xc0),
+                          /*anchor_hash=*/TestHash(tag + 1),
+                          work);
+}
+
+} // namespace
+
 BOOST_AUTO_TEST_CASE(reorg_gating_approval_lifecycle)
 {
-    ReorgGatingManager mgr;
+    ReorgGatingManager mgr{TestGatingConfig(ReorgGatingMode::BLOCK)};
 
     const uint256 candidate = uint256::FromHex("00000000000000000000000000000000000000000000000000000000000000aa").value();
     const uint256 current = uint256::FromHex("00000000000000000000000000000000000000000000000000000000000000bb").value();
     const uint256 fork_point = uint256::FromHex("00000000000000000000000000000000000000000000000000000000000000cc").value();
+    const uint256 anchor = uint256::FromHex("00000000000000000000000000000000000000000000000000000000000000dd").value();
 
     // No approval before any decision.
     BOOST_CHECK(!mgr.GetApproval().is_valid);
@@ -316,8 +369,13 @@ BOOST_AUTO_TEST_CASE(reorg_gating_approval_lifecycle)
     ReorgAdvisory advisory;
     advisory.depth_current = 5;
     advisory.is_valid = true;
-    mgr.SetPending(advisory, candidate, current, fork_point);
-    BOOST_CHECK(mgr.GetPending().fork_point_hash == fork_point);
+    const uint64_t gate_id = mgr.SetPending(advisory, candidate, /*candidate_height=*/105,
+                                            current, fork_point, anchor, TestWork(50, 60));
+    const auto gate = mgr.GetGate(gate_id);
+    BOOST_REQUIRE(gate.has_value());
+    BOOST_CHECK(gate->fork_point_hash == fork_point);
+    BOOST_CHECK(gate->anchor_hash == anchor);
+    BOOST_CHECK(gate->gate_state == ReorgGateState::PENDING);
 
     mgr.RecordApprovalFromPending();
     mgr.ClearPending();
@@ -325,6 +383,7 @@ BOOST_AUTO_TEST_CASE(reorg_gating_approval_lifecycle)
     // Approval survives ClearPending and matches the accepted reorg,
     // including the old tip it was granted against.
     BOOST_CHECK(!mgr.HasPending());
+    BOOST_CHECK_EQUAL(mgr.GateCount(), 0u);
     ReorgApprovalState approval = mgr.GetApproval();
     BOOST_CHECK(approval.is_valid);
     BOOST_CHECK(approval.fork_point_hash == fork_point);
@@ -338,15 +397,16 @@ BOOST_AUTO_TEST_CASE(reorg_gating_approval_lifecycle)
 BOOST_AUTO_TEST_CASE(reorg_gating_approval_ttl)
 {
     SetMockTime(1000000);
-    ReorgGatingManager mgr;
+    ReorgGatingManager mgr{TestGatingConfig(ReorgGatingMode::BLOCK)};
 
     const uint256 candidate = uint256::FromHex("00000000000000000000000000000000000000000000000000000000000000aa").value();
     const uint256 current = uint256::FromHex("00000000000000000000000000000000000000000000000000000000000000bb").value();
     const uint256 fork_point = uint256::FromHex("00000000000000000000000000000000000000000000000000000000000000cc").value();
+    const uint256 anchor = uint256::FromHex("00000000000000000000000000000000000000000000000000000000000000dd").value();
 
     ReorgAdvisory advisory;
     advisory.is_valid = true;
-    mgr.SetPending(advisory, candidate, current, fork_point);
+    mgr.SetPending(advisory, candidate, /*candidate_height=*/105, current, fork_point, anchor, TestWork(50, 60));
     mgr.RecordApprovalFromPending();
     mgr.ClearPending();
 
@@ -361,6 +421,348 @@ BOOST_AUTO_TEST_CASE(reorg_gating_approval_ttl)
     BOOST_CHECK(!mgr.GetApproval().is_valid);
 
     SetMockTime(0);
+}
+
+BOOST_AUTO_TEST_CASE(reorg_gating_keyed_map_lifecycle)
+{
+    ReorgGatingManager mgr{TestGatingConfig(ReorgGatingMode::MASK)};
+
+    // Two distinct {fork point, anchor} keys coexist with monotonic ids.
+    const uint64_t id_a = ArmTestGate(mgr, /*tag=*/0x10, /*candidate_height=*/100);
+    const uint64_t id_b = ArmTestGate(mgr, /*tag=*/0x20, /*candidate_height=*/101);
+    BOOST_CHECK(id_b > id_a);
+    BOOST_CHECK_EQUAL(mgr.GateCount(), 2u);
+    BOOST_CHECK(mgr.HasPending());
+
+    // Re-arming an existing key is idempotent: same gate id, refreshed
+    // candidate tip/height, no duplicate entry.
+    ReorgAdvisory advisory;
+    advisory.is_valid = true;
+    const uint64_t id_a2 = mgr.SetPending(advisory, TestHash(0x99), /*candidate_height=*/107,
+                                          TestHash(0xb0), TestHash(0xc0), TestHash(0x11), TestWork(50, 70));
+    BOOST_CHECK_EQUAL(id_a2, id_a);
+    BOOST_CHECK_EQUAL(mgr.GateCount(), 2u);
+    const auto refreshed = mgr.GetGate(id_a);
+    BOOST_REQUIRE(refreshed.has_value());
+    BOOST_CHECK(refreshed->candidate_tip_hash == TestHash(0x99));
+    BOOST_CHECK_EQUAL(refreshed->candidate_height, 107);
+
+    // GetGates is sorted by gate id.
+    const auto gates = mgr.GetGates();
+    BOOST_REQUIRE_EQUAL(gates.size(), 2u);
+    BOOST_CHECK_EQUAL(gates[0].gate_id, id_a);
+    BOOST_CHECK_EQUAL(gates[1].gate_id, id_b);
+}
+
+BOOST_AUTO_TEST_CASE(reorg_gating_gate_id_targeting)
+{
+    ReorgGatingManager mgr{TestGatingConfig(ReorgGatingMode::MASK)};
+
+    // No gate at all.
+    BOOST_CHECK(mgr.SubmitDecision(std::nullopt, ReorgDecision::ACCEPT) ==
+                ReorgGatingManager::SubmitStatus::NO_GATE);
+
+    const uint64_t id_a = ArmTestGate(mgr, 0x10);
+    const uint64_t id_b = ArmTestGate(mgr, 0x20);
+
+    // Bare form is refused while more than one gate exists.
+    BOOST_CHECK(mgr.SubmitDecision(std::nullopt, ReorgDecision::ACCEPT) ==
+                ReorgGatingManager::SubmitStatus::AMBIGUOUS);
+
+    // Unknown id is refused.
+    BOOST_CHECK(mgr.SubmitDecision(id_b + 1000, ReorgDecision::ACCEPT) ==
+                ReorgGatingManager::SubmitStatus::UNKNOWN_GATE);
+
+    // Targeted accept hits only its gate; the other stays pending.
+    uint64_t resolved{0};
+    BOOST_CHECK(mgr.SubmitDecision(id_a, ReorgDecision::ACCEPT, &resolved) ==
+                ReorgGatingManager::SubmitStatus::OK);
+    BOOST_CHECK_EQUAL(resolved, id_a);
+    BOOST_CHECK(!mgr.GetGate(id_a).has_value());
+    BOOST_CHECK(mgr.GetGate(id_b).has_value());
+    BOOST_CHECK(mgr.GetApproval().is_valid);
+
+    // With exactly one gate left, the bare form works again.
+    BOOST_CHECK(mgr.SubmitDecision(std::nullopt, ReorgDecision::REJECT, &resolved) ==
+                ReorgGatingManager::SubmitStatus::OK);
+    BOOST_CHECK_EQUAL(resolved, id_b);
+    const auto vetoed = mgr.GetGate(id_b);
+    BOOST_REQUIRE(vetoed.has_value());
+    BOOST_CHECK(vetoed->gate_state == ReorgGateState::VETOED);
+}
+
+BOOST_AUTO_TEST_CASE(reorg_gating_veto_ttl_and_escapes)
+{
+    SetMockTime(2000000);
+    ReorgGatingManager mgr{TestGatingConfig(ReorgGatingMode::MASK)};
+
+    // --- TTL expiry ---
+    {
+        const uint64_t id = ArmTestGate(mgr, 0x10, /*candidate_height=*/100, TestWork(50, 40));
+        // Pending gates always mask.
+        BOOST_CHECK(mgr.EvaluateMask(id, TestHash(0x99), 100, arith_uint256{40}, arith_uint256{50}));
+
+        BOOST_REQUIRE(mgr.SubmitDecision(id, ReorgDecision::REJECT) == ReorgGatingManager::SubmitStatus::OK);
+        // Vetoed and still masked within the TTL, unchanged branch.
+        BOOST_CHECK(mgr.EvaluateMask(id, TestHash(0x99), 100, arith_uint256{40}, arith_uint256{50}));
+
+        // Past the TTL the veto is dropped so the branch re-prompts (once).
+        SetMockTime(2000000 + 601);
+        BOOST_CHECK(!mgr.EvaluateMask(id, TestHash(0x99), 100, arith_uint256{40}, arith_uint256{50}));
+        BOOST_CHECK(!mgr.GetGate(id).has_value());
+        SetMockTime(2000000);
+    }
+
+    // --- Growth escape: branch extends >= veto_growth_blocks (3) ---
+    {
+        const uint64_t id = ArmTestGate(mgr, 0x20, /*candidate_height=*/100, TestWork(50, 40));
+        BOOST_REQUIRE(mgr.SubmitDecision(id, ReorgDecision::REJECT) == ReorgGatingManager::SubmitStatus::OK);
+        BOOST_CHECK(mgr.EvaluateMask(id, TestHash(0x99), 101, arith_uint256{41}, arith_uint256{50}));
+        BOOST_CHECK(mgr.EvaluateMask(id, TestHash(0x99), 102, arith_uint256{42}, arith_uint256{50}));
+        // +3 blocks beyond the veto-time height: escape fires, gate dropped.
+        BOOST_CHECK(!mgr.EvaluateMask(id, TestHash(0x99), 103, arith_uint256{43}, arith_uint256{50}));
+        BOOST_CHECK(!mgr.GetGate(id).has_value());
+    }
+
+    // --- Raw-work escape: margin over the tip grows past the veto baseline ---
+    {
+        // At veto time the candidate leads the tip by 10 raw units.
+        const uint64_t id = ArmTestGate(mgr, 0x30, /*candidate_height=*/100, TestWork(50, 60));
+        BOOST_REQUIRE(mgr.SubmitDecision(id, ReorgDecision::REJECT) == ReorgGatingManager::SubmitStatus::OK);
+        // Same margin: still masked.
+        BOOST_CHECK(mgr.EvaluateMask(id, TestHash(0x99), 100, arith_uint256{60}, arith_uint256{50}));
+        // Margin shrank (our tip out-worked it): still masked.
+        BOOST_CHECK(mgr.EvaluateMask(id, TestHash(0x99), 100, arith_uint256{60}, arith_uint256{55}));
+        // Margin grew past the baseline: escape fires, gate dropped.
+        BOOST_CHECK(!mgr.EvaluateMask(id, TestHash(0x99), 101, arith_uint256{65}, arith_uint256{50}));
+        BOOST_CHECK(!mgr.GetGate(id).has_value());
+    }
+
+    // --- Raw-work escape from a non-positive baseline ---
+    {
+        // At veto time the candidate does NOT lead on raw work (policy-driven
+        // shape); any positive raw margin later must re-prompt.
+        const uint64_t id = ArmTestGate(mgr, 0x40, /*candidate_height=*/100, TestWork(50, 40));
+        BOOST_REQUIRE(mgr.SubmitDecision(id, ReorgDecision::REJECT) == ReorgGatingManager::SubmitStatus::OK);
+        BOOST_CHECK(mgr.EvaluateMask(id, TestHash(0x99), 100, arith_uint256{50}, arith_uint256{50}));
+        BOOST_CHECK(!mgr.EvaluateMask(id, TestHash(0x99), 101, arith_uint256{51}, arith_uint256{50}));
+        BOOST_CHECK(!mgr.GetGate(id).has_value());
+    }
+
+    SetMockTime(0);
+}
+
+BOOST_AUTO_TEST_CASE(reorg_gating_timeout_generation_race)
+{
+    ReorgGatingManager mgr{TestGatingConfig(ReorgGatingMode::MASK)};
+
+    const uint64_t id = ArmTestGate(mgr, 0x10);
+    const auto armed = mgr.GetGate(id);
+    BOOST_REQUIRE(armed.has_value());
+    const uint64_t armed_generation = armed->generation;
+
+    // Operator decision bumps the generation...
+    BOOST_REQUIRE(mgr.SubmitDecision(id, ReorgDecision::REJECT) == ReorgGatingManager::SubmitStatus::OK);
+    const auto vetoed = mgr.GetGate(id);
+    BOOST_REQUIRE(vetoed.has_value());
+    BOOST_CHECK(vetoed->generation != armed_generation);
+    BOOST_CHECK(vetoed->gate_state == ReorgGateState::VETOED);
+    const int64_t vetoed_at = vetoed->vetoed_at;
+
+    // ...so the stale timer armed at SetPending fires as a no-op: the veto is
+    // neither cleared nor re-recorded.
+    mgr.HandleTimeout(id, armed_generation);
+    const auto after = mgr.GetGate(id);
+    BOOST_REQUIRE(after.has_value());
+    BOOST_CHECK(after->gate_state == ReorgGateState::VETOED);
+    BOOST_CHECK_EQUAL(after->vetoed_at, vetoed_at);
+    BOOST_CHECK_EQUAL(after->generation, vetoed->generation);
+
+    // A timeout for a gate that no longer exists is also a no-op.
+    mgr.HandleTimeout(id + 1000, armed_generation);
+    BOOST_CHECK_EQUAL(mgr.GateCount(), 1u);
+}
+
+BOOST_AUTO_TEST_CASE(reorg_gating_idempotent_transitions)
+{
+    ReorgGatingManager mgr{TestGatingConfig(ReorgGatingMode::MASK)};
+
+    // Double accept: the second decision finds no gate and changes nothing.
+    {
+        const uint64_t id = ArmTestGate(mgr, 0x10);
+        BOOST_CHECK(mgr.SubmitDecision(id, ReorgDecision::ACCEPT) == ReorgGatingManager::SubmitStatus::OK);
+        BOOST_CHECK(mgr.SubmitDecision(id, ReorgDecision::ACCEPT) == ReorgGatingManager::SubmitStatus::UNKNOWN_GATE);
+        BOOST_CHECK_EQUAL(mgr.GateCount(), 0u);
+        mgr.ClearApproval();
+    }
+
+    // Double reject: the second reject refreshes the veto, no state corruption.
+    {
+        const uint64_t id = ArmTestGate(mgr, 0x20);
+        BOOST_CHECK(mgr.SubmitDecision(id, ReorgDecision::REJECT) == ReorgGatingManager::SubmitStatus::OK);
+        BOOST_CHECK(mgr.SubmitDecision(id, ReorgDecision::REJECT) == ReorgGatingManager::SubmitStatus::OK);
+        const auto gate = mgr.GetGate(id);
+        BOOST_REQUIRE(gate.has_value());
+        BOOST_CHECK(gate->gate_state == ReorgGateState::VETOED);
+
+        // Accept overrides an earlier reject (veto-clear + approve in one step).
+        BOOST_CHECK(mgr.SubmitDecision(id, ReorgDecision::ACCEPT) == ReorgGatingManager::SubmitStatus::OK);
+        BOOST_CHECK(!mgr.GetGate(id).has_value());
+        BOOST_CHECK(mgr.GetApproval().is_valid);
+        mgr.ClearApproval();
+    }
+
+    // ClearVeto: only valid on vetoed gates; double-clear is a no-op error.
+    {
+        const uint64_t id = ArmTestGate(mgr, 0x30);
+        BOOST_CHECK(mgr.ClearVeto(id) == ReorgGatingManager::SubmitStatus::BAD_STATE);
+        BOOST_REQUIRE(mgr.SubmitDecision(id, ReorgDecision::REJECT) == ReorgGatingManager::SubmitStatus::OK);
+        BOOST_CHECK(mgr.ClearVeto(id) == ReorgGatingManager::SubmitStatus::OK);
+        BOOST_CHECK(mgr.ClearVeto(id) == ReorgGatingManager::SubmitStatus::UNKNOWN_GATE);
+        BOOST_CHECK_EQUAL(mgr.GateCount(), 0u);
+    }
+
+    // RemoveGate is safe on a missing id.
+    BOOST_CHECK(!mgr.RemoveGate(12345, "test"));
+}
+
+BOOST_AUTO_TEST_CASE(reorg_gating_prune_moot_gates)
+{
+    ReorgGatingManager mgr{TestGatingConfig(ReorgGatingMode::MASK)};
+
+    // Anchors: 0x11 (invalidated), 0x21 (forced active), 0x31 (still live).
+    const uint64_t id_a = ArmTestGate(mgr, 0x10);
+    const uint64_t id_b = ArmTestGate(mgr, 0x20);
+    const uint64_t id_c = ArmTestGate(mgr, 0x30);
+    // Vetoed gates are swept the same as pending ones.
+    BOOST_REQUIRE(mgr.SubmitDecision(id_b, ReorgDecision::REJECT) == ReorgGatingManager::SubmitStatus::OK);
+
+    const auto classify = [](const uint256& anchor) {
+        if (anchor == TestHash(0x11)) return ReorgGateAnchorStatus::INVALIDATED;
+        if (anchor == TestHash(0x21)) return ReorgGateAnchorStatus::ON_ACTIVE_CHAIN;
+        return ReorgGateAnchorStatus::KEEP;
+    };
+
+    BOOST_CHECK_EQUAL(mgr.PruneMootGates(classify), 2u);
+    BOOST_CHECK(!mgr.GetGate(id_a).has_value());
+    BOOST_CHECK(!mgr.GetGate(id_b).has_value());
+    BOOST_CHECK(mgr.GetGate(id_c).has_value());
+    BOOST_CHECK_EQUAL(mgr.GateCount(), 1u);
+
+    // Idempotent: a second sweep over the same state removes nothing.
+    BOOST_CHECK_EQUAL(mgr.PruneMootGates(classify), 0u);
+    BOOST_CHECK(mgr.GetGate(id_c).has_value());
+
+    // Sweeping an empty map is a no-op.
+    BOOST_CHECK(mgr.SubmitDecision(id_c, ReorgDecision::ACCEPT) == ReorgGatingManager::SubmitStatus::OK);
+    BOOST_CHECK_EQUAL(mgr.PruneMootGates(classify), 0u);
+}
+
+BOOST_AUTO_TEST_CASE(reorg_gating_timeout_accept_guardrail)
+{
+    // Predicate: auto-accept only a strictly raw-work-heavier candidate that
+    // is not penalty/policy-driven.
+    BOOST_CHECK(ReorgGatingManager::TimeoutAcceptAllowed(TestWork(50, 60, /*penalty_driven=*/false)));
+    BOOST_CHECK(!ReorgGatingManager::TimeoutAcceptAllowed(TestWork(50, 50, false)));  // equal raw: no
+    BOOST_CHECK(!ReorgGatingManager::TimeoutAcceptAllowed(TestWork(60, 50, false)));  // lighter raw: no
+    BOOST_CHECK(!ReorgGatingManager::TimeoutAcceptAllowed(TestWork(50, 60, true)));   // policy-driven: no
+
+    // End-to-end (mask mode, timeout_accept=1): guardrail pass auto-accepts.
+    {
+        ReorgGatingConfig config = TestGatingConfig(ReorgGatingMode::MASK);
+        config.timeout_accept = true;
+        ReorgGatingManager mgr{config};
+        const uint64_t id = ArmTestGate(mgr, 0x10, 100, TestWork(50, 60));
+        const auto gate = mgr.GetGate(id);
+        BOOST_REQUIRE(gate.has_value());
+        mgr.HandleTimeout(id, gate->generation);
+        BOOST_CHECK(!mgr.GetGate(id).has_value()); // accepted and cleared
+        BOOST_CHECK(mgr.GetApproval().is_valid);
+    }
+
+    // Guardrail fail (raw-lighter candidate): timeout acts as veto-REJECT.
+    {
+        ReorgGatingConfig config = TestGatingConfig(ReorgGatingMode::MASK);
+        config.timeout_accept = true;
+        ReorgGatingManager mgr{config};
+        const uint64_t id = ArmTestGate(mgr, 0x20, 100, TestWork(60, 50));
+        const auto gate = mgr.GetGate(id);
+        BOOST_REQUIRE(gate.has_value());
+        mgr.HandleTimeout(id, gate->generation);
+        const auto after = mgr.GetGate(id);
+        BOOST_REQUIRE(after.has_value());
+        BOOST_CHECK(after->gate_state == ReorgGateState::VETOED);
+        BOOST_CHECK(!mgr.GetApproval().is_valid);
+    }
+
+    // Guardrail fail (penalty/policy-driven): timeout acts as veto-REJECT.
+    {
+        ReorgGatingConfig config = TestGatingConfig(ReorgGatingMode::MASK);
+        config.timeout_accept = true;
+        ReorgGatingManager mgr{config};
+        const uint64_t id = ArmTestGate(mgr, 0x30, 100, TestWork(50, 60, /*penalty_driven=*/true));
+        const auto gate = mgr.GetGate(id);
+        BOOST_REQUIRE(gate.has_value());
+        mgr.HandleTimeout(id, gate->generation);
+        const auto after = mgr.GetGate(id);
+        BOOST_REQUIRE(after.has_value());
+        BOOST_CHECK(after->gate_state == ReorgGateState::VETOED);
+        BOOST_CHECK(!mgr.GetApproval().is_valid);
+    }
+
+    // timeout_accept=0: timeout always vetoes, even a raw-work-heavier candidate.
+    {
+        ReorgGatingManager mgr{TestGatingConfig(ReorgGatingMode::MASK)};
+        const uint64_t id = ArmTestGate(mgr, 0x40, 100, TestWork(50, 60));
+        const auto gate = mgr.GetGate(id);
+        BOOST_REQUIRE(gate.has_value());
+        mgr.HandleTimeout(id, gate->generation);
+        const auto after = mgr.GetGate(id);
+        BOOST_REQUIRE(after.has_value());
+        BOOST_CHECK(after->gate_state == ReorgGateState::VETOED);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(reorg_gating_block_mode_wait_interrupt_and_decisions)
+{
+    // Interrupt aborts the wait without a decision or approval.
+    {
+        ReorgGatingConfig config = TestGatingConfig(ReorgGatingMode::BLOCK);
+        ReorgGatingManager mgr{config};
+        const uint64_t id = ArmTestGate(mgr, 0x10);
+        BOOST_CHECK(mgr.WaitForDecision([] { return true; }) == ReorgDecision::ABORT);
+        // The gate survives the abort (the caller clears it explicitly) and
+        // no approval was recorded.
+        BOOST_CHECK(mgr.GetGate(id).has_value());
+        BOOST_CHECK(!mgr.GetApproval().is_valid);
+        mgr.ClearPending();
+        BOOST_CHECK_EQUAL(mgr.GateCount(), 0u);
+    }
+
+    // A decision submitted before/while waiting is returned as-is.
+    {
+        ReorgGatingManager mgr{TestGatingConfig(ReorgGatingMode::BLOCK)};
+        ArmTestGate(mgr, 0x20);
+        BOOST_REQUIRE(mgr.SubmitDecision(std::nullopt, ReorgDecision::REJECT) == ReorgGatingManager::SubmitStatus::OK);
+        BOOST_CHECK(mgr.WaitForDecision([] { return false; }) == ReorgDecision::REJECT);
+        mgr.ClearPending();
+    }
+
+    // Zero timeout: the wait resolves to TIMEOUT without an operator.
+    {
+        ReorgGatingConfig config = TestGatingConfig(ReorgGatingMode::BLOCK);
+        config.timeout_secs = 0;
+        ReorgGatingManager mgr{config};
+        ArmTestGate(mgr, 0x30);
+        BOOST_CHECK(mgr.WaitForDecision([] { return false; }) == ReorgDecision::TIMEOUT);
+        mgr.ClearPending();
+    }
+
+    // No pending gate: nothing to wait on.
+    {
+        ReorgGatingManager mgr{TestGatingConfig(ReorgGatingMode::BLOCK)};
+        BOOST_CHECK(mgr.WaitForDecision([] { return false; }) == ReorgDecision::NONE);
+    }
 }
 
 BOOST_AUTO_TEST_CASE(should_auto_follow_sane_partition_reorg)
