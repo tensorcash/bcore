@@ -791,6 +791,14 @@ private:
     void InvalidBlockFound(CBlockIndex* pindex, const BlockValidationState& state) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
     CBlockIndex* FindMostWorkChain() EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
+    /**
+     * Whether a candidate tip descends through the anchor of a pending/vetoed
+     * reorg gate and must be skipped by FindMostWorkChain at SELECTION TIME
+     * ONLY (mask gating mode). Never erases from setBlockIndexCandidates.
+     * Expired/escaped vetoes are dropped here so the branch re-prompts.
+     */
+    bool IsReorgGateMaskedCandidate(const CBlockIndex* candidate) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+
     bool RollforwardBlock(const CBlockIndex* pindex, CCoinsViewCache& inputs) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     void CheckForkWarningConditions() EXCLUSIVE_LOCKS_REQUIRED(cs_main);

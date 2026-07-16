@@ -321,6 +321,10 @@ void Shutdown(NodeContext& node)
     StopTorControl();
 
     if (node.background_init_thread.joinable()) node.background_init_thread.join();
+    // The reorg-gate hooks reference the scheduler and chainman; drop them
+    // before either is torn down. Pending gates/vetoes are in-memory only and
+    // die with the process (a restart may re-prompt but never auto-accepts).
+    GetReorgGatingManager().ResetAsyncHooks();
     // After everything has been shut down, but before things get flushed, stop the
     // the scheduler. After this point, SyncWithValidationInterfaceQueue() should not be called anymore
     // as this would prevent the shutdown from completing.
@@ -648,6 +652,9 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-reorgadvisorytimeout=<n>", "Timeout in seconds for operator decision before default action (default: 1800 = 30 minutes, min: 60, max: 86400)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-reorgadvisorytimeoutaccept", "Default action on timeout: 1=accept fork, 0=reject and stay on current chain (default: 0)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-reorgadvisoryapprovalttl=<n>", "How long in seconds an accepted reorg decision keeps covering later segments of the same reorg without re-prompting (default: 3600, min: 60, max: 86400)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-reorgadvisorygatingmode=<mode>", "How an armed reorg gate constrains the node: 'mask' (default) keeps validation, P2P and RPC fully live and only excludes the gated branch from fork choice until a decision; 'block' restores the legacy behavior of parking chain activation until a decision (with a shutdown-interruptible wait). Escape hatch for one release; unknown values fall back to 'mask'", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-reorgadvisoryvetottl=<n>", "How long in seconds a rejected reorg stays vetoed before the branch may prompt again (mask mode; default: 3600, min: 60, max: 86400). A veto also expires early if the branch extends by -reorgadvisoryvetogrowth blocks or its raw-work margin over the local tip grows", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-reorgadvisoryvetogrowth=<n>", "Number of blocks a vetoed branch must extend beyond its length at veto time to escape the veto early and re-prompt once (default: 6, min: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-checkmempool=<n>", strprintf("Run mempool consistency checks every <n> transactions. Use 0 to disable. (default: %u, regtest: %u)", defaultChainParams->DefaultConsistencyChecks(), regtestChainParams->DefaultConsistencyChecks()), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     // Checkpoints were removed. We keep `-checkpoints` as a hidden arg to display a more user friendly error when set.
     argsman.AddArg("-checkpoints", "", ArgsManager::ALLOW_ANY, OptionsCategory::HIDDEN);
@@ -2466,6 +2473,30 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     }
 
     ChainstateManager& chainman = *Assert(node.chainman);
+
+    // Reorg-gate async hooks: the scheduler owns gate timeouts, a dedicated
+    // manager thread owns the post-decision ActivateBestChain kick, so no
+    // validation, RPC or scheduler thread ever parks on the gate (mask mode).
+    // The snapshot hook feeds the decision-time raw-work guardrails. Hooks
+    // are dropped in Shutdown before the scheduler/chainman are torn down.
+    GetReorgGatingManager().SetAsyncHooks(
+        /*schedule_fn=*/[&scheduler](std::function<void()> task, int64_t delay_secs) {
+            scheduler.scheduleFromNow(std::move(task), std::chrono::seconds{delay_secs});
+        },
+        // Runs on the manager's dedicated kick thread. It must NOT run on the
+        // scheduler thread: ActivateBestChain waits on the validation-interface
+        // queue, which the scheduler thread drains (SerialTaskRunner), so
+        // running it there self-deadlocks.
+        /*kick_fn=*/[&chainman] {
+            BlockValidationState state;
+            if (!chainman.ActiveChainstate().ActivateBestChain(state)) {
+                LogPrintf("REORG GATING: post-decision ActivateBestChain failed: %s\n", state.ToString());
+            }
+        },
+        /*snapshot_fn=*/[&chainman](const uint256& candidate_tip_hash) {
+            LOCK(cs_main);
+            return ComputeReorgGateWorkSnapshot(chainman, candidate_tip_hash);
+        });
 
     // g_ValidationApi is constructed inside InitAndLoadChainstate, so the
     // connman hookup must happen after it returns — wiring it next to the

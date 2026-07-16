@@ -174,6 +174,15 @@ public:
     //! Kept separate from nChainWork so both lanes remain unsigned and monotonic.
     arith_uint256 nChainPenalty{};
 
+    //! (memory only) Raw consensus chainwork: the sum of GetBlockProof over this
+    //! chain, never mutated by local policy (Full_Red demotion, model-challenge
+    //! zero-work, penalties). Maintained where nChainWork is first computed
+    //! (AddToBlockIndex and index load) and deliberately NOT touched by
+    //! RecalculateBlockIndexWorkForFullValidation, so operator tooling can tell a
+    //! policy/penalty-manufactured reorg from a genuine raw-work deficit.
+    //! No disk-format impact: like nChainWork, it is recomputed at load.
+    arith_uint256 nChainWorkRaw{};
+
     //! Number of transactions in this block. This will be nonzero if the block
     //! reached the VALID_TRANSACTIONS level, and zero otherwise.
     //! Note: in a potential headers-first mode, this number cannot be relied upon
