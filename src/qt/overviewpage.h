@@ -82,7 +82,23 @@ private:
     QLabel* labelContractsMtm{nullptr};
     QLabel* labelTotalMtm{nullptr};
     QTimer* mtmRefreshTimer{nullptr};
-    bool m_overview_refresh_in_progress{false};
+
+    // Off-thread wallet-MTM fetch (mirrors ContractRegistryModel::refresh()).
+    // pricing.portfolio.risk can block for the full duration of a node-side
+    // stall (e.g. cs_main held across a validator round-trip on a slow
+    // network), so it must never run on the GUI thread.
+    struct WalletMtmSnapshot {
+        bool ok{false};
+        double tscMtm{0.0};
+        double assetMtm{0.0};
+        double contractsMtm{0.0};
+        double totalMtm{0.0};
+    };
+    bool m_mtmFetchInFlight{false};
+    bool m_mtmFetchPending{false};
+    static WalletMtmSnapshot fetchWalletMtm(WalletModel* wm);
+    void dispatchWalletMtmFetch();
+    void renderWalletMtm(const WalletMtmSnapshot& snap);
 
     // Contracts Overview section
     QFrame* contractsOverviewFrame{nullptr};
@@ -103,7 +119,6 @@ private Q_SLOTS:
     void updateWatchOnlyLabels(bool showWatchOnly);
     void setMonospacedFont(const QFont&);
     void refreshOverviewPanels();
-    void refreshWalletMtm();
     void refreshContractsOverview();
 };
 

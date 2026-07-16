@@ -28,6 +28,8 @@
 #include <QDateTime>
 #include <QElapsedTimer>
 #include <QFrame>
+#include <QFutureWatcher>
+#include <QtConcurrent/QtConcurrent>
 #include <QGridLayout>
 #include <QListView>
 #include <QPainter>
@@ -579,45 +581,15 @@ void OverviewPage::refreshOverviewPanels()
         return;
     }
 
-    if (m_overview_refresh_in_progress) {
-        LogPrintf("OverviewPage::refreshOverviewPanels skip wallet=%s visible=%d privacy=%d\n",
-                  walletModel->getWalletName().toStdString().c_str(),
-                  isVisible(),
-                  m_privacy);
-        return;
-    }
-
-    m_overview_refresh_in_progress = true;
-    QElapsedTimer timer;
-    timer.start();
-
-    LogPrintf("OverviewPage::refreshOverviewPanels start wallet=%s visible=%d privacy=%d\n",
+    LogPrintf("OverviewPage::refreshOverviewPanels dispatch wallet=%s visible=%d privacy=%d\n",
               walletModel->getWalletName().toStdString().c_str(),
               isVisible(),
               m_privacy);
 
-    try {
-        refreshWalletMtm();
-        LogPrintf("OverviewPage::refreshOverviewPanels after refreshWalletMtm wallet=%s elapsed_ms=%lld\n",
-                  walletModel->getWalletName().toStdString().c_str(),
-                  timer.elapsed());
-
-        refreshContractsOverview();
-        LogPrintf("OverviewPage::refreshOverviewPanels done wallet=%s total_elapsed_ms=%lld\n",
-                  walletModel->getWalletName().toStdString().c_str(),
-                  timer.elapsed());
-    } catch (const std::exception& e) {
-        LogPrintf("OverviewPage::refreshOverviewPanels exception wallet=%s elapsed_ms=%lld error=%s\n",
-                  walletModel->getWalletName().toStdString().c_str(),
-                  timer.elapsed(),
-                  e.what());
-    } catch (...) {
-        LogPrintf("OverviewPage::refreshOverviewPanels unknown exception wallet=%s elapsed_ms=%lld\n",
-                  walletModel->getWalletName().toStdString().c_str(),
-                  timer.elapsed());
-    }
-
-    m_overview_refresh_in_progress = false;
+    // Both halves run async: the MTM fetch on a worker thread, the contracts
+    // overview via ContractRegistryModel::refresh() (already off-thread).
+    dispatchWalletMtmFetch();
+    refreshContractsOverview();
 }
 
 void OverviewPage::setupWalletMtmSection()
@@ -756,14 +728,70 @@ void OverviewPage::handleContractClicked(const QModelIndex &index)
     }
 }
 
-void OverviewPage::refreshWalletMtm()
+void OverviewPage::dispatchWalletMtmFetch()
 {
     if (!walletModel || m_privacy) return;
 
+    // Coalesce: one fetch in flight at a time. A tick that lands mid-fetch is
+    // remembered and re-dispatched by the completion handler, so on a slow
+    // network the fetches queue up 1-deep instead of piling on.
+    // GUI-thread-only flags (mirrors ContractRegistryModel::refresh()).
+    if (m_mtmFetchInFlight) {
+        m_mtmFetchPending = true;
+        return;
+    }
+    m_mtmFetchInFlight = true;
+
+    LogPrintf("OverviewPage::refreshWalletMtm dispatch (async) wallet=%s\n",
+              walletModel->getWalletName().toStdString().c_str());
+
+    QPointer<OverviewPage> self(this);
+    QPointer<WalletModel> wm(walletModel);
+
+    auto* watcher = new QFutureWatcher<WalletMtmSnapshot>(this);
+    connect(watcher, &QFutureWatcher<WalletMtmSnapshot>::finished, this,
+            [self, wm, watcher]() {
+        const WalletMtmSnapshot snap = watcher->result();
+        watcher->deleteLater();
+
+        if (!self) {
+            return; // page destroyed while the worker ran
+        }
+        self->m_mtmFetchInFlight = false;
+
+        // Drop results that raced a wallet switch: only render if the wallet
+        // this fetch ran against is still the active one.
+        if (snap.ok && wm && self->walletModel == wm.data()) {
+            self->renderWalletMtm(snap);
+        }
+
+        if (self->m_mtmFetchPending) {
+            self->m_mtmFetchPending = false;
+            self->dispatchWalletMtmFetch();
+        }
+    });
+
+    // Worker captures only the QPointer<WalletModel> by value and calls the
+    // static fetchWalletMtm(), which touches no `this` state — same shutdown
+    // contract as ContractRegistryModel::buildSnapshot().
+    watcher->setFuture(QtConcurrent::run([wm]() -> WalletMtmSnapshot {
+        if (!wm) return {};
+        return OverviewPage::fetchWalletMtm(wm.data());
+    }));
+}
+
+// RUNS ON A WORKER THREAD. Must not touch any OverviewPage state — only the
+// passed-in walletModel (node().executeRpc is thread-safe, same as the
+// contract.list call in ContractRegistryModel::buildSnapshot()) and locals.
+OverviewPage::WalletMtmSnapshot OverviewPage::fetchWalletMtm(WalletModel* wm)
+{
+    WalletMtmSnapshot snap;
+    if (!wm) return snap;
+
     QElapsedTimer timer;
     timer.start();
-    LogPrintf("OverviewPage::refreshWalletMtm start wallet=%s\n",
-              walletModel->getWalletName().toStdString().c_str());
+    const std::string wallet_name = wm->getWalletName().toStdString();
+    LogPrintf("OverviewPage::refreshWalletMtm start wallet=%s\n", wallet_name.c_str());
 
     try {
         // Call the pricing.portfolio.risk RPC
@@ -771,30 +799,24 @@ void OverviewPage::refreshWalletMtm()
         params.push_back(true); // include_balances
 
         LogPrintf("OverviewPage::refreshWalletMtm calling pricing.portfolio.risk wallet=%s\n",
-                  walletModel->getWalletName().toStdString().c_str());
+                  wallet_name.c_str());
 
-        UniValue result = walletModel->node().executeRpc(
-            "pricing.portfolio.risk", params, walletModel->getWalletName().toStdString());
+        UniValue result = wm->node().executeRpc("pricing.portfolio.risk", params, wallet_name);
 
         LogPrintf("OverviewPage::refreshWalletMtm pricing.portfolio.risk returned wallet=%s elapsed_ms=%lld\n",
-                  walletModel->getWalletName().toStdString().c_str(),
+                  wallet_name.c_str(),
                   timer.elapsed());
 
         if (result.isObject()) {
-            double tscMtm = 0.0;
-            double assetMtm = 0.0;
-            double contractsMtm = 0.0;
-            double totalMtm = 0.0;
-
             // Parse balance_deltas to get TSC and asset values
             if (result.exists("balance_deltas")) {
                 const UniValue& balDeltas = result["balance_deltas"];
                 for (const auto& key : balDeltas.getKeys()) {
                     double value = balDeltas[key].get_real();
                     if (key == "TSC") {
-                        tscMtm = value;
+                        snap.tscMtm = value;
                     } else {
-                        assetMtm += value;
+                        snap.assetMtm += value;
                     }
                 }
             }
@@ -805,57 +827,63 @@ void OverviewPage::refreshWalletMtm()
                 for (size_t i = 0; i < positions.size(); ++i) {
                     const UniValue& pos = positions[i];
                     if (pos.exists("mtm")) {
-                        contractsMtm += pos["mtm"].get_real();
+                        snap.contractsMtm += pos["mtm"].get_real();
                     }
                 }
             }
 
             // Get total MTM (which should be sum of all)
             if (result.exists("total_mtm")) {
-                totalMtm = result["total_mtm"].get_real();
+                snap.totalMtm = result["total_mtm"].get_real();
             }
 
-            // Update labels
-            if (labelTscMtm) {
-                labelTscMtm->setText(QString::number(tscMtm, 'f', 8) + " TSC");
-            }
-            if (labelAssetMtm) {
-                labelAssetMtm->setText(QString::number(assetMtm, 'f', 8) + " TSC");
-            }
-            if (labelContractsMtm) {
-                labelContractsMtm->setText(QString::number(contractsMtm, 'f', 8) + " TSC");
-                // Color code contracts MTM
-                if (contractsMtm > 0) {
-                    labelContractsMtm->setStyleSheet("color: green;");
-                } else if (contractsMtm < 0) {
-                    labelContractsMtm->setStyleSheet("color: red;");
-                } else {
-                    labelContractsMtm->setStyleSheet("");
-                }
-            }
-            if (labelTotalMtm) {
-                labelTotalMtm->setText(QString::number(totalMtm, 'f', 8) + " TSC");
-            }
+            snap.ok = true;
         }
     } catch (const UniValue& e) {
         LogPrintf("OverviewPage::refreshWalletMtm RPC error wallet=%s elapsed_ms=%lld error=%s\n",
-                  walletModel->getWalletName().toStdString().c_str(),
+                  wallet_name.c_str(),
                   timer.elapsed(),
                   GUIUtil::RpcExceptionMessage(e).toStdString());
     } catch (const std::exception& e) {
         LogPrintf("OverviewPage::refreshWalletMtm exception wallet=%s elapsed_ms=%lld error=%s\n",
-                  walletModel->getWalletName().toStdString().c_str(),
+                  wallet_name.c_str(),
                   timer.elapsed(),
                   e.what());
     } catch (...) {
         LogPrintf("OverviewPage::refreshWalletMtm unknown exception wallet=%s elapsed_ms=%lld\n",
-                  walletModel->getWalletName().toStdString().c_str(),
+                  wallet_name.c_str(),
                   timer.elapsed());
     }
 
     LogPrintf("OverviewPage::refreshWalletMtm done wallet=%s elapsed_ms=%lld\n",
-              walletModel->getWalletName().toStdString().c_str(),
+              wallet_name.c_str(),
               timer.elapsed());
+    return snap;
+}
+
+// GUI-thread render half: applies a completed off-thread fetch to the labels.
+void OverviewPage::renderWalletMtm(const WalletMtmSnapshot& snap)
+{
+    if (labelTscMtm) {
+        labelTscMtm->setText(QString::number(snap.tscMtm, 'f', 8) + " TSC");
+    }
+    if (labelAssetMtm) {
+        labelAssetMtm->setText(QString::number(snap.assetMtm, 'f', 8) + " TSC");
+    }
+    if (labelContractsMtm) {
+        labelContractsMtm->setText(QString::number(snap.contractsMtm, 'f', 8) + " TSC");
+        // Color code contracts MTM
+        if (snap.contractsMtm > 0) {
+            labelContractsMtm->setStyleSheet("color: green;");
+        } else if (snap.contractsMtm < 0) {
+            labelContractsMtm->setStyleSheet("color: red;");
+        } else {
+            labelContractsMtm->setStyleSheet("");
+        }
+    }
+    if (labelTotalMtm) {
+        labelTotalMtm->setText(QString::number(snap.totalMtm, 'f', 8) + " TSC");
+    }
 }
 
 void OverviewPage::refreshContractsOverview()
