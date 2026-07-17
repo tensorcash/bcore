@@ -439,6 +439,108 @@ class ReorgGatingTest(BitcoinTestFramework):
         self.connect_nodes(0, 1)
         self.sync_blocks(self.nodes, timeout=120)
 
+    def test_block_mode_reject_persists_no_rearm(self):
+        self.log.info("Testing block mode: reject persists as a veto - no re-arm, no re-park, node stays live")
+        n0, n1 = self.nodes
+        # vetogrowth=4: in block mode the gate arms (and parks msghand) at the
+        # first winning partial segment - here base+5 of n1's 7-block branch -
+        # so the veto's growth baseline is that height and the queued
+        # remainder (2 blocks) plus the one block mined below counts as
+        # growth 3. That must stay under the escape, or this test would be
+        # exercising the designed one-shot growth re-prompt instead of the
+        # no-re-arm guarantee.
+        block_args = [
+            "-reorgadvisory=1", "-reorgadvisorydepth=3", "-reorgadvisorygating=1",
+            "-reorgadvisorygatingdepth=3", "-reorgadvisorygatingmode=block",
+            "-reorgadvisorytimeout=600", "-reorgadvisoryvetottl=600",
+            "-reorgadvisoryvetogrowth=4", "-checkblockindex=1",
+            "-spv-asn-corroboration=0",
+        ]
+        self._arm_mask_gate(extra_args=block_args)
+
+        res = n0.submitreorgdecision("reject")
+        assert res["success"]
+        # The parked waiter's epilogue converts the reject into a TTL veto;
+        # the gate persists instead of being erased.
+        self.wait_until(
+            lambda: n0.getpendingreorg() is not None
+            and n0.getpendingreorg()["gates"][0]["state"] == "vetoed",
+            timeout=30)
+        gate_id = n0.getpendingreorg()["gates"][0]["gate_id"]
+        assert n0.getblockcount() < n1.getblockcount()
+
+        # One more candidate block (with the queued remainder, growth 3 <
+        # vetogrowth 4): before the fix ANY next activation re-selected the
+        # branch, re-armed a fresh gate and parked the validation thread for
+        # another full decision window - forever.
+        self.generate(n1, 1, sync_fun=self.no_op)
+        time.sleep(2)
+        pending = n0.getpendingreorg()
+        assert pending is not None
+        assert_equal(pending["gates"][0]["state"], "vetoed")
+        assert_equal(pending["gates"][0]["gate_id"], gate_id)
+
+        # The node keeps mining on its own chain with no stall.
+        start = time.time()
+        mined = self.generate(n0, 1, sync_fun=self.no_op)
+        assert time.time() - start < 60
+        assert_equal(n0.getbestblockhash(), mined[-1])
+
+        # An explicit accept overrides the veto (block mode included) and
+        # activates the branch.
+        res = n0.submitreorgdecision("accept")
+        assert res["success"]
+        self.wait_until(lambda: n0.getpendingreorg() is None, timeout=30)
+        self.sync_blocks(self.nodes, timeout=120)
+        assert_equal(n0.getbestblockhash(), n1.getbestblockhash())
+
+    def test_offline_bypass_respects_recent_veto(self):
+        self.log.info("Testing offline >6h bypass is suppressed for a recently vetoed branch (re-prompt, not silent follow)")
+        n0, n1 = self.nodes
+        # The chain already contains blocks ~7h in the future (mined by
+        # test_offline_autofollow), so every restart from here pins -mocktime.
+        t_base = int(time.time()) + 8 * 60 * 60
+        self.restart_node(0, extra_args=self.MASK_ARGS + [
+            "-reorgadvisoryvetottl=60", "-mocktime=%d" % t_base])
+        self.restart_node(1, extra_args=[
+            "-reorgadvisory=1", "-reorgadvisorydepth=3", "-spv-asn-corroboration=0",
+            "-mocktime=%d" % t_base])
+        self.connect_nodes(0, 1)
+        self._clear_pending_if_any(n0)
+        self.sync_all()
+        self.generate(n0, 10)
+        self.sync_all()
+
+        self._build_divergent_chains(4, 7)
+        self._wait_for_pending(n0)
+        res = n0.submitreorgdecision("reject")
+        assert res["success"]
+        assert_equal(n0.getpendingreorg()["gates"][0]["state"], "vetoed")
+
+        # 7 hours later: the tip is "offline"-stale (>6h) and the 60s veto
+        # TTL has long expired.
+        t_late = t_base + 7 * 60 * 60
+        n0.setmocktime(t_late)
+        n1.setmocktime(t_late)
+
+        # A new candidate block re-runs fork choice: the expired veto is
+        # dropped, but its tombstone suppresses the offline auto-follow
+        # bypass - the node must RE-PROMPT, never silently follow the branch
+        # the operator vetoed.
+        self.generate(n1, 1, sync_fun=self.no_op)
+        self.wait_until(
+            lambda: n0.getpendingreorg() is not None
+            and any(g["state"] == "pending" for g in n0.getpendingreorg()["gates"]),
+            timeout=30)
+        assert n0.getblockcount() < n1.getblockcount()
+
+        # Accept the re-prompt to settle both nodes for teardown.
+        res = n0.submitreorgdecision("accept")
+        assert res["success"]
+        self.wait_until(lambda: n0.getpendingreorg() is None, timeout=30)
+        self.sync_blocks(self.nodes, timeout=120)
+        assert_equal(n0.getbestblockhash(), n1.getbestblockhash())
+
     def run_test(self):
         self.test_reject_path()
         self.test_accept_path()
@@ -451,10 +553,13 @@ class ReorgGatingTest(BitcoinTestFramework):
         self.test_mask_clear_veto_then_accept()
         self.test_mask_direction_fields()
         self.test_block_mode_clean_shutdown_mid_gate()
-        # Runs last: it advances mocktime by 7h and mines blocks with future
-        # timestamps, after which a plain restart (no -mocktime) refuses to
-        # start on the "block from the future" startup check.
+        self.test_block_mode_reject_persists_no_rearm()
+        # The remaining tests advance mocktime by hours and mine blocks with
+        # future timestamps, after which a plain restart (no -mocktime)
+        # refuses to start on the "block from the future" startup check - so
+        # they run last, and the second one pins -mocktime on every restart.
         self.test_offline_autofollow()
+        self.test_offline_bypass_respects_recent_veto()
 
 
 if __name__ == '__main__':
