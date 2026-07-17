@@ -496,7 +496,7 @@ ReorgAdvisoryConfig GetReorgAdvisoryConfig()
     // Read enabled flag (default: true)
     config.enabled = gArgs.GetBoolArg("-reorgadvisory", true);
 
-    // Read depth threshold (default: 3)
+    // Read depth threshold (default: ADVISORY_DEPTH_THRESHOLD)
     config.depth_threshold = gArgs.GetIntArg("-reorgadvisorydepth", ADVISORY_DEPTH_THRESHOLD);
 
     // Read offline threshold in seconds (default: 6 hours = 21600 seconds)

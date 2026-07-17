@@ -942,14 +942,16 @@ public:
      * re-prompts (once) through ActivateBestChainStep.
      *
      * @param candidate_block_proof Work of one block at the candidate tip
-     *        (GetBlockProof); sizes the raw-work escape quantum.
+     *        (GetBlockProof); sizes the raw-work escape quantum. Deliberately
+     *        has no default: passing zero re-enables the margin-escape-per-
+     *        block churn, so a caller must opt into that explicitly.
      * @return true if candidates descending through this gate's anchor must be
      *         skipped by FindMostWorkChain.
      */
     bool EvaluateMask(uint64_t gate_id, const uint256& candidate_hash, int candidate_height,
                       const arith_uint256& candidate_raw_work,
                       const arith_uint256& tip_raw_work,
-                      const arith_uint256& candidate_block_proof = arith_uint256{});
+                      const arith_uint256& candidate_block_proof);
 
     /**
      * Scheduler timeout for a MASK-mode gate. Transitions the gate only if it

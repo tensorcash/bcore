@@ -503,15 +503,15 @@ BOOST_AUTO_TEST_CASE(reorg_gating_veto_ttl_and_escapes)
     {
         const uint64_t id = ArmTestGate(mgr, 0x10, /*candidate_height=*/100, TestWork(50, 40));
         // Pending gates always mask.
-        BOOST_CHECK(mgr.EvaluateMask(id, TestHash(0x99), 100, arith_uint256{40}, arith_uint256{50}));
+        BOOST_CHECK(mgr.EvaluateMask(id, TestHash(0x99), 100, arith_uint256{40}, arith_uint256{50}, /*candidate_block_proof=*/arith_uint256{}));
 
         BOOST_REQUIRE(mgr.SubmitDecision(id, ReorgDecision::REJECT) == ReorgGatingManager::SubmitStatus::OK);
         // Vetoed and still masked within the TTL, unchanged branch.
-        BOOST_CHECK(mgr.EvaluateMask(id, TestHash(0x99), 100, arith_uint256{40}, arith_uint256{50}));
+        BOOST_CHECK(mgr.EvaluateMask(id, TestHash(0x99), 100, arith_uint256{40}, arith_uint256{50}, /*candidate_block_proof=*/arith_uint256{}));
 
         // Past the TTL the veto is dropped so the branch re-prompts (once).
         SetMockTime(2000000 + 601);
-        BOOST_CHECK(!mgr.EvaluateMask(id, TestHash(0x99), 100, arith_uint256{40}, arith_uint256{50}));
+        BOOST_CHECK(!mgr.EvaluateMask(id, TestHash(0x99), 100, arith_uint256{40}, arith_uint256{50}, /*candidate_block_proof=*/arith_uint256{}));
         BOOST_CHECK(!mgr.GetGate(id).has_value());
         SetMockTime(2000000);
     }
@@ -520,10 +520,10 @@ BOOST_AUTO_TEST_CASE(reorg_gating_veto_ttl_and_escapes)
     {
         const uint64_t id = ArmTestGate(mgr, 0x20, /*candidate_height=*/100, TestWork(50, 40));
         BOOST_REQUIRE(mgr.SubmitDecision(id, ReorgDecision::REJECT) == ReorgGatingManager::SubmitStatus::OK);
-        BOOST_CHECK(mgr.EvaluateMask(id, TestHash(0x99), 101, arith_uint256{41}, arith_uint256{50}));
-        BOOST_CHECK(mgr.EvaluateMask(id, TestHash(0x99), 102, arith_uint256{42}, arith_uint256{50}));
+        BOOST_CHECK(mgr.EvaluateMask(id, TestHash(0x99), 101, arith_uint256{41}, arith_uint256{50}, /*candidate_block_proof=*/arith_uint256{}));
+        BOOST_CHECK(mgr.EvaluateMask(id, TestHash(0x99), 102, arith_uint256{42}, arith_uint256{50}, /*candidate_block_proof=*/arith_uint256{}));
         // +3 blocks beyond the veto-time height: escape fires, gate dropped.
-        BOOST_CHECK(!mgr.EvaluateMask(id, TestHash(0x99), 103, arith_uint256{43}, arith_uint256{50}));
+        BOOST_CHECK(!mgr.EvaluateMask(id, TestHash(0x99), 103, arith_uint256{43}, arith_uint256{50}, /*candidate_block_proof=*/arith_uint256{}));
         BOOST_CHECK(!mgr.GetGate(id).has_value());
     }
 
@@ -533,11 +533,11 @@ BOOST_AUTO_TEST_CASE(reorg_gating_veto_ttl_and_escapes)
         const uint64_t id = ArmTestGate(mgr, 0x30, /*candidate_height=*/100, TestWork(50, 60));
         BOOST_REQUIRE(mgr.SubmitDecision(id, ReorgDecision::REJECT) == ReorgGatingManager::SubmitStatus::OK);
         // Same margin: still masked.
-        BOOST_CHECK(mgr.EvaluateMask(id, TestHash(0x99), 100, arith_uint256{60}, arith_uint256{50}));
+        BOOST_CHECK(mgr.EvaluateMask(id, TestHash(0x99), 100, arith_uint256{60}, arith_uint256{50}, /*candidate_block_proof=*/arith_uint256{}));
         // Margin shrank (our tip out-worked it): still masked.
-        BOOST_CHECK(mgr.EvaluateMask(id, TestHash(0x99), 100, arith_uint256{60}, arith_uint256{55}));
+        BOOST_CHECK(mgr.EvaluateMask(id, TestHash(0x99), 100, arith_uint256{60}, arith_uint256{55}, /*candidate_block_proof=*/arith_uint256{}));
         // Margin grew past the baseline: escape fires, gate dropped.
-        BOOST_CHECK(!mgr.EvaluateMask(id, TestHash(0x99), 101, arith_uint256{65}, arith_uint256{50}));
+        BOOST_CHECK(!mgr.EvaluateMask(id, TestHash(0x99), 101, arith_uint256{65}, arith_uint256{50}, /*candidate_block_proof=*/arith_uint256{}));
         BOOST_CHECK(!mgr.GetGate(id).has_value());
     }
 
@@ -547,8 +547,8 @@ BOOST_AUTO_TEST_CASE(reorg_gating_veto_ttl_and_escapes)
         // shape); any positive raw margin later must re-prompt.
         const uint64_t id = ArmTestGate(mgr, 0x40, /*candidate_height=*/100, TestWork(50, 40));
         BOOST_REQUIRE(mgr.SubmitDecision(id, ReorgDecision::REJECT) == ReorgGatingManager::SubmitStatus::OK);
-        BOOST_CHECK(mgr.EvaluateMask(id, TestHash(0x99), 100, arith_uint256{50}, arith_uint256{50}));
-        BOOST_CHECK(!mgr.EvaluateMask(id, TestHash(0x99), 101, arith_uint256{51}, arith_uint256{50}));
+        BOOST_CHECK(mgr.EvaluateMask(id, TestHash(0x99), 100, arith_uint256{50}, arith_uint256{50}, /*candidate_block_proof=*/arith_uint256{}));
+        BOOST_CHECK(!mgr.EvaluateMask(id, TestHash(0x99), 101, arith_uint256{51}, arith_uint256{50}, /*candidate_block_proof=*/arith_uint256{}));
         BOOST_CHECK(!mgr.GetGate(id).has_value());
     }
 
@@ -790,7 +790,7 @@ BOOST_AUTO_TEST_CASE(reorg_gating_block_mode_reject_persists_as_veto)
 
     // The veto masks fork choice in BLOCK mode (a pending gate would not:
     // the park, not the mask, holds a pending reorg in block mode).
-    BOOST_CHECK(mgr.EvaluateMask(id, TestHash(0x99), 100, arith_uint256{60}, arith_uint256{50}));
+    BOOST_CHECK(mgr.EvaluateMask(id, TestHash(0x99), 100, arith_uint256{60}, arith_uint256{50}, /*candidate_block_proof=*/arith_uint256{}));
 
     // ClearPending (the waiter epilogue for accept/abort) must leave the
     // veto alone: only PENDING gates are its business.
@@ -898,16 +898,16 @@ BOOST_AUTO_TEST_CASE(reorg_gating_pending_refresh_prefers_raw_work)
     const uint64_t id = ArmTestGate(mgr, 0x10, /*candidate_height=*/100, TestWork(50, 60));
 
     // A worse same-height sibling does not overwrite the stored candidate.
-    BOOST_CHECK(mgr.EvaluateMask(id, TestHash(0x77), 100, arith_uint256{55}, arith_uint256{50}));
+    BOOST_CHECK(mgr.EvaluateMask(id, TestHash(0x77), 100, arith_uint256{55}, arith_uint256{50}, /*candidate_block_proof=*/arith_uint256{}));
     BOOST_CHECK(mgr.GetGate(id)->candidate_tip_hash == TestHash(0x10));
     BOOST_CHECK(mgr.GetGate(id)->work.candidate_raw_work == arith_uint256{60});
 
     // Nor does an equal-work one.
-    BOOST_CHECK(mgr.EvaluateMask(id, TestHash(0x78), 100, arith_uint256{60}, arith_uint256{50}));
+    BOOST_CHECK(mgr.EvaluateMask(id, TestHash(0x78), 100, arith_uint256{60}, arith_uint256{50}, /*candidate_block_proof=*/arith_uint256{}));
     BOOST_CHECK(mgr.GetGate(id)->candidate_tip_hash == TestHash(0x10));
 
     // A strictly heavier candidate does.
-    BOOST_CHECK(mgr.EvaluateMask(id, TestHash(0x79), 101, arith_uint256{70}, arith_uint256{50}));
+    BOOST_CHECK(mgr.EvaluateMask(id, TestHash(0x79), 101, arith_uint256{70}, arith_uint256{50}, /*candidate_block_proof=*/arith_uint256{}));
     BOOST_CHECK(mgr.GetGate(id)->candidate_tip_hash == TestHash(0x79));
     BOOST_CHECK_EQUAL(mgr.GetGate(id)->candidate_height, 101);
     BOOST_CHECK(mgr.GetGate(id)->work.candidate_raw_work == arith_uint256{70});
@@ -939,7 +939,7 @@ BOOST_AUTO_TEST_CASE(reorg_gating_veto_tombstone_suppresses_offline_bypass)
 
     // TTL expiry drops the veto but records a tombstone.
     SetMockTime(4000000 + 601);
-    BOOST_CHECK(!mgr.EvaluateMask(id, TestHash(0x99), 100, arith_uint256{60}, arith_uint256{50}));
+    BOOST_CHECK(!mgr.EvaluateMask(id, TestHash(0x99), 100, arith_uint256{60}, arith_uint256{50}, /*candidate_block_proof=*/arith_uint256{}));
     BOOST_CHECK(!mgr.GetGate(id).has_value());
     BOOST_CHECK(mgr.HadRecentVeto(anchor));
 
