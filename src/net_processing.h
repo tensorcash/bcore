@@ -48,8 +48,17 @@ static const unsigned int MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK = 3;
 /** Number of headers sent in one getheaders result. We rely on the assumption that if a peer sends
  *  less than this number, we reached its tip. Changing this value is a protocol upgrade. */
 static const unsigned int MAX_HEADERS_RESULTS = 2000;
-/** Default minimum verified cumulative VDF tick per block for header-only candidate fetch. */
-static constexpr uint64_t DEFAULT_SPV_MIN_CUMULATIVE_TICK_PER_BLOCK{40000 * 9 * 60};
+/** Default minimum verified cumulative VDF tick per block for header-only candidate fetch.
+ *
+ *  Temporarily lowered from 40000 to 35000 tick/s during the 2026-07 fast-block
+ *  recovery (min-per-block 21.6M -> 18.9M). Unlike the slack (already 21 days,
+ *  which only shifts the intercept), the expectation sets the floor's SLOPE, so
+ *  lowering it both widens headroom and slows the rate the floor rises per
+ *  block, letting default-configured nodes ride out the compressed-spacing
+ *  episode. Honest miners run well above this (blended ~48-70k/s in the affected
+ *  window), so it stays a real sequential-time gate. Restore to 40000 once block
+ *  spacing normalises above the breakeven cadence. */
+static constexpr uint64_t DEFAULT_SPV_MIN_CUMULATIVE_TICK_PER_BLOCK{35000 * 9 * 60};
 /** Expected block cadence used to convert slack days into block slack. */
 static constexpr uint32_t DEFAULT_SPV_MIN_CUMULATIVE_TICK_BLOCK_SECONDS{9 * 60};
 /** Default slack before enforcing the cumulative VDF tick floor.
