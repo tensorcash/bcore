@@ -762,7 +762,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-validationapi-force-external", "Force the external full-validation flow with the real validation backend on chains that do not enable it by consensus (for functional tests)", ArgsManager::ALLOW_ANY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-mockval-preapprove-genesis", "If set, pre-approve genesis Quick/Smell in mock backend", ArgsManager::ALLOW_ANY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-minermodel=<name@commit>", "Override model identifier used by the miner when building blocks (default: consensus defaults)", ArgsManager::ALLOW_ANY, OptionsCategory::DEBUG_TEST);
-    argsman.AddArg("-validatorhttpurl=<url>", "Gateway verification service base URL for desktop/HTTP mode (e.g., https://verify.tensorcash.io)", ArgsManager::ALLOW_ANY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-validatorhttpurl=<url>", "Gateway verification service base URL for desktop/HTTP mode (e.g., https://verify.tensorcash.org, no trailing slash)", ArgsManager::ALLOW_ANY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-validatorapikey=<key>", "API key for gateway verification service (desktop/HTTP mode)", ArgsManager::ALLOW_ANY | ArgsManager::SENSITIVE, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-validatorapikeys=<k1,k2,...>", "Comma-separated API keys for gateway verification service endpoints in desktop/HTTP mode. Either provide one shared key or one key per configured base URL.", ArgsManager::ALLOW_ANY | ArgsManager::SENSITIVE, OptionsCategory::DEBUG_TEST);
     // External miner API toggle (useful for tests)
