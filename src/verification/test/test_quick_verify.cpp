@@ -338,7 +338,6 @@ BOOST_AUTO_TEST_CASE(test_reuse_gate_version_differential) {
 BOOST_AUTO_TEST_CASE(test_genesis_subset_10_tokens) {
     RegisterTestModel();
     // Test genesis with only first 10 tokens (for faster testing in some scenarios)
-    QuickVerifier verifier;
     CProofBlob blob = g_genesisBlob;
 
     // Take only first 10 tokens
@@ -347,10 +346,28 @@ BOOST_AUTO_TEST_CASE(test_genesis_subset_10_tokens) {
     blob.topk_indices.resize(10);
     blob.sampling_u.resize(10);
 
-    // This should fail hash verification since hash was computed with all 256 tokens
-    auto result = verifier.QuickVerify(blob);
-    BOOST_CHECK(result == VerificationResult::Quick_Fail);
-    BOOST_CHECK(verifier.GetLastError().find("Final hash mismatch") != std::string::npos);
+    // Without an enforced window size (regtest default), the verifier adopts
+    // the proof's own window and the truncated proof fails hash verification,
+    // since the hash was computed with all 256 tokens.
+    {
+        QuickVerifier verifier;
+        auto result = verifier.QuickVerify(blob);
+        BOOST_CHECK(result == VerificationResult::Quick_Fail);
+        BOOST_CHECK(verifier.GetLastError().find("Final hash mismatch") != std::string::npos);
+    }
+
+    // With the window size pinned by consensus params (tensor main/test), the
+    // same proof must be rejected outright by the block-sanity window-size
+    // check, before we ever reach hash verification.
+    {
+        Consensus::Params params;
+        params.nEnforcedProofWindowSize = POW_WINDOW_SIZE;
+        QuickVerifier verifier;
+        verifier.SetV3Context(params, /*height=*/1);
+        auto result = verifier.QuickVerify(blob);
+        BOOST_CHECK(result == VerificationResult::Quick_Fail);
+        BOOST_CHECK(verifier.GetLastError().find("Invalid proof window size") != std::string::npos);
+    }
 }
 
 BOOST_AUTO_TEST_CASE(test_header_pow_verification) {

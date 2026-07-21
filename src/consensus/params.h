@@ -274,6 +274,16 @@ struct Params {
         return height >= 0 && height >= V3ActivationHeight;
     }
 
+    // Exact chosen-token count every mining proof must carry, enforced in
+    // QuickVerifier block sanity for ALL proof versions. 0 = not enforced:
+    // the verifier adopts the proof's own window size, which regtest needs
+    // because the functional-test harness mines deliberately short
+    // transcripts. Production chains whose audited history only ever mined
+    // full windows pin this to the miner's window size (256) — a shorter
+    // window is cheaper to grind, so adopting the proof's own size on such a
+    // chain would under-price the work.
+    uint32_t nEnforcedProofWindowSize{0};
+
     // v3 chain constants (§1). Historical verification must always read these
     // from the chain params active for the block's chain — never from mutable
     // off-chain policy. Defaults mirror the vendored implementation

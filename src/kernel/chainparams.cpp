@@ -308,6 +308,12 @@ public:
         // remaining V3* constants keep their params.h defaults (they only bind
         // at/after activation).
         consensus.V3ActivationHeight = 8000;
+        // Every mining proof must carry the full 256-token window (see
+        // consensus/params.h). Enforced retroactively over existing history,
+        // which is safe here: every accepted block passed the external
+        // verification service's full replay, which pins the 256-token
+        // window, so history cannot contain a shorter proof.
+        consensus.nEnforcedProofWindowSize = 256;
         // Re-mined genesis (715 TSC + GENESIS_PUBKEY 047acd84..., model Qwen/Qwen3-8B@9c925d64
         // at bf16). nTime/nNonce are the winning values from the genesis grind; the proof blob
         // is g_genesisBlob (kernel/genesis_proof.h). 715 * COIN == GENESIS_REWARD_COINS.
@@ -763,6 +769,9 @@ public:
         // (TIP-0003; default disabled). Main/test chains hardwire
         // this: consensus must never depend on node-local configuration.
         consensus.V3ActivationHeight = gArgs.GetIntArg("-v3activationheight", std::numeric_limits<int>::max());
+        // Regtest-only knob for the enforced proof window size (default off:
+        // the functional-test harness mines short transcripts).
+        consensus.nEnforcedProofWindowSize = gArgs.GetIntArg("-enforcedproofwindowsize", 0);
 
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].bit = 28;
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nStartTime = 0;
@@ -947,6 +956,11 @@ public:
         // tensor-test. Hardwired (never gArgs); a coordinated release sets the
         // testnet height first, mainnet later.
         consensus.V3ActivationHeight = std::numeric_limits<int>::max();
+        // Full 256-token proof window, as on tensor mainnet (see
+        // consensus/params.h). Every accepted block passed the external
+        // verification service's full replay, which pins the 256-token
+        // window, so history cannot contain a shorter proof.
+        consensus.nEnforcedProofWindowSize = 256;
         // Scalar-CFD subsystem (ISSUER_SCALAR carrier + OP_SCALAR_CFD_SETTLE opcode + the Slice-6 format
         // catalogue). Coordinated testnet activation. This is a parser RELAXATION with no prior scalar
         // contracts traded, so it only requires the whole tensor-test fleet to run a scalarcfd-capable
@@ -1032,6 +1046,8 @@ public:
         consensus.reuse_entropy_height = gArgs.GetIntArg("-reuseentropyheight", std::numeric_limits<int>::max());
         // Regtest-only v3 prompt-binding activation knob (see CRegTestParams).
         consensus.V3ActivationHeight = gArgs.GetIntArg("-v3activationheight", std::numeric_limits<int>::max());
+        // Regtest-only enforced-proof-window-size knob (see CRegTestParams).
+        consensus.nEnforcedProofWindowSize = gArgs.GetIntArg("-enforcedproofwindowsize", 0);
 
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].bit = 28;
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nStartTime = 0;
