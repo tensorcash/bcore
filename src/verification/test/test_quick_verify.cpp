@@ -347,10 +347,11 @@ BOOST_AUTO_TEST_CASE(test_genesis_subset_10_tokens) {
     blob.topk_indices.resize(10);
     blob.sampling_u.resize(10);
 
-    // This should fail hash verification since hash was computed with all 256 tokens
+    // A proof that is not a full 256-token window must be rejected outright by
+    // the block-sanity window-size check (before we ever reach hash verification).
     auto result = verifier.QuickVerify(blob);
     BOOST_CHECK(result == VerificationResult::Quick_Fail);
-    BOOST_CHECK(verifier.GetLastError().find("Final hash mismatch") != std::string::npos);
+    BOOST_CHECK(verifier.GetLastError().find("Invalid proof window size") != std::string::npos);
 }
 
 BOOST_AUTO_TEST_CASE(test_header_pow_verification) {

@@ -183,6 +183,20 @@ bool QuickVerifier::VerifyBlockSanity(const CProofBlob& proof) {
         return false;
     }
 
+    // A valid mined proof is emitted only at an exact window boundary, so it
+    // must carry exactly POW_WINDOW_SIZE (256) chosen tokens. check_solutions()
+    // only ever writes a proof when nsteps % window_size == 0, and get_window()
+    // always returns the full 256-token window. Pinning the count here (rather
+    // than adopting proof.chosen_tokens.size() as m_windowSize) rejects
+    // undersized/oversized proofs up front instead of silently verifying a
+    // shorter sequence.
+    if (proof.chosen_tokens.size() != POW_WINDOW_SIZE) {
+        m_lastError = "Invalid proof window size: " +
+                      std::to_string(proof.chosen_tokens.size()) + " != " +
+                      std::to_string(POW_WINDOW_SIZE);
+        return false;
+    }
+
     if (proof.topk_logits.size() != proof.chosen_tokens.size()) {
         m_lastError = "Logits and chosen tokens size mismatch: " +
                       std::to_string(proof.topk_logits.size()) + " != " +
