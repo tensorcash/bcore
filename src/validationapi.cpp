@@ -1402,9 +1402,12 @@ void ValidationAPI::EnqueueStatusRequest(const uint256& req_id, const Validation
 {
     std::lock_guard<std::mutex> lock(status_queue_mutex_);
     StatusKey key{req_id, req_type};
+    // system_clock, NOT steady_clock: JobSchedulerLoop checks these stamps
+    // (IsHttpStatusAcceptedPendingStale, readyToUpdate) against system_clock
+    // epoch ms; a steady_clock stamp makes every entry look eons stale.
     const uint64_t now_ms = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now().time_since_epoch())
+            std::chrono::system_clock::now().time_since_epoch())
             .count());
     if (status_queue_set_.insert(key).second) {
         status_queue_.push_back(key);
@@ -1482,9 +1485,11 @@ void ValidationAPI::ReconcileHttpStatusQueueWithTrackedRequests(uint64_t now_ms)
 
 ValidationResponseBehavior ValidationAPI::GettHttpStatus(uint256& req_id, ValidationReqType& req_type)
 {
+    // system_clock to match EnqueueStatusRequest stamps and JobSchedulerLoop's
+    // staleness clock (see comment there).
     const uint64_t now_ms = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now().time_since_epoch())
+            std::chrono::system_clock::now().time_since_epoch())
             .count());
     std::vector<StatusKey> snapshot;
 
