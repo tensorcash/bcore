@@ -112,6 +112,7 @@ BASE_SCRIPTS = [
     # vv Tests less than 60s vv
     'feature_assets_basic.py',
     'feature_v3_activation.py',
+    'feature_quickverify_window.py',
     'feature_v3_acceptance.py',
     'rpc_assets.py',
     'mempool_assets.py',

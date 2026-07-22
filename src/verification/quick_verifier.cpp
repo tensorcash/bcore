@@ -183,17 +183,20 @@ bool QuickVerifier::VerifyBlockSanity(const CProofBlob& proof) {
         return false;
     }
 
-    // A valid mined proof is emitted only at an exact window boundary, so it
-    // must carry exactly POW_WINDOW_SIZE (256) chosen tokens. check_solutions()
-    // only ever writes a proof when nsteps % window_size == 0, and get_window()
-    // always returns the full 256-token window. Pinning the count here (rather
-    // than adopting proof.chosen_tokens.size() as m_windowSize) rejects
-    // undersized/oversized proofs up front instead of silently verifying a
-    // shorter sequence.
-    if (proof.chosen_tokens.size() != POW_WINDOW_SIZE) {
+    // A production mined proof is emitted only at an exact window boundary
+    // over the full window: check_solutions() only ever writes a proof when
+    // nsteps % window_size == 0, and get_window() always returns the full
+    // 256-token window. Chains whose history is all full-window proofs pin
+    // the count via consensus params (nEnforcedProofWindowSize; 0 = adopt the
+    // proof's own size, which regtest's short test transcripts rely on).
+    // Enforcing here (rather than adopting proof.chosen_tokens.size() as
+    // m_windowSize) rejects undersized/oversized proofs up front instead of
+    // silently verifying a shorter — cheaper to grind — sequence.
+    if (m_v3ChainParams && m_v3ChainParams->nEnforcedProofWindowSize > 0 &&
+        proof.chosen_tokens.size() != m_v3ChainParams->nEnforcedProofWindowSize) {
         m_lastError = "Invalid proof window size: " +
                       std::to_string(proof.chosen_tokens.size()) + " != " +
-                      std::to_string(POW_WINDOW_SIZE);
+                      std::to_string(m_v3ChainParams->nEnforcedProofWindowSize);
         return false;
     }
 
