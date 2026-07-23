@@ -21,6 +21,7 @@
 #include <boost/asio/connect.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/ssl.hpp>
+#include <compat/compat.h>
 #include <univalue.h>
 #include "uint256.h"
 #include <fstream>
@@ -50,6 +51,66 @@ constexpr std::array<std::chrono::seconds, 4> AMBER_RETRY_DELAYS{
     std::chrono::seconds{1},
     std::chrono::seconds{60},
     std::chrono::seconds{120}};
+
+//! beast's expires_after only bounds ASYNC operations; every HTTP call in this
+//! file uses the synchronous read/write overloads, so a peer that goes quiet
+//! mid-exchange blocks recv()/send() indefinitely — observed as a shutdown
+//! deadlock: SolutionReceiverLoop parked in http::read while ~ValidationAPI's
+//! StopThreads() join waits on it forever. Bound every sync syscall at the
+//! socket level instead.
+void BoundSyncSocketIO(boost::asio::ip::tcp::socket& sock, std::chrono::milliseconds timeout)
+{
+#ifdef WIN32
+    const DWORD win_timeout = static_cast<DWORD>(timeout.count());
+    setsockopt(sock.native_handle(), SOL_SOCKET, SO_RCVTIMEO,
+               reinterpret_cast<const char*>(&win_timeout), sizeof(win_timeout));
+    setsockopt(sock.native_handle(), SOL_SOCKET, SO_SNDTIMEO,
+               reinterpret_cast<const char*>(&win_timeout), sizeof(win_timeout));
+#else
+    timeval tv;
+    tv.tv_sec = static_cast<time_t>(timeout.count() / 1000);
+    tv.tv_usec = static_cast<suseconds_t>((timeout.count() % 1000) * 1000);
+    setsockopt(sock.native_handle(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock.native_handle(), SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
+}
+
+//! Run a full HTTP write+read as ASYNC ops driven to completion on the
+//! site-local io_context. This is the only way the beast stream's
+//! expires_after deadline is enforced: the sync overloads ignore it, and
+//! socket-level SO_RCVTIMEO is defeated by asio's sync recv, which treats
+//! EAGAIN as "wait for readiness" and re-polls with an infinite timeout.
+//! Throws system_error on failure/timeout, like the sync overloads did.
+template <typename Stream, typename Request>
+void SyncHttpExchange(boost::asio::io_context& ioc, Stream& stream, Request& req,
+                      boost::beast::flat_buffer& buffer,
+                      boost::beast::http::response<boost::beast::http::string_body>& res)
+{
+    boost::system::error_code op_ec;
+    boost::beast::http::async_write(stream, req,
+        [&](const boost::system::error_code& ec, std::size_t) { op_ec = ec; });
+    ioc.restart();
+    ioc.run();
+    if (op_ec) throw boost::system::system_error{op_ec};
+    boost::beast::http::async_read(stream, buffer, res,
+        [&](const boost::system::error_code& ec, std::size_t) { op_ec = ec; });
+    ioc.restart();
+    ioc.run();
+    if (op_ec) throw boost::system::system_error{op_ec};
+}
+
+//! Async TLS handshake driven to completion, for the same reason as
+//! SyncHttpExchange: the sync handshake blocks unboundedly on a quiet peer.
+template <typename SslStream>
+void SyncSslHandshake(boost::asio::io_context& ioc, SslStream& stream)
+{
+    boost::system::error_code op_ec;
+    stream.async_handshake(boost::asio::ssl::stream_base::client,
+                           [&](const boost::system::error_code& ec) { op_ec = ec; });
+    ioc.restart();
+    ioc.run();
+    if (op_ec) throw boost::system::system_error{op_ec};
+}
 
 std::string TrimCopy(std::string_view raw)
 {
@@ -938,15 +999,14 @@ bool ValidationAPI::TryFetchPublicStatusSync(const uint256& req_id, const Valida
                 boost::beast::tcp_stream stream{ioc};
                 stream.expires_after(http_config_.timeout);
                 stream.connect(results);
+                BoundSyncSocketIO(stream.socket(), http_config_.timeout);
 
                 http::request<http::string_body> req_msg{http::verb::get, path, 11};
                 req_msg.set(http::field::host, endpoint->host);
                 req_msg.set(http::field::user_agent, "tensorcash/validationapi");
-                http::write(stream, req_msg);
-
                 boost::beast::flat_buffer buffer;
                 http::response<http::string_body> res;
-                http::read(stream, buffer, res);
+                SyncHttpExchange(ioc, stream, req_msg, buffer, res);
                 stream.socket().shutdown(tcp::socket::shutdown_both);
                 status_code = res.result_int();
                 body = res.body();
@@ -961,16 +1021,15 @@ bool ValidationAPI::TryFetchPublicStatusSync(const uint256& req_id, const Valida
                 }
                 boost::beast::get_lowest_layer(stream).expires_after(http_config_.timeout);
                 boost::beast::get_lowest_layer(stream).connect(results);
-                stream.handshake(net::ssl::stream_base::client);
+                BoundSyncSocketIO(boost::beast::get_lowest_layer(stream).socket(), http_config_.timeout);
+                SyncSslHandshake(ioc, stream);
 
                 http::request<http::string_body> req_msg{http::verb::get, path, 11};
                 req_msg.set(http::field::host, endpoint->host);
                 req_msg.set(http::field::user_agent, "tensorcash/validationapi");
-                http::write(stream, req_msg);
-
                 boost::beast::flat_buffer buffer;
                 http::response<http::string_body> res;
-                http::read(stream, buffer, res);
+                SyncHttpExchange(ioc, stream, req_msg, buffer, res);
                 boost::system::error_code ec;
                 stream.shutdown(ec);
                 status_code = res.result_int();
@@ -1073,6 +1132,8 @@ bool ValidationAPI::TryFetchAuthStatusSync(const uint256& req_id, const Validati
                                   "\"}],\"wait_ms\":0}";
 
     for (const auto& endpoint_cfg : http_config_.endpoints) {
+        // Shutdown: don't start new sync HTTP exchanges (see BoundSyncSocketIO).
+        if (!m_on.load() || m_chainman.m_interrupt) break;
         if (endpoint_cfg.api_key.empty()) {
             continue;
         }
@@ -1095,6 +1156,7 @@ bool ValidationAPI::TryFetchAuthStatusSync(const uint256& req_id, const Validati
                 boost::beast::tcp_stream stream{ioc};
                 stream.expires_after(http_config_.timeout);
                 stream.connect(results);
+                BoundSyncSocketIO(stream.socket(), http_config_.timeout);
 
                 http::request<http::string_body> req_msg{http::verb::post, path, 11};
                 req_msg.set(http::field::host, endpoint->host);
@@ -1103,11 +1165,9 @@ bool ValidationAPI::TryFetchAuthStatusSync(const uint256& req_id, const Validati
                 req_msg.set(http::field::content_type, "application/json");
                 req_msg.body() = body_json;
                 req_msg.prepare_payload();
-                http::write(stream, req_msg);
-
                 boost::beast::flat_buffer buffer;
                 http::response<http::string_body> res;
-                http::read(stream, buffer, res);
+                SyncHttpExchange(ioc, stream, req_msg, buffer, res);
                 stream.socket().shutdown(tcp::socket::shutdown_both);
                 status_code = res.result_int();
                 resp_body = res.body();
@@ -1122,7 +1182,8 @@ bool ValidationAPI::TryFetchAuthStatusSync(const uint256& req_id, const Validati
                 }
                 boost::beast::get_lowest_layer(stream).expires_after(http_config_.timeout);
                 boost::beast::get_lowest_layer(stream).connect(results);
-                stream.handshake(net::ssl::stream_base::client);
+                BoundSyncSocketIO(boost::beast::get_lowest_layer(stream).socket(), http_config_.timeout);
+                SyncSslHandshake(ioc, stream);
 
                 http::request<http::string_body> req_msg{http::verb::post, path, 11};
                 req_msg.set(http::field::host, endpoint->host);
@@ -1131,11 +1192,9 @@ bool ValidationAPI::TryFetchAuthStatusSync(const uint256& req_id, const Validati
                 req_msg.set(http::field::content_type, "application/json");
                 req_msg.body() = body_json;
                 req_msg.prepare_payload();
-                http::write(stream, req_msg);
-
                 boost::beast::flat_buffer buffer;
                 http::response<http::string_body> res;
-                http::read(stream, buffer, res);
+                SyncHttpExchange(ioc, stream, req_msg, buffer, res);
                 boost::system::error_code ec;
                 stream.shutdown(ec);
                 status_code = res.result_int();
@@ -1296,6 +1355,8 @@ uint16_t ValidationAPI::SendHttpRequest(const uint256& req_id,
     bool queued_public_fallback{false};
 
     for (const auto& endpoint_cfg : http_config_.endpoints) {
+        // Shutdown: don't start new sync HTTP exchanges (see BoundSyncSocketIO).
+        if (!m_on.load() || m_chainman.m_interrupt) break;
         if (endpoint_cfg.api_key.empty()) {
             LogWarning("VALIDATOR HTTP submit skipped %s because no API key is configured for that endpoint\n",
                        endpoint_cfg.base_url.c_str());
@@ -1321,6 +1382,7 @@ uint16_t ValidationAPI::SendHttpRequest(const uint256& req_id,
                 boost::beast::tcp_stream stream{ioc};
                 stream.expires_after(http_config_.timeout);
                 stream.connect(results);
+                BoundSyncSocketIO(stream.socket(), http_config_.timeout);
 
                 http::request<http::vector_body<uint8_t>> req{http::verb::post, path, 11};
                 req.set(http::field::host, endpoint->host);
@@ -1333,11 +1395,9 @@ uint16_t ValidationAPI::SendHttpRequest(const uint256& req_id,
                 req.body() = payload;
                 req.prepare_payload();
 
-                http::write(stream, req);
-
                 boost::beast::flat_buffer buffer;
                 http::response<http::string_body> res;
-                http::read(stream, buffer, res);
+                SyncHttpExchange(ioc, stream, req, buffer, res);
                 stream.socket().shutdown(tcp::socket::shutdown_both);
                 status_code = static_cast<uint16_t>(res.result());
             } else {
@@ -1354,7 +1414,8 @@ uint16_t ValidationAPI::SendHttpRequest(const uint256& req_id,
                 }
                 boost::beast::get_lowest_layer(stream).expires_after(http_config_.timeout);
                 boost::beast::get_lowest_layer(stream).connect(results);
-                stream.handshake(net::ssl::stream_base::client);
+                BoundSyncSocketIO(boost::beast::get_lowest_layer(stream).socket(), http_config_.timeout);
+                SyncSslHandshake(ioc, stream);
 
                 http::request<http::vector_body<uint8_t>> req{http::verb::post, path, 11};
                 req.set(http::field::host, endpoint->host);
@@ -1367,11 +1428,9 @@ uint16_t ValidationAPI::SendHttpRequest(const uint256& req_id,
                 req.body() = payload;
                 req.prepare_payload();
 
-                http::write(stream, req);
-
                 boost::beast::flat_buffer buffer;
                 http::response<http::string_body> res;
-                http::read(stream, buffer, res);
+                SyncHttpExchange(ioc, stream, req, buffer, res);
                 boost::system::error_code ec;
                 stream.shutdown(ec);
                 status_code = static_cast<uint16_t>(res.result());
@@ -1781,6 +1840,10 @@ ValidationResponseBehavior ValidationAPI::GettHttpStatus(uint256& req_id, Valida
             using tcp = net::ip::tcp;
 
             for (const auto& base_url : http_config_.base_urls) {
+                // Shutdown: don't start new HTTP requests — StopThreads has no
+                // way to interrupt an in-flight sync exchange, so the join in
+                // ~ValidationAPI waits out every request this pass still issues.
+                if (!m_on.load() || m_chainman.m_interrupt) break;
                 const auto endpoint = ParseHttpBaseUrl(base_url);
                 if (!endpoint.has_value()) {
                     LogError("VALIDATOR HTTP public status skipped invalid base URL: %s\n", base_url.c_str());
@@ -1800,15 +1863,14 @@ ValidationResponseBehavior ValidationAPI::GettHttpStatus(uint256& req_id, Valida
                     boost::beast::tcp_stream stream{ioc};
                     stream.expires_after(http_config_.timeout);
                     stream.connect(results);
+                    BoundSyncSocketIO(stream.socket(), http_config_.timeout);
 
                     http::request<http::string_body> req_msg{http::verb::get, path, 11};
                     req_msg.set(http::field::host, endpoint->host);
                     req_msg.set(http::field::user_agent, "tensorcash/validationapi");
-                    http::write(stream, req_msg);
-
                     boost::beast::flat_buffer buffer;
                     http::response<http::string_body> res;
-                    http::read(stream, buffer, res);
+                    SyncHttpExchange(ioc, stream, req_msg, buffer, res);
                     stream.socket().shutdown(tcp::socket::shutdown_both);
                     const auto status_code = res.result_int();
                     if (status_code == 429 || status_code == 403) {
@@ -1830,16 +1892,15 @@ ValidationResponseBehavior ValidationAPI::GettHttpStatus(uint256& req_id, Valida
                     }
                     boost::beast::get_lowest_layer(stream).expires_after(http_config_.timeout);
                     boost::beast::get_lowest_layer(stream).connect(results);
-                    stream.handshake(net::ssl::stream_base::client);
+                    BoundSyncSocketIO(boost::beast::get_lowest_layer(stream).socket(), http_config_.timeout);
+                    SyncSslHandshake(ioc, stream);
 
                     http::request<http::string_body> req_msg{http::verb::get, path, 11};
                     req_msg.set(http::field::host, endpoint->host);
                     req_msg.set(http::field::user_agent, "tensorcash/validationapi");
-                    http::write(stream, req_msg);
-
                     boost::beast::flat_buffer buffer;
                     http::response<http::string_body> res;
-                    http::read(stream, buffer, res);
+                    SyncHttpExchange(ioc, stream, req_msg, buffer, res);
                     boost::system::error_code ec;
                     stream.shutdown(ec);
                     const auto status_code = res.result_int();
@@ -2088,6 +2149,9 @@ ValidationResponseBehavior ValidationAPI::GettHttpStatus(uint256& req_id, Valida
     }
 
     for (const auto& endpoint_cfg : http_config_.endpoints) {
+        // Shutdown: same reasoning as the public-status loop above — no new
+        // sync HTTP exchanges once StopThreads has flipped m_on.
+        if (!m_on.load() || m_chainman.m_interrupt) break;
         if (endpoint_cfg.api_key.empty()) {
             LogWarning("VALIDATOR HTTP status batch skipped %s because no API key is configured for that endpoint\n",
                        endpoint_cfg.base_url.c_str());
@@ -2110,6 +2174,7 @@ ValidationResponseBehavior ValidationAPI::GettHttpStatus(uint256& req_id, Valida
                 boost::beast::tcp_stream stream{ioc};
                 stream.expires_after(http_config_.timeout);
                 stream.connect(results);
+                BoundSyncSocketIO(stream.socket(), http_config_.timeout);
 
                 http::request<http::string_body> req{http::verb::post, path, 11};
                 req.set(http::field::host, endpoint->host);
@@ -2119,11 +2184,9 @@ ValidationResponseBehavior ValidationAPI::GettHttpStatus(uint256& req_id, Valida
                 req.body() = json;
                 req.prepare_payload();
 
-                http::write(stream, req);
-
                 boost::beast::flat_buffer buffer;
                 http::response<http::string_body> res;
-                http::read(stream, buffer, res);
+                SyncHttpExchange(ioc, stream, req, buffer, res);
                 stream.socket().shutdown(tcp::socket::shutdown_both);
 
                 const int status_code = res.result_int();
@@ -2157,7 +2220,8 @@ ValidationResponseBehavior ValidationAPI::GettHttpStatus(uint256& req_id, Valida
             }
             boost::beast::get_lowest_layer(stream).expires_after(http_config_.timeout);
             boost::beast::get_lowest_layer(stream).connect(results);
-            stream.handshake(net::ssl::stream_base::client);
+            BoundSyncSocketIO(boost::beast::get_lowest_layer(stream).socket(), http_config_.timeout);
+            SyncSslHandshake(ioc, stream);
 
             http::request<http::string_body> req{http::verb::post, path, 11};
             req.set(http::field::host, endpoint->host);
@@ -2167,11 +2231,9 @@ ValidationResponseBehavior ValidationAPI::GettHttpStatus(uint256& req_id, Valida
             req.body() = json;
             req.prepare_payload();
 
-            http::write(stream, req);
-
             boost::beast::flat_buffer buffer;
             http::response<http::string_body> res;
-            http::read(stream, buffer, res);
+            SyncHttpExchange(ioc, stream, req, buffer, res);
             boost::system::error_code ec;
             stream.shutdown(ec);
 
