@@ -3997,7 +3997,9 @@ static RPCHelpMan submitreorgdecision()
         return result;
     case ReorgGatingManager::SubmitStatus::BAD_STATE:
         result.pushKV("success", false);
-        result.pushKV("message", "Failed to submit decision. The gate state may have changed.");
+        result.pushKV("message", "Decision not applied: the gate was already resolved (an earlier decision "
+                                 "or its timeout won the race). Check getpendingreorg for the current state; "
+                                 "a vetoed gate can be accepted, or lifted with clearreorgveto.");
         return result;
     }
 

@@ -496,7 +496,7 @@ ReorgAdvisoryConfig GetReorgAdvisoryConfig()
     // Read enabled flag (default: true)
     config.enabled = gArgs.GetBoolArg("-reorgadvisory", true);
 
-    // Read depth threshold (default: 3)
+    // Read depth threshold (default: ADVISORY_DEPTH_THRESHOLD)
     config.depth_threshold = gArgs.GetIntArg("-reorgadvisorydepth", ADVISORY_DEPTH_THRESHOLD);
 
     // Read offline threshold in seconds (default: 6 hours = 21600 seconds)
@@ -930,6 +930,7 @@ void ReorgGatingManager::RecordApprovalFromEntry(const ReorgGateEntry& entry)
 {
     m_approval.is_valid = true;
     m_approval.fork_point_hash = entry.fork_point_hash;
+    m_approval.anchor_hash = entry.anchor_hash;
     m_approval.candidate_tip_hash = entry.candidate_tip_hash;
     m_approval.current_tip_hash = entry.current_tip_hash;
     m_approval.approved_at = GetTime();
@@ -953,9 +954,42 @@ void ReorgGatingManager::ConvertToVeto(ReorgGateEntry& entry, const char* origin
                                 : arith_uint256{};
 
     LogPrintf("REORG GATING: Gate %d REJECTED (%s): candidate %s vetoed for %d seconds; "
-              "escapes early if the branch extends >=%d blocks or its raw-work margin over the tip grows.\n",
+              "escapes early if the branch extends >=%d blocks or its raw-work margin over the tip "
+              "grows by more than %d blocks' worth of work.\n",
               entry.gate_id, origin, entry.candidate_tip_hash.ToString(),
-              m_config.veto_ttl_secs, m_config.veto_growth_blocks);
+              m_config.veto_ttl_secs, m_config.veto_growth_blocks, m_config.veto_growth_blocks);
+}
+
+void ReorgGatingManager::RecordVetoTombstone(const uint256& anchor_hash)
+{
+    const int64_t now{GetTime()};
+    m_veto_tombstones[anchor_hash] = now;
+    // Lazy bound: drop expired tombstones whenever a new one is recorded.
+    for (auto it = m_veto_tombstones.begin(); it != m_veto_tombstones.end();) {
+        if (now - it->second > REORG_VETO_TOMBSTONE_SECS) {
+            it = m_veto_tombstones.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+bool ReorgGatingManager::HadRecentVeto(const uint256& anchor_hash)
+{
+    LOCK(m_mutex);
+    // A LIVE veto counts too: in mask mode it never reaches ShouldGateReorg
+    // (the mask filters the candidate first), but the offline bypass must be
+    // suppressed regardless of which check runs first.
+    for (const auto& [key, entry] : m_gates) {
+        if (entry.gate_state == ReorgGateState::VETOED && entry.anchor_hash == anchor_hash) return true;
+    }
+    const auto it = m_veto_tombstones.find(anchor_hash);
+    if (it == m_veto_tombstones.end()) return false;
+    if (GetTime() - it->second > REORG_VETO_TOMBSTONE_SECS) {
+        m_veto_tombstones.erase(it);
+        return false;
+    }
+    return true;
 }
 
 void ReorgGatingManager::ArmTimeout(uint64_t gate_id, uint64_t generation)
@@ -1096,18 +1130,29 @@ ReorgGatingManager::SubmitStatus ReorgGatingManager::SubmitDecision(const std::o
         if (status != SubmitStatus::OK) return status;
         if (out_gate_id) *out_gate_id = entry->gate_id;
 
-        // Operator decisions bump the generation so any armed timeout for the
-        // previous generation fires as a no-op.
-        entry->generation = ++m_next_generation;
-
-        if (m_config.gating_mode == ReorgGatingMode::BLOCK) {
-            if (entry->gate_state != ReorgGateState::PENDING) return SubmitStatus::BAD_STATE;
+        if (m_config.gating_mode == ReorgGatingMode::BLOCK &&
+            entry->gate_state == ReorgGateState::PENDING) {
+            // The parked waiter acts on the FIRST resolution only. Once the
+            // decision slot is occupied — an earlier operator decision, or
+            // the TIMEOUT stamp the waiter records at its deadline — a later
+            // submission must be refused, not silently absorbed: the waiter
+            // may already have returned with the earlier value, and an RPC
+            // "success" it never acts on is a lost decision.
+            if (entry->decision != ReorgDecision::NONE) return SubmitStatus::BAD_STATE;
+            // Operator decisions bump the generation so any armed timeout
+            // for the previous generation fires as a no-op.
+            entry->generation = ++m_next_generation;
             entry->decision = decision;
             LogPrintf("REORG GATING: Operator decision received for gate %d: %s\n",
                       entry->gate_id, DecisionName(decision));
+            // The parked waiter consumes the stamp: its epilogue records the
+            // approval (ACCEPT) or converts the gate to a TTL veto (REJECT /
+            // timeout) via VetoPending, so a rejected branch stays masked in
+            // fork choice instead of re-arming and re-parking forever.
         } else if (decision == ReorgDecision::ACCEPT) {
-            // ACCEPT clears the mask (works on a vetoed gate too: an explicit
-            // accept overrides an earlier reject).
+            // ACCEPT clears the mask (works on a vetoed gate too, in either
+            // mode: an explicit accept overrides an earlier reject).
+            entry->generation = ++m_next_generation;
             LogPrintf("REORG GATING: Gate %d ACCEPTED by operator; unmasking candidate %s.\n",
                       entry->gate_id, entry->candidate_tip_hash.ToString());
             RecordApprovalFromEntry(*entry);
@@ -1117,6 +1162,7 @@ ReorgGatingManager::SubmitStatus ReorgGatingManager::SubmitDecision(const std::o
             m_kick_requested = true;
         } else {
             // REJECT converts the mask into (or refreshes) a TTL-bound veto.
+            entry->generation = ++m_next_generation;
             ConvertToVeto(*entry, "operator REJECT");
         }
     }
@@ -1134,6 +1180,10 @@ ReorgGatingManager::SubmitStatus ReorgGatingManager::ClearVeto(const std::option
         if (entry->gate_state != ReorgGateState::VETOED) return SubmitStatus::BAD_STATE;
         if (out_gate_id) *out_gate_id = entry->gate_id;
         LogPrintf("REORG GATING: Gate %d veto cleared by operator; branch may re-prompt.\n", entry->gate_id);
+        // The documented outcome is a re-PROMPT: leave a tombstone so the
+        // offline bypass cannot turn the veto-clear into a silent follow (an
+        // operator who wants to follow the branch accepts instead).
+        RecordVetoTombstone(entry->anchor_hash);
         m_gates.erase(GateKey{entry->fork_point_hash, entry->anchor_hash});
         // Kick so the branch re-prompts without waiting for a new block.
         m_kick_requested = true;
@@ -1218,17 +1268,23 @@ ReorgDecision ReorgGatingManager::WaitForDecision(const std::function<bool()>& i
 
 bool ReorgGatingManager::EvaluateMask(uint64_t gate_id, const uint256& candidate_hash, int candidate_height,
                                       const arith_uint256& candidate_raw_work,
-                                      const arith_uint256& tip_raw_work)
+                                      const arith_uint256& tip_raw_work,
+                                      const arith_uint256& candidate_block_proof)
 {
     LOCK(m_mutex);
-    if (m_config.gating_mode != ReorgGatingMode::MASK) return false;
     ReorgGateEntry* entry = FindGateById(gate_id);
     if (!entry) return false;
     if (entry->gate_state == ReorgGateState::PENDING) {
+        // A pending gate masks only in mask mode; in block mode the parked
+        // wait is what holds the reorg back.
+        if (m_config.gating_mode != ReorgGatingMode::MASK) return false;
         // Track the growing branch: the mask keeps ActivateBestChainStep from
         // re-arming this gate, so the best candidate seen at selection time is
         // what keeps the operator view - and any later veto baseline - fresh.
-        if (candidate_height >= entry->candidate_height) {
+        // "Best" is strictly-more raw work, never height: a worse same-height
+        // sibling inside the subtree is visited later in the selection walk
+        // and must not overwrite the candidate the operator is judging.
+        if (candidate_raw_work > entry->work.candidate_raw_work) {
             entry->candidate_tip_hash = candidate_hash;
             entry->candidate_height = candidate_height;
             entry->work.candidate_raw_work = candidate_raw_work;
@@ -1237,11 +1293,15 @@ bool ReorgGatingManager::EvaluateMask(uint64_t gate_id, const uint256& candidate
         return true;
     }
 
-    // VETOED: drop the veto when it expires or an escape fires, so the branch
-    // re-prompts (once) through ActivateBestChainStep. A fresh reject then
-    // records a fresh veto with fresh baselines.
+    // VETOED (masks in BOTH modes): drop the veto when it expires or an
+    // escape fires, so the branch re-prompts (once) through
+    // ActivateBestChainStep. A fresh reject then records a fresh veto with
+    // fresh baselines. The tombstone left behind keeps the offline
+    // auto-follow bypass suppressed, so the re-prompt is a prompt — never a
+    // silent follow of a branch the operator vetoed.
     const auto erase_and_unmask = [&](const char* why) EXCLUSIVE_LOCKS_REQUIRED(m_mutex) {
         LogPrintf("REORG GATING: Gate %d veto %s; branch will re-prompt.\n", entry->gate_id, why);
+        RecordVetoTombstone(entry->anchor_hash);
         m_gates.erase(GateKey{entry->fork_point_hash, entry->anchor_hash});
         return false;
     };
@@ -1253,7 +1313,19 @@ bool ReorgGatingManager::EvaluateMask(uint64_t gate_id, const uint256& candidate
     }
     if (candidate_raw_work > tip_raw_work) {
         const arith_uint256 margin{candidate_raw_work - tip_raw_work};
-        if (!entry->veto_margin_positive || margin > entry->veto_raw_margin) {
+        // Escape only when the margin grew a full growth-quantum past the
+        // veto-time baseline. A bare margin > baseline check degenerates to
+        // one prompt per candidate block against a branch that is already
+        // ahead and keeps out-mining the tip: every re-veto records the then-
+        // current margin, and the very next block exceeds it.
+        arith_uint256 escape_threshold{entry->veto_margin_positive ? entry->veto_raw_margin
+                                                                   : arith_uint256{}};
+        if (m_config.veto_growth_blocks > 0) {
+            arith_uint256 quantum{candidate_block_proof};
+            quantum *= static_cast<uint32_t>(m_config.veto_growth_blocks);
+            escape_threshold += quantum;
+        }
+        if (margin > escape_threshold) {
             return erase_and_unmask("raw-work escape (margin over tip grew)");
         }
     }
@@ -1309,9 +1381,12 @@ void ReorgGatingManager::HandleTimeout(uint64_t gate_id, uint64_t generation)
 void ReorgGatingManager::RecordApprovalFromPending()
 {
     LOCK(m_mutex);
-    // BLOCK-mode helper: the sole (oldest) gate carries the decision.
+    // BLOCK-mode helper: the oldest PENDING gate carries the decision.
+    // Vetoed gates for other branches may coexist and must never be the
+    // approval source.
     ReorgGateEntry* found{nullptr};
     for (auto& [key, entry] : m_gates) {
+        if (entry.gate_state != ReorgGateState::PENDING) continue;
         if (!found || entry.gate_id < found->gate_id) found = &entry;
     }
     if (!found) return;
@@ -1321,13 +1396,40 @@ void ReorgGatingManager::RecordApprovalFromPending()
 void ReorgGatingManager::ClearPending()
 {
     LOCK(m_mutex);
+    // Only ever drop the PENDING gate the waiter resolved: vetoed gates for
+    // other (or this) branch outlive decisions on purpose, and erasing the
+    // oldest gate regardless of state could destroy a live veto.
     auto oldest = m_gates.end();
     for (auto it = m_gates.begin(); it != m_gates.end(); ++it) {
+        if (it->second.gate_state != ReorgGateState::PENDING) continue;
         if (oldest == m_gates.end() || it->second.gate_id < oldest->second.gate_id) oldest = it;
     }
     if (oldest == m_gates.end()) return;
     m_gates.erase(oldest);
     LogDebug(BCLog::VALIDATION, "REORG GATING: Pending state cleared.\n");
+}
+
+void ReorgGatingManager::VetoPending(const std::optional<ReorgGateWorkSnapshot>& fresh_work,
+                                     const char* origin,
+                                     const std::optional<std::pair<uint256, int>>& live_candidate)
+{
+    {
+        LOCK(m_mutex);
+        ReorgGateEntry* found{nullptr};
+        for (auto& [key, entry] : m_gates) {
+            if (entry.gate_state != ReorgGateState::PENDING) continue;
+            if (!found || entry.gate_id < found->gate_id) found = &entry;
+        }
+        if (!found) return;
+        if (fresh_work) found->work = *fresh_work;
+        if (live_candidate) {
+            found->candidate_tip_hash = live_candidate->first;
+            found->candidate_height = live_candidate->second;
+        }
+        found->generation = ++m_next_generation;
+        ConvertToVeto(*found, origin);
+    }
+    m_cv.notify_all();
 }
 
 ReorgApprovalState ReorgGatingManager::GetApproval() const
@@ -1445,7 +1547,8 @@ bool ReorgGateOperatorActionActive()
 }
 
 bool ShouldGateReorg(int depth_current, int64_t since_last_block, bool disconnect_only,
-                     const std::optional<ReorgGatingConfig>& config_opt)
+                     const std::optional<ReorgGatingConfig>& config_opt,
+                     bool recent_operator_veto)
 {
     // The gate exists to obtain operator sign-off. An operator-initiated
     // action (invalidateblock/reconsiderblock) already carries that sign-off,
@@ -1473,13 +1576,22 @@ bool ShouldGateReorg(int depth_current, int64_t since_last_block, bool disconnec
         return false;
     }
 
-    // Don't gate if node was offline too long (auto-follow per spec)
+    // Don't gate if node was offline too long (auto-follow per spec) — unless
+    // this subtree carries (or recently carried) an operator veto. A node that
+    // vetoed the only growing branch goes tip-stale by construction while it
+    // holds its ground; treating that as "offline" would silently follow the
+    // very branch the operator rejected. Gate (re-prompt) instead.
     ReorgAdvisoryConfig adv_config = GetReorgAdvisoryConfig();
     if (since_last_block > adv_config.offline_threshold_secs) {
-        LogDebug(BCLog::VALIDATION,
-            "REORG GATING: Skipping gate - node was offline for %lld seconds (threshold: %lld)\n",
-            since_last_block, adv_config.offline_threshold_secs);
-        return false;
+        if (recent_operator_veto) {
+            LogPrintf("REORG GATING: Offline auto-follow bypass suppressed - the candidate branch "
+                      "carries a recent operator veto; prompting instead.\n");
+        } else {
+            LogDebug(BCLog::VALIDATION,
+                "REORG GATING: Skipping gate - node was offline for %lld seconds (threshold: %lld)\n",
+                since_last_block, adv_config.offline_threshold_secs);
+            return false;
+        }
     }
 
     return true;

@@ -604,8 +604,15 @@ struct ReorgApprovalState {
     //! Fork point of the approved reorg (invariant across its segments).
     uint256 fork_point_hash;
 
-    //! Candidate tip the operator saw when approving. Later candidates must
-    //! descend from this block to be covered by the approval.
+    //! Candidate-subtree anchor (fork-point child) of the approved branch.
+    //! The approval covers exactly what the gate prompted for: any candidate
+    //! that descends through this anchor. Anchoring to the exact candidate
+    //! tip instead would let a same-height sibling arriving between prompt
+    //! and accept strand the approval and re-prompt the operator.
+    uint256 anchor_hash;
+
+    //! Candidate tip the operator saw when approving (operator visibility;
+    //! coverage is decided by anchor_hash above).
     uint256 candidate_tip_hash;
 
     //! Active tip whose replacement the operator approved. The approval only
@@ -652,8 +659,22 @@ constexpr ReorgGatingMode DEFAULT_REORG_GATING_MODE = ReorgGatingMode::MASK;
 constexpr int64_t DEFAULT_REORG_VETO_TTL_SECS = 60 * 60;
 
 //! Default growth escape: a vetoed branch that extends this many blocks past
-//! its length at veto time escapes the veto early and re-prompts (once).
+//! its length at veto time escapes the veto early and re-prompts (once). The
+//! same block count sizes the raw-work escape quantum: the candidate's margin
+//! over the tip must grow by this many blocks' worth of work past the
+//! veto-time baseline, so a rejected branch that keeps out-mining the tip
+//! re-prompts once per quantum, not once per block.
 constexpr int DEFAULT_REORG_VETO_GROWTH_BLOCKS = 6;
+
+//! How long after a veto is dropped (TTL expiry, escape, or clearreorgveto)
+//! its anchor keeps suppressing the offline (>6h stale tip) auto-follow
+//! bypass in ShouldGateReorg. A node holding or recently holding an operator
+//! veto was manifestly attended, not offline: its tip going stale is the
+//! natural consequence of rejecting the only growing branch, and following
+//! that branch silently would override the operator's decision. Tombstones
+//! are in-memory like vetoes, so a genuinely offline node that restarts
+//! still auto-follows on catch-up.
+constexpr int64_t REORG_VETO_TOMBSTONE_SECS = 24 * 60 * 60;
 
 /**
  * Gating configuration read from command-line args.
@@ -737,6 +758,14 @@ private:
     uint64_t m_next_gate_id GUARDED_BY(m_mutex){1};
     uint64_t m_next_generation GUARDED_BY(m_mutex){1};
     ReorgApprovalState m_approval GUARDED_BY(m_mutex);
+    //! Anchors whose veto was dropped (TTL expiry, escape, clearreorgveto)
+    //! and when: while a tombstone is fresh (REORG_VETO_TOMBSTONE_SECS) the
+    //! offline auto-follow bypass stays suppressed for that subtree, so an
+    //! operator veto can never be silently overridden just because the local
+    //! tip went stale while rejecting the only growing branch. In-memory
+    //! only, bounded by lazy expiry (each entry cost the network a distinct
+    //! deeper-than-threshold branch, so the map is work-bounded).
+    std::map<uint256, int64_t> m_veto_tombstones GUARDED_BY(m_mutex);
     ReorgGatingConfig m_config;
 
     //! Scheduler hooks, wired at init; absent in unit tests (no timers fire,
@@ -766,6 +795,7 @@ private:
         EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
     void RecordApprovalFromEntry(const ReorgGateEntry& entry) EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
     void ConvertToVeto(ReorgGateEntry& entry, const char* origin) EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
+    void RecordVetoTombstone(const uint256& anchor_hash) EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
     void ArmTimeout(uint64_t gate_id, uint64_t generation);
 
 public:
@@ -840,12 +870,19 @@ public:
     /**
      * Submit an operator decision (ACCEPT or REJECT) for one gate.
      * Bare form (no gate_id) is sugar allowed only when exactly one gate is
-     * live. In MASK mode the transition is applied inline: ACCEPT records the
-     * durable approval, drops the gate and kicks ActivateBestChain; REJECT
-     * converts the gate to a TTL veto. In BLOCK mode the parked waiter applies
-     * the transition. Idempotent: a decision against a gate that already
-     * transitioned reports UNKNOWN_GATE and changes nothing. Every operator
-     * decision bumps the gate generation, so a stale armed timeout is a no-op.
+     * live. ACCEPT records the durable approval, drops the gate and kicks
+     * ActivateBestChain (also on a vetoed gate: an explicit accept overrides
+     * an earlier reject in either mode); REJECT ends as a TTL veto in either
+     * mode, so a rejected branch masks fork choice instead of re-arming — in
+     * MASK mode the conversion is inline, in BLOCK mode the stamp wakes the
+     * parked waiter whose epilogue converts via VetoPending. A BLOCK-mode
+     * gate whose decision slot is already occupied (the waiter stamped
+     * TIMEOUT, or an earlier decision landed first) refuses further
+     * submissions with BAD_STATE instead of silently overwriting what the
+     * waiter acts on. Idempotent: a decision
+     * against a gate that already transitioned reports UNKNOWN_GATE and
+     * changes nothing. Every applied operator decision bumps the gate
+     * generation, so a stale armed timeout is a no-op.
      *
      * @param[out] out_gate_id The resolved gate id (set on OK).
      */
@@ -879,30 +916,42 @@ public:
 
     /**
      * BLOCK mode only: wait for an operator decision, timeout, or interrupt
-     * on the sole pending gate. The wait is sliced into 1s ticks; when
+     * on the oldest pending gate. The wait is sliced into 1s ticks; when
      * interrupted() reports true the wait aborts WITHOUT deciding and returns
-     * ABORT (callers must clear the gate and stay on the current tip).
+     * ABORT (callers must clear the gate and stay on the current tip). On
+     * timeout the gate's decision slot is stamped TIMEOUT under the mutex, so
+     * a concurrently arriving SubmitDecision is refused (BAD_STATE) instead
+     * of being silently discarded by the already-returned waiter.
      *
      * @return ACCEPT, REJECT, TIMEOUT, ABORT, or NONE if no gate is pending.
      */
     ReorgDecision WaitForDecision(const std::function<bool()>& interrupted);
 
     /**
-     * MASK mode selection-time check for one gate. PENDING gates always mask,
-     * and are refreshed from the live candidate seen here (the mask prevents
-     * ActivateBestChainStep from re-arming the gate, so this is where the
-     * gate tracks the growing branch the operator will decide on). A VETOED
-     * gate masks until its TTL expires or an escape fires (branch extended
-     * >= veto_growth_blocks, or its raw-work margin over the tip grew past
-     * the veto-time baseline); an expired/escaped veto is dropped here so the
-     * branch re-prompts (once) through ActivateBestChainStep.
+     * Selection-time mask check for one gate. PENDING gates mask in MASK mode
+     * only (in BLOCK mode the parked wait is what holds the reorg), and are
+     * refreshed from the live candidate seen here whenever it strictly
+     * improves the stored candidate on raw work (a worse same-height sibling
+     * must not overwrite what the operator is judging). A VETOED gate masks
+     * in BOTH modes until its TTL expires or an escape fires: branch extended
+     * >= veto_growth_blocks, or its raw-work margin over the tip grew more
+     * than veto_growth_blocks * candidate_block_proof past the veto-time
+     * baseline (the quantum keeps a winning branch from re-prompting once per
+     * block). An expired/escaped veto is dropped here — leaving a tombstone
+     * that suppresses the offline auto-follow bypass — so the branch
+     * re-prompts (once) through ActivateBestChainStep.
      *
+     * @param candidate_block_proof Work of one block at the candidate tip
+     *        (GetBlockProof); sizes the raw-work escape quantum. Deliberately
+     *        has no default: passing zero re-enables the margin-escape-per-
+     *        block churn, so a caller must opt into that explicitly.
      * @return true if candidates descending through this gate's anchor must be
      *         skipped by FindMostWorkChain.
      */
     bool EvaluateMask(uint64_t gate_id, const uint256& candidate_hash, int candidate_height,
                       const arith_uint256& candidate_raw_work,
-                      const arith_uint256& tip_raw_work);
+                      const arith_uint256& tip_raw_work,
+                      const arith_uint256& candidate_block_proof);
 
     /**
      * Scheduler timeout for a MASK-mode gate. Transitions the gate only if it
@@ -915,18 +964,49 @@ public:
     void HandleTimeout(uint64_t gate_id, uint64_t generation);
 
     /**
-     * BLOCK mode: record a durable approval from the sole gate.
-     * Called on ACCEPT (operator or timeout-accept) BEFORE ClearPending, so
-     * that later segments of the same reorg skip the gate instead of
-     * re-prompting the operator once per segment.
+     * BLOCK mode: record a durable approval from the oldest PENDING gate
+     * (vetoed gates for other branches may coexist and must not be the
+     * source). Called on ACCEPT (operator or timeout-accept) BEFORE
+     * ClearPending, so that later segments of the same reorg skip the gate
+     * instead of re-prompting the operator once per segment.
      */
     void RecordApprovalFromPending();
 
     /**
-     * BLOCK mode: drop the sole gate after its decision has been processed
-     * (or on interrupt, without any decision).
+     * BLOCK mode: drop the oldest PENDING gate after its decision has been
+     * processed (or on interrupt, without any decision). Vetoed gates are
+     * left alone — they outlive the decision on purpose.
      */
     void ClearPending();
+
+    /**
+     * BLOCK mode: convert the oldest PENDING gate to a TTL veto after its
+     * wait resolved to REJECT (operator) or TIMEOUT (with timeout_accept off
+     * or the guardrail failing). The veto masks the branch in fork choice,
+     * so the next activation stays on the current chain instead of re-arming
+     * the gate and parking the validation thread for another full decision
+     * window.
+     *
+     * @param fresh_work Decision-time work snapshot to base the veto's
+     *        raw-work escape baseline on, when available.
+     * @param origin Log tag: what resolved the gate.
+     * @param live_candidate Live {tip hash, height} of the candidate subtree
+     *        at decision time. A block-mode gate is never refreshed while the
+     *        waiter is parked (no selection pass runs), so the stored
+     *        candidate can be several blocks stale by the time the decision
+     *        lands — and stale growth/margin baselines make the escapes fire
+     *        immediately, leaving the veto stillborn.
+     */
+    void VetoPending(const std::optional<ReorgGateWorkSnapshot>& fresh_work = std::nullopt,
+                     const char* origin = "decision timeout",
+                     const std::optional<std::pair<uint256, int>>& live_candidate = std::nullopt);
+
+    /**
+     * Whether a veto covering this anchor was dropped recently enough
+     * (REORG_VETO_TOMBSTONE_SECS) that the offline auto-follow bypass must
+     * stay suppressed for its subtree. Expired tombstones are pruned here.
+     */
+    bool HadRecentVeto(const uint256& anchor_hash);
 
     /**
      * Get the recorded approval, if any.
@@ -999,10 +1079,16 @@ void PruneMootReorgGates(ChainstateManager& chainman) EXCLUSIVE_LOCKS_REQUIRED(:
  * @param since_last_block Seconds since last block was seen.
  * @param disconnect_only True when the candidate chain is an ancestor of the current tip.
  * @param config Optional config; if not provided, reads from gArgs.
+ * @param recent_operator_veto True when the candidate subtree carries (or
+ *        recently carried — see REORG_VETO_TOMBSTONE_SECS) an operator veto.
+ *        Suppresses the offline (>6h stale tip) auto-follow bypass: a node
+ *        that vetoed the only growing branch goes tip-stale by construction,
+ *        and silently following that branch would override the operator.
  * @return true if gating is enabled and thresholds are met.
  */
 bool ShouldGateReorg(int depth_current, int64_t since_last_block, bool disconnect_only = false,
-                     const std::optional<ReorgGatingConfig>& config = std::nullopt);
+                     const std::optional<ReorgGatingConfig>& config = std::nullopt,
+                     bool recent_operator_veto = false);
 
 /**
  * Check if an otherwise-gated reorg should auto-follow as sane partition recovery.
