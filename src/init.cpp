@@ -677,6 +677,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
         argsman.AddArg("-scalarcfdheight=<n>", "Regtest only: block height at/after which scalar-CFD ISSUER_SCALAR publication carriers (0x11) activate (default: 0). Ignored on main/test chains, where activation is hardwired consensus.", ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
         argsman.AddArg("-reuseentropyheight=<n>", "Regtest only: block height at/after which the quick verifier reuse entropy score activates (default: disabled). Ignored on main/test chains.", ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
         argsman.AddArg("-v3activationheight=<n>", "Regtest only: block height at/after which the v3 prompt-binding proof rules (admission nonce, B_cred tiering, fixed sampler profile) activate (default: disabled). Ignored on main/test chains, where activation is hardwired consensus.", ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
+        argsman.AddArg("-enforcedproofwindowsize=<n>", "Regtest only: exact chosen-token count every mining proof must carry, enforced in quick verification for all proof versions (default: 0 = not enforced). Ignored on main/test chains, where the value is hardwired consensus.", ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
         // -assetminicubond removed: the minimum initial ICU bond is consensus-critical
         // (enforced in ConnectBlock) and now lives in Consensus::Params::AssetMinIcuBond.
         s_asset_args_added = true;
