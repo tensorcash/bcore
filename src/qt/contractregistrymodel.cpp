@@ -13,6 +13,12 @@
 #include <QPointer>
 #include <QtConcurrent/QtConcurrent>
 
+namespace {
+// Routine refresh traces go to the qt debug category (-debug=qt); operations
+// slower than this are escalated to the unconditional log.
+constexpr qint64 SLOW_REFRESH_MS = 250;
+} // namespace
+
 ContractRegistryModel::ContractRegistryModel(WalletModel* wallet, QObject* parent)
     : QAbstractTableModel(parent),
       walletModel(wallet),
@@ -419,7 +425,7 @@ void ContractRegistryModel::refresh()
     QPointer<ContractRegistryModel> self(this);
     QPointer<WalletModel> wm(walletModel);
 
-    LogPrintf("ContractRegistryModel::refresh start (async) wallet=%s gen=%llu rows_before=%d type_filter=%s status_filter=%s\n",
+    LogDebug(BCLog::QT, "ContractRegistryModel::refresh start (async) wallet=%s gen=%llu rows_before=%d type_filter=%s status_filter=%s\n",
               walletModel->getWalletName().toStdString().c_str(),
               static_cast<unsigned long long>(generation),
               filteredContracts.size(),
@@ -442,7 +448,7 @@ void ContractRegistryModel::refresh()
         // worker started. Drop this snapshot; the newer one is or will be
         // in flight.
         if (generation != self->m_refreshGeneration.load(std::memory_order_acquire)) {
-            LogPrintf("ContractRegistryModel::refresh dropping stale snapshot gen=%llu current=%llu\n",
+            LogDebug(BCLog::QT, "ContractRegistryModel::refresh dropping stale snapshot gen=%llu current=%llu\n",
                       static_cast<unsigned long long>(generation),
                       static_cast<unsigned long long>(self->m_refreshGeneration.load(std::memory_order_acquire)));
         } else {
@@ -484,7 +490,7 @@ void ContractRegistryModel::applySnapshot(QList<ContractEntry> snapshot)
     contracts = std::move(snapshot);
     applyFilters();
     endResetModel();
-    LogPrintf("ContractRegistryModel::applySnapshot wallet=%s contracts=%d filtered=%d\n",
+    LogDebug(BCLog::QT, "ContractRegistryModel::applySnapshot wallet=%s contracts=%d filtered=%d\n",
               walletModel ? walletModel->getWalletName().toStdString().c_str() : "",
               contracts.size(),
               filteredContracts.size());
@@ -540,15 +546,23 @@ QList<ContractRegistryModel::ContractEntry> ContractRegistryModel::buildSnapshot
         return result;
     }
 
-    LogPrintf("ContractRegistryModel::buildSnapshot start wallet=%s\n",
+    LogDebug(BCLog::QT, "ContractRegistryModel::buildSnapshot start wallet=%s\n",
               walletModel->getWalletName().toStdString().c_str());
 
     // Call contract.list RPC to get all contracts
     QList<QVariantMap> contractList = walletModel->listContracts();
-    LogPrintf("ContractRegistryModel::buildSnapshot contract.list returned wallet=%s count=%d elapsed_ms=%lld\n",
-              walletModel->getWalletName().toStdString().c_str(),
-              contractList.size(),
-              timer.elapsed());
+    // Routine refresh traces are debug-category; escalate only when slow.
+    if (timer.elapsed() >= SLOW_REFRESH_MS) {
+        LogPrintf("ContractRegistryModel::buildSnapshot contract.list returned (slow) wallet=%s count=%d elapsed_ms=%lld\n",
+                  walletModel->getWalletName().toStdString().c_str(),
+                  contractList.size(),
+                  timer.elapsed());
+    } else {
+        LogDebug(BCLog::QT, "ContractRegistryModel::buildSnapshot contract.list returned wallet=%s count=%d elapsed_ms=%lld\n",
+                 walletModel->getWalletName().toStdString().c_str(),
+                 contractList.size(),
+                 timer.elapsed());
+    }
 
     for (const QVariantMap& contractData : contractList) {
         ContractEntry entry;
@@ -650,10 +664,17 @@ QList<ContractRegistryModel::ContractEntry> ContractRegistryModel::buildSnapshot
         // reload.
     }
 
-    LogPrintf("ContractRegistryModel::buildSnapshot done wallet=%s contracts=%d elapsed_ms=%lld\n",
-              walletModel->getWalletName().toStdString().c_str(),
-              result.size(),
-              timer.elapsed());
+    if (timer.elapsed() >= SLOW_REFRESH_MS) {
+        LogPrintf("ContractRegistryModel::buildSnapshot done (slow) wallet=%s contracts=%d elapsed_ms=%lld\n",
+                  walletModel->getWalletName().toStdString().c_str(),
+                  result.size(),
+                  timer.elapsed());
+    } else {
+        LogDebug(BCLog::QT, "ContractRegistryModel::buildSnapshot done wallet=%s contracts=%d elapsed_ms=%lld\n",
+                 walletModel->getWalletName().toStdString().c_str(),
+                 result.size(),
+                 timer.elapsed());
+    }
     return result;
 }
 
@@ -718,7 +739,7 @@ void ContractRegistryModel::computeMTM(WalletModel* walletModel, ContractEntry& 
 
     QElapsedTimer timer;
     timer.start();
-    LogPrintf("ContractRegistryModel::computeMTM start wallet=%s id=%s type=%s role=%s status=%s\n",
+    LogDebug(BCLog::QT, "ContractRegistryModel::computeMTM start wallet=%s id=%s type=%s role=%s status=%s\n",
               walletModel->getWalletName().toStdString().c_str(),
               entry.id.toStdString().c_str(),
               entry.type.toStdString().c_str(),
@@ -728,7 +749,7 @@ void ContractRegistryModel::computeMTM(WalletModel* walletModel, ContractEntry& 
     try {
         if (entry.type == "repo") {
             // Call pricing.repo.quote RPC with registry source for "mark" prices
-            LogPrintf("ContractRegistryModel::computeMTM pricing.repo.quote mark start id=%s\n",
+            LogDebug(BCLog::QT, "ContractRegistryModel::computeMTM pricing.repo.quote mark start id=%s\n",
                       entry.id.toStdString().c_str());
             auto resultMark = walletModel->pricingRepoQuote(
                 "registry",
@@ -740,13 +761,13 @@ void ContractRegistryModel::computeMTM(WalletModel* walletModel, ContractEntry& 
                 QStringLiteral("mark"),
                 false           // DO NOT include inception cashflows for opened contracts
             );
-            LogPrintf("ContractRegistryModel::computeMTM pricing.repo.quote mark done id=%s success=%d elapsed_ms=%lld\n",
+            LogDebug(BCLog::QT, "ContractRegistryModel::computeMTM pricing.repo.quote mark done id=%s success=%d elapsed_ms=%lld\n",
                       entry.id.toStdString().c_str(),
                       resultMark.success,
                       timer.elapsed());
 
             // Call pricing.repo.quote RPC with registry source for "market" prices
-            LogPrintf("ContractRegistryModel::computeMTM pricing.repo.quote market start id=%s\n",
+            LogDebug(BCLog::QT, "ContractRegistryModel::computeMTM pricing.repo.quote market start id=%s\n",
                       entry.id.toStdString().c_str());
             auto resultMarket = walletModel->pricingRepoQuote(
                 "registry",
@@ -758,7 +779,7 @@ void ContractRegistryModel::computeMTM(WalletModel* walletModel, ContractEntry& 
                 QStringLiteral("market"),
                 false           // DO NOT include inception cashflows for opened contracts
             );
-            LogPrintf("ContractRegistryModel::computeMTM pricing.repo.quote market done id=%s success=%d elapsed_ms=%lld\n",
+            LogDebug(BCLog::QT, "ContractRegistryModel::computeMTM pricing.repo.quote market done id=%s success=%d elapsed_ms=%lld\n",
                       entry.id.toStdString().c_str(),
                       resultMarket.success,
                       timer.elapsed());
@@ -783,7 +804,7 @@ void ContractRegistryModel::computeMTM(WalletModel* walletModel, ContractEntry& 
         } else if (entry.type == "forward" || entry.type == "option") {
             // Call pricing.forward.quote RPC with registry source
             // Note: Forward pricing doesn't have separate mark/market sources yet
-            LogPrintf("ContractRegistryModel::computeMTM pricing.forward.quote start id=%s\n",
+            LogDebug(BCLog::QT, "ContractRegistryModel::computeMTM pricing.forward.quote start id=%s\n",
                       entry.id.toStdString().c_str());
             auto result = walletModel->pricingForwardQuote(
                 "registry",
@@ -793,7 +814,7 @@ void ContractRegistryModel::computeMTM(WalletModel* walletModel, ContractEntry& 
                 true,           // report_is_native (default to TSC)
                 false           // compute_greeks (skip for performance)
             );
-            LogPrintf("ContractRegistryModel::computeMTM pricing.forward.quote done id=%s success=%d elapsed_ms=%lld\n",
+            LogDebug(BCLog::QT, "ContractRegistryModel::computeMTM pricing.forward.quote done id=%s success=%d elapsed_ms=%lld\n",
                       entry.id.toStdString().c_str(),
                       result.success,
                       timer.elapsed());
@@ -819,7 +840,7 @@ void ContractRegistryModel::computeMTM(WalletModel* walletModel, ContractEntry& 
             if (entry.status != "opened") {
                 entry.mtmComputed = false;
             } else {
-                LogPrintf("ContractRegistryModel::computeMTM pricing.difficulty.quote start id=%s\n",
+                LogDebug(BCLog::QT, "ContractRegistryModel::computeMTM pricing.difficulty.quote start id=%s\n",
                           entry.id.toStdString().c_str());
                 auto result = walletModel->pricingDifficultyQuote(
                     "registry",
@@ -827,7 +848,7 @@ void ContractRegistryModel::computeMTM(WalletModel* walletModel, ContractEntry& 
                     QVariantMap(),
                     false
                 );
-                LogPrintf("ContractRegistryModel::computeMTM pricing.difficulty.quote done id=%s success=%d elapsed_ms=%lld\n",
+                LogDebug(BCLog::QT, "ContractRegistryModel::computeMTM pricing.difficulty.quote done id=%s success=%d elapsed_ms=%lld\n",
                           entry.id.toStdString().c_str(),
                           result.success,
                           timer.elapsed());
@@ -863,10 +884,10 @@ void ContractRegistryModel::computeMTM(WalletModel* walletModel, ContractEntry& 
             if (entry.status != "opened" && entry.status != "partially_settled") {
                 entry.mtmComputed = false;
             } else {
-                LogPrintf("ContractRegistryModel::computeMTM scalarcfd.price start id=%s\n",
+                LogDebug(BCLog::QT, "ContractRegistryModel::computeMTM scalarcfd.price start id=%s\n",
                           entry.id.toStdString().c_str());
                 auto result = walletModel->scalarCfdPrice(entry.id);
-                LogPrintf("ContractRegistryModel::computeMTM scalarcfd.price done id=%s success=%d elapsed_ms=%lld\n",
+                LogDebug(BCLog::QT, "ContractRegistryModel::computeMTM scalarcfd.price done id=%s success=%d elapsed_ms=%lld\n",
                           entry.id.toStdString().c_str(),
                           result.success,
                           timer.elapsed());
@@ -904,13 +925,23 @@ void ContractRegistryModel::computeMTM(WalletModel* walletModel, ContractEntry& 
         entry.mtmComputed = false;
     }
 
-    LogPrintf("ContractRegistryModel::computeMTM done wallet=%s id=%s computed=%d mark=%f market=%f elapsed_ms=%lld\n",
-              walletModel->getWalletName().toStdString().c_str(),
-              entry.id.toStdString().c_str(),
-              entry.mtmComputed,
-              entry.mtmMarks,
-              entry.mtmMarket,
-              timer.elapsed());
+    if (timer.elapsed() >= SLOW_REFRESH_MS) {
+        LogPrintf("ContractRegistryModel::computeMTM done (slow) wallet=%s id=%s computed=%d mark=%f market=%f elapsed_ms=%lld\n",
+                  walletModel->getWalletName().toStdString().c_str(),
+                  entry.id.toStdString().c_str(),
+                  entry.mtmComputed,
+                  entry.mtmMarks,
+                  entry.mtmMarket,
+                  timer.elapsed());
+    } else {
+        LogDebug(BCLog::QT, "ContractRegistryModel::computeMTM done wallet=%s id=%s computed=%d mark=%f market=%f elapsed_ms=%lld\n",
+                 walletModel->getWalletName().toStdString().c_str(),
+                 entry.id.toStdString().c_str(),
+                 entry.mtmComputed,
+                 entry.mtmMarks,
+                 entry.mtmMarket,
+                 timer.elapsed());
+    }
 }
 
 QString ContractRegistryModel::formatMTM(double mtm, bool computed) const

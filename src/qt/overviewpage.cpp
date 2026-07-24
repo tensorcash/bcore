@@ -43,6 +43,10 @@
 #define DECORATION_SIZE 54
 #define NUM_ITEMS 5
 
+// Routine refresh traces go to the qt debug category (-debug=qt); operations
+// slower than this are escalated to the unconditional log.
+static constexpr qint64 SLOW_REFRESH_MS = 250;
+
 Q_DECLARE_METATYPE(interfaces::WalletBalances)
 
 class TxViewDelegate : public QAbstractItemDelegate
@@ -581,7 +585,10 @@ void OverviewPage::refreshOverviewPanels()
         return;
     }
 
-    LogPrintf("OverviewPage::refreshOverviewPanels dispatch wallet=%s visible=%d privacy=%d\n",
+    // Routine refresh traces are debug-category (-debug=qt); a 30s timer per
+    // loaded wallet otherwise floods debug.log with tens of thousands of
+    // lines per session.
+    LogDebug(BCLog::QT, "OverviewPage::refreshOverviewPanels dispatch wallet=%s visible=%d privacy=%d\n",
               walletModel->getWalletName().toStdString().c_str(),
               isVisible(),
               m_privacy);
@@ -791,21 +798,28 @@ OverviewPage::WalletMtmSnapshot OverviewPage::fetchWalletMtm(WalletModel* wm)
     QElapsedTimer timer;
     timer.start();
     const std::string wallet_name = wm->getWalletName().toStdString();
-    LogPrintf("OverviewPage::refreshWalletMtm start wallet=%s\n", wallet_name.c_str());
+    LogDebug(BCLog::QT, "OverviewPage::refreshWalletMtm start wallet=%s\n", wallet_name.c_str());
 
     try {
         // Call the pricing.portfolio.risk RPC
         UniValue params(UniValue::VARR);
         params.push_back(true); // include_balances
 
-        LogPrintf("OverviewPage::refreshWalletMtm calling pricing.portfolio.risk wallet=%s\n",
+        LogDebug(BCLog::QT, "OverviewPage::refreshWalletMtm calling pricing.portfolio.risk wallet=%s\n",
                   wallet_name.c_str());
 
         UniValue result = wm->node().executeRpc("pricing.portfolio.risk", params, wallet_name);
 
-        LogPrintf("OverviewPage::refreshWalletMtm pricing.portfolio.risk returned wallet=%s elapsed_ms=%lld\n",
-                  wallet_name.c_str(),
-                  timer.elapsed());
+        // Routine traces stay debug-category; escalate only when slow.
+        if (timer.elapsed() >= SLOW_REFRESH_MS) {
+            LogPrintf("OverviewPage::refreshWalletMtm pricing.portfolio.risk returned (slow) wallet=%s elapsed_ms=%lld\n",
+                      wallet_name.c_str(),
+                      timer.elapsed());
+        } else {
+            LogDebug(BCLog::QT, "OverviewPage::refreshWalletMtm pricing.portfolio.risk returned wallet=%s elapsed_ms=%lld\n",
+                     wallet_name.c_str(),
+                     timer.elapsed());
+        }
 
         if (result.isObject()) {
             // Parse balance_deltas to get TSC and asset values
@@ -855,9 +869,15 @@ OverviewPage::WalletMtmSnapshot OverviewPage::fetchWalletMtm(WalletModel* wm)
                   timer.elapsed());
     }
 
-    LogPrintf("OverviewPage::refreshWalletMtm done wallet=%s elapsed_ms=%lld\n",
-              wallet_name.c_str(),
-              timer.elapsed());
+    if (timer.elapsed() >= SLOW_REFRESH_MS) {
+        LogPrintf("OverviewPage::refreshWalletMtm done (slow) wallet=%s elapsed_ms=%lld\n",
+                  wallet_name.c_str(),
+                  timer.elapsed());
+    } else {
+        LogDebug(BCLog::QT, "OverviewPage::refreshWalletMtm done wallet=%s elapsed_ms=%lld\n",
+                 wallet_name.c_str(),
+                 timer.elapsed());
+    }
     return snap;
 }
 
@@ -893,7 +913,7 @@ void OverviewPage::refreshContractsOverview()
     QElapsedTimer timer;
     timer.start();
     const int rows_before = listContracts && listContracts->model() ? listContracts->model()->rowCount() : -1;
-    LogPrintf("OverviewPage::refreshContractsOverview start wallet=%s rows_before=%d\n",
+    LogDebug(BCLog::QT, "OverviewPage::refreshContractsOverview start wallet=%s rows_before=%d\n",
               walletModel ? walletModel->getWalletName().toStdString().c_str() : "",
               rows_before);
 
@@ -907,8 +927,15 @@ void OverviewPage::refreshContractsOverview()
     }
 
     const int rows_after = listContracts && listContracts->model() ? listContracts->model()->rowCount() : -1;
-    LogPrintf("OverviewPage::refreshContractsOverview done wallet=%s rows_after=%d elapsed_ms=%lld\n",
-              walletModel ? walletModel->getWalletName().toStdString().c_str() : "",
-              rows_after,
-              timer.elapsed());
+    if (timer.elapsed() >= SLOW_REFRESH_MS) {
+        LogPrintf("OverviewPage::refreshContractsOverview done (slow) wallet=%s rows_after=%d elapsed_ms=%lld\n",
+                  walletModel ? walletModel->getWalletName().toStdString().c_str() : "",
+                  rows_after,
+                  timer.elapsed());
+    } else {
+        LogDebug(BCLog::QT, "OverviewPage::refreshContractsOverview done wallet=%s rows_after=%d elapsed_ms=%lld\n",
+                 walletModel ? walletModel->getWalletName().toStdString().c_str() : "",
+                 rows_after,
+                 timer.elapsed());
+    }
 }
