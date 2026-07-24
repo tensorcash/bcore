@@ -5,12 +5,17 @@
 #ifndef BITCOIN_QT_MODELSPAGE_H
 #define BITCOIN_QT_MODELSPAGE_H
 
+#include <QList>
+#include <QPair>
 #include <QPointer>
+#include <QStringList>
 #include <QWidget>
 #include <QTabWidget>
 #include <QTimer>
 #include <QHash>
 #include <QSet>
+#include <univalue.h>
+#include <atomic>
 #include <memory>
 
 class WalletModel;
@@ -45,8 +50,40 @@ public:
     void setWalletModel(WalletModel* walletModel);
     void setClientModel(ClientModel* clientModel);
 
+    // Off-thread discussion-scope fetch result. Network-scoped data shared
+    // across wallets through the process-wide DiscussionScopesCoordinator in
+    // modelspage.cpp, which owns the in-flight/pending/cache state and
+    // broadcasts completions to every live ModelsPage.
+    struct DiscussionScopesFetchResult {
+        struct Scope {
+            QString scopeType;
+            QString scopeId;
+            QString preview;
+            QString modelIdentifier;
+            quint64 postCount{0};
+        };
+        bool success{false};
+        bool onlyLiveVerified{false};
+        QList<Scope> scopes;
+        // model_hash -> "model_name@commit" pairs from getmodelslist
+        QList<QPair<QString, QString>> modelAliases;
+    };
+    // GUI-thread render of a scopes result; called by the coordinator on cache
+    // hits and completion broadcasts.
+    void applyDiscussionScopes(const DiscussionScopesFetchResult& result);
+    // Labeled scope keys ("type:id" -> label) of a result; the coordinator
+    // diffs them against its per-filter baselines for new-discussion detection.
+    QHash<QString, QString> labeledDiscussionScopes(const DiscussionScopesFetchResult& result) const;
+    // Emits the (single, process-wide) "New discussions" notification; called
+    // by the coordinator on exactly one page per discovery.
+    void emitNewDiscussions(const QStringList& newDiscussionLabels);
+    // Current "hide scopes without live verified" filter state; the coordinator
+    // keys its per-filter state on it and matches broadcasts to pages with it.
+    bool discussionScopesOnlyLiveFilter() const;
+
 protected:
     void showEvent(QShowEvent* event) override;
+    void hideEvent(QHideEvent* event) override;
 
 public Q_SLOTS:
     void refreshMyDeposits();
@@ -163,8 +200,30 @@ private:
     bool discSyncingDiscussionFields{false};
     bool discScopeAliasesLoaded{false};
     QHash<QString, QString> discScopeAliases;
-    QSet<QString> discKnownDiscussionScopes;
-    bool discKnownDiscussionScopesInitialized{false};
+
+    // Off-thread discussion-posts fetch (cosign.discussion_list, plus the
+    // init_bb fallback). Per-page, unlike the scopes fetch: it is bound to this
+    // page's selected scope and captures this page's WalletModel. Coalescing
+    // flags are GUI-thread-only (mirrors TradeBoardTab); the atomic body counter
+    // backs the destructor's bounded wait so no worker body outlives the wallet.
+    struct DiscussionListFetchResult {
+        bool success{false};
+        QString errorText;   // status-label text when !success
+        bool bbInitialized{false};
+        QString scopeType;
+        QString scopeId;
+        UniValue result;
+    };
+    void dispatchDiscussionListFetch(const QString& scopeType, const QString& scopeId, bool force);
+    void renderDiscussionPosts(const DiscussionListFetchResult& result);
+    bool m_discListInFlight{false};
+    bool m_discListPending{false};
+    bool m_discListPendingForce{false};
+    // Guards against a second cosign.discussion_post while one is in flight:
+    // the disabled button alone is not enough because typing re-runs
+    // onDiscussionScopeChanged(), which recomputes the button state.
+    bool m_discPostInFlight{false};
+    std::atomic<int> m_inflightBodies{0};
 
     // Timer for maturity countdown updates
     QTimer* maturityTimer{nullptr};
