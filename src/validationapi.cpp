@@ -615,13 +615,14 @@ std::vector<ValidationAPI::BlockValidationDB::RecentValidation> ValidationAPI::B
     return results;
 }
 
-ValidationAPI::ValidationAPI(ChainstateManager& chainman, const Consensus::Params& consensusParams, bool desktop_mode)
+ValidationAPI::ValidationAPI(ChainstateManager& chainman, const Consensus::Params& consensusParams, bool desktop_mode, bool force_public_endpoint)
     : m_chainman{chainman},
       m_validatedBlocks{consensusParams},
       config{EnvConfig::fromEnvironment("VALIDATOR", 6001, 7001)},
       http_config_{},
       m_http_mode{false},
       m_desktop_mode{desktop_mode},
+      m_force_public_endpoint{force_public_endpoint},
       context{nullptr},
       reqPush{nullptr},
       solPull{nullptr},
@@ -740,13 +741,17 @@ bool ValidationAPI::Initialize() {
         if (http_urls_env || http_bases_env || http_url_env || http_base_env || has_cli_url || m_desktop_mode) {
             // Desktop wallet defaults to the public verification endpoint (no API key required).
             // Server deployments that set env vars will use those instead.
-            const std::string desktop_default = "https://verify.tensorcash.org";
-            const std::string raw_base_urls = has_cli_url ? gArgs.GetArg("-validatorhttpurl", "")
+            const std::string desktop_default = PUBLIC_VERIFY_ENDPOINT;
+            std::string raw_base_urls = has_cli_url ? gArgs.GetArg("-validatorhttpurl", "")
                 : (http_urls_env ? std::string(http_urls_env)
                                  : (http_bases_env ? std::string(http_bases_env)
                                                    : (http_url_env ? std::string(http_url_env)
                                                                    : (http_base_env ? std::string(http_base_env)
                                                                                     : desktop_default))));
+            if (m_force_public_endpoint && raw_base_urls != desktop_default) {
+                LogWarning("VALIDATOR: ignoring configured verification URL override(s); this backend is pinned to %s\n", desktop_default);
+                raw_base_urls = desktop_default;
+            }
             http_config_.base_urls = ParseHttpBaseUrls(raw_base_urls);
             if (http_config_.base_urls.empty()) {
                 LogError("VALIDATOR: HTTP mode enabled but no valid base URLs were configured\n");

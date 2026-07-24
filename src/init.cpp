@@ -755,7 +755,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
 #endif
 
     // Validation API selection and mock controls (primarily for tests/functional)
-    argsman.AddArg("-validationapi=<real|mock|desktop>", "Select external validation backend (real uses ZMQ, mock is in-process and deterministic, desktop uses local quick + HTTPS full/model). Default: real", ArgsManager::ALLOW_ANY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-validationapi=<real|mock|desktop>", "Select external validation backend (real uses ZMQ, mock is in-process and deterministic, desktop uses local quick + HTTPS full/model). mock is only honored on regtest chains; elsewhere it is redirected to the desktop backend pinned to the public verification endpoint. Default: real", ArgsManager::ALLOW_ANY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-mockval-default-quick=<VALUE>", "Default Quick/Smell mock response (Quick_OK_Smell_OK | Quick_OK_Smell_Fail | Quick_Fail_Smell_OK | Quick_Fail_Smell_Fail)", ArgsManager::ALLOW_ANY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-mockval-default-full=<VALUE>", "Default Full mock response (Full_Green | Full_Amber | Full_Red)", ArgsManager::ALLOW_ANY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-mockval-default-model=<VALUE>", "Default Model mock response (Model_OK | Model_Fail)", ArgsManager::ALLOW_ANY, OptionsCategory::DEBUG_TEST);
@@ -1481,7 +1481,30 @@ static ChainstateLoadResult InitAndLoadChainstate(
     const std::string api_mode = to_lower(args.GetArg("-validationapi", "real"));
     // On mockable/testing chains, default to mock unless explicitly overridden
     const bool is_mockable_chain = chainparams.IsMockableChain();
-    if (api_mode == "mock" || (is_mockable_chain && !args.IsArgSet("-validationapi"))) {
+#ifdef ENABLE_MOCK_VALIDATION_ANY_CHAIN
+    // Functional-test builds honor -validationapi=mock on every chain so
+    // mainnet consensus rules can be exercised with stubbed verdicts
+    // (e.g. mining_mainnet.py). Release builds compile the redirect below.
+    const bool allow_mock_backend = true;
+    if (api_mode == "mock" && !is_mockable_chain) {
+        LogWarning("ValidationAPI: honoring -validationapi=mock on non-mockable chain '%s' (test-only build with ENABLE_MOCK_VALIDATION_ANY_CHAIN)\n",
+                   chainparams.GetChainTypeString());
+    }
+#else
+    const bool allow_mock_backend = is_mockable_chain;
+#endif
+    if (api_mode == "mock" && !allow_mock_backend) {
+        // A mock backend answers its configured default for every block, so a
+        // node running it on a real network will happily extend a RED chain.
+        // Never honor it here: pin the desktop HTTP backend to the public
+        // verification endpoint, ignoring every URL override. Skipping
+        // verification on this chain requires rebuilding from modified sources.
+        LogWarning("ValidationAPI: -validationapi=mock is not available on chain '%s'; using the public verification endpoint %s instead\n",
+                   chainparams.GetChainTypeString(), PUBLIC_VERIFY_ENDPOINT);
+        g_ValidationApi = std::make_unique<ValidationAPI>(chainman, chainparams.GetConsensus(), /*desktop_mode=*/true, /*force_public_endpoint=*/true);
+        g_ValidationApi->Initialize();
+        LogPrintf("ValidationAPI: using desktop HTTP backend pinned to %s\n", PUBLIC_VERIFY_ENDPOINT);
+    } else if (api_mode == "mock" || (is_mockable_chain && !args.IsArgSet("-validationapi"))) {
         auto mock = std::make_unique<ValidationAPIMock>();
         // Apply defaults if provided
         if (args.IsArgSet("-mockval-default-quick")) {

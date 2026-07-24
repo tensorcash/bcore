@@ -14,7 +14,7 @@ order to maximally raise the difficulty. Verify this using the getmininginfo RPC
 
 """
 
-from test_framework.test_framework import BitcoinTestFramework
+from test_framework.test_framework import BitcoinTestFramework, SkipTest
 from test_framework.util import assert_equal
 from test_framework.blocktools import (
     create_coinbase,
@@ -195,6 +195,13 @@ class MiningMainnetTest(BitcoinTestFramework):
 
     def run_test(self):
         node = self.nodes[0]
+        # Release-configured builds redirect -validationapi=mock to the pinned
+        # public verification endpoint on the non-mockable tensor chain, and
+        # this test's synthetic blocks cannot pass real verification. CI test
+        # builds enable the mock via -DENABLE_MOCK_VALIDATION_ANY_CHAIN=ON.
+        with open(node.debug_log_path, "rb") as fh:
+            if b"-validationapi=mock is not available on chain" in fh.read():
+                raise SkipTest("binary redirects mock validation on the tensor chain; rebuild with -DENABLE_MOCK_VALIDATION_ANY_CHAIN=ON")
         # Clear disk space warning
         node.stderr.seek(0)
         node.stderr.truncate()

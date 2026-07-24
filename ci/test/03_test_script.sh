@@ -102,7 +102,10 @@ if [ "$DOWNLOAD_PREVIOUS_RELEASES" = "true" ]; then
   test/get_previous_releases.py -b -t "$PREVIOUS_RELEASES_DIR"
 fi
 
-BITCOIN_CONFIG_ALL="-DBUILD_BENCH=ON -DBUILD_FUZZ_BINARY=ON"
+# ENABLE_MOCK_VALIDATION_ANY_CHAIN: functional tests (mining_mainnet.py)
+# exercise mainnet consensus rules with the in-process validation mock, which
+# release builds redirect to the public verification endpoint.
+BITCOIN_CONFIG_ALL="-DBUILD_BENCH=ON -DBUILD_FUZZ_BINARY=ON -DENABLE_MOCK_VALIDATION_ANY_CHAIN=ON"
 if [ -z "$NO_DEPENDS" ]; then
   BITCOIN_CONFIG_ALL="${BITCOIN_CONFIG_ALL} -DCMAKE_TOOLCHAIN_FILE=$DEPENDS_DIR/$HOST/toolchain.cmake"
 fi
