@@ -819,9 +819,19 @@ bool ValidationAPI::Initialize() {
             }
         }
         if (!HasHttpApiKey()) {
-            LogWarning("*** VALIDATOR WARNING: VALIDATOR_API_KEY is NOT set. "
-                       "Status polling will use the public read-only endpoint "
-                       "(/v1/public/status). Submission requests requiring auth will FAIL. ***\n");
+            if (m_desktop_mode) {
+                // Keyless operation is the normal desktop-wallet configuration:
+                // quick verification runs locally and proof status uses the
+                // public read-only lookup. Don't scare users with a warning.
+                LogPrintf("VALIDATOR: no API key configured; using the keyless public "
+                          "read-only status lookup (/v1/public/status). This is the normal "
+                          "desktop-wallet configuration. Only authenticated remote submission "
+                          "(miners/validators) requires VALIDATOR_API_KEY.\n");
+            } else {
+                LogWarning("*** VALIDATOR WARNING: VALIDATOR_API_KEY is NOT set. "
+                           "Status polling will use the public read-only endpoint "
+                           "(/v1/public/status). Submission requests requiring auth will FAIL. ***\n");
+            }
         }
         StartThreads();
         return true;
