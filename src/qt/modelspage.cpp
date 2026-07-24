@@ -13,6 +13,7 @@
 #include <core_io.h>
 #include <interfaces/node.h>
 #include <chainparams.h>
+#include <logging.h>
 #include <modeldb.h>
 #include <node/interface_ui.h>
 #include <univalue.h>
@@ -44,12 +45,16 @@
 #include <QCoreApplication>
 #include <QElapsedTimer>
 #include <QEventLoop>
+#include <QFutureWatcher>
+#include <QtConcurrent/QtConcurrent>
 #include <QTimer>
 #include <QShowEvent>
+#include <QHideEvent>
 #include <QThread>
 #include <QSettings>
 #include <QTextBrowser>
 #include <algorithm>
+#include <atomic>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -140,6 +145,293 @@ QString FormatRpcError(const UniValue& objError)
     }
 }
 
+// Process-wide coordinator for the discussion-scope discovery fetch. Scopes are
+// per-network data: with several wallets loaded, every ModelsPage shares one
+// in-flight fetch, one pending latch, and one result cache, and completions are
+// broadcast to every live page. The QFutureWatcher is owned here (app lifetime,
+// not page lifetime), so the continuation always runs and wallet unload can
+// never strand the in-flight flag; shutdown waiting happens once, on
+// aboutToQuit, instead of in every page destructor. GUI-thread-only.
+class DiscussionScopesCoordinator : public QObject
+{
+public:
+    static DiscussionScopesCoordinator& instance()
+    {
+        // Deliberately leaked: outliving every ModelsPage and the QApplication
+        // teardown order is the point; the aboutToQuit hook below is the
+        // shutdown barrier.
+        static DiscussionScopesCoordinator* coordinator = new DiscussionScopesCoordinator();
+        return *coordinator;
+    }
+
+    void subscribe(ModelsPage* page)
+    {
+        m_subscribers.removeAll(QPointer<ModelsPage>(nullptr));
+        for (const auto& existing : m_subscribers) {
+            if (existing == page) return;
+        }
+        m_subscribers.append(QPointer<ModelsPage>(page));
+    }
+
+    void request(ModelsPage* page, interfaces::Node* node, bool force)
+    {
+        if (!page || !node) return;
+        const bool onlyLive = page->discussionScopesOnlyLiveFilter();
+        FilterState& slot = filterSlot(onlyLive);
+
+        // One fetch in flight process-wide, but pending state is keyed by
+        // filter so requests for the two variants are never collapsed into
+        // whichever arrived last: each slot keeps its own force latch and
+        // requester list, and the slots drain through successive completions.
+        if (m_inFlight) {
+            if (m_inFlightOnlyLive == onlyLive && !force) {
+                // The in-flight fetch already answers this request; just make
+                // sure this page renders even on failure.
+                addTo(m_requesters, page);
+                return;
+            }
+            slot.pending = true;
+            if (force) slot.pendingForce = true;
+            addTo(slot.pendingRequesters, page);
+            return;
+        }
+
+        // Non-force requests render from this filter's cache when fresh. 25s
+        // keeps the visible page's 30s tick refreshing for real.
+        if (!force && slot.cache.success &&
+            QDateTime::currentMSecsSinceEpoch() - slot.cacheAtMs < CACHE_FRESH_MS) {
+            page->applyDiscussionScopes(slot.cache);
+            return;
+        }
+
+        addTo(m_requesters, page);
+        dispatch(node, force, onlyLive);
+    }
+
+private:
+    static constexpr qint64 CACHE_FRESH_MS = 25000;
+
+    // Per-filter coalescing, cache, and notification baseline:
+    // [0] = all scopes, [1] = only-live-verified. The baselines are per filter
+    // (snapshot semantics) so the first result of one variant is never diffed
+    // against the other variant's baseline.
+    struct FilterState {
+        bool pending{false};
+        bool pendingForce{false};
+        QList<QPointer<ModelsPage>> pendingRequesters;
+        ModelsPage::DiscussionScopesFetchResult cache;
+        qint64 cacheAtMs{0};
+        QSet<QString> knownScopes;
+        bool knownInitialized{false};
+    };
+
+    FilterState& filterSlot(bool onlyLive) { return m_filters[onlyLive ? 1 : 0]; }
+
+    DiscussionScopesCoordinator()
+    {
+        // Bounded wait before the event loop ends: the worker body captures the
+        // node interface, which outlives exec() but not the application
+        // teardown that follows.
+        connect(qApp, &QCoreApplication::aboutToQuit, this, [this]() {
+            QElapsedTimer timer;
+            timer.start();
+            while (m_future.isRunning() && timer.elapsed() < 5000) {
+                QThread::msleep(25);
+            }
+            if (m_future.isRunning()) {
+                LogPrintf("ModelsPage: shutdown timeout — discussion-scope fetch still in flight; proceeding anyway\n");
+            }
+        });
+    }
+
+    static void addTo(QList<QPointer<ModelsPage>>& list, ModelsPage* page)
+    {
+        for (const auto& existing : list) {
+            if (existing == page) return;
+        }
+        list.append(QPointer<ModelsPage>(page));
+    }
+
+    void dispatch(interfaces::Node* node, bool force, bool onlyLive)
+    {
+        m_inFlight = true;
+        m_inFlightOnlyLive = onlyLive;
+        m_node = node;
+
+        auto* watcher = new QFutureWatcher<ModelsPage::DiscussionScopesFetchResult>(this);
+        connect(watcher, &QFutureWatcher<ModelsPage::DiscussionScopesFetchResult>::finished, this,
+                [this, watcher]() {
+            watcher->deleteLater();
+            const ModelsPage::DiscussionScopesFetchResult result = watcher->result();
+            m_inFlight = false;
+
+            const QList<QPointer<ModelsPage>> requesters = m_requesters;
+            m_requesters.clear();
+
+            if (result.success) {
+                FilterState& slot = filterSlot(result.onlyLiveVerified);
+                slot.cache = result;
+                slot.cacheAtMs = QDateTime::currentMSecsSinceEpoch();
+                // Broadcast to every live page whose filter matches; the rest
+                // keep their current contents and pick the cache up on their
+                // next tick or tab-show.
+                m_subscribers.removeAll(QPointer<ModelsPage>(nullptr));
+                QList<QPointer<ModelsPage>> applied;
+                for (const auto& page : m_subscribers) {
+                    if (page && page->discussionScopesOnlyLiveFilter() == result.onlyLiveVerified) {
+                        page->applyDiscussionScopes(result);
+                        applied.append(page);
+                    }
+                }
+                // New-discussion detection: baseline per filter (snapshot
+                // semantics, matching the old per-page behavior), emission
+                // process-wide and deduplicated across filter variants via
+                // m_announcedScopes. Exactly one page emits (they all land in
+                // the same BitcoinGUI), preferring a visible one; runs after
+                // apply so the notifier has the result's aliases for labels.
+                ModelsPage* notifier = nullptr;
+                for (const auto& page : applied) {
+                    if (page && page->isVisible()) { notifier = page; break; }
+                }
+                if (!notifier && !applied.isEmpty()) notifier = applied.first();
+                if (notifier) {
+                    const QHash<QString, QString> labeled = notifier->labeledDiscussionScopes(result);
+                    if (slot.knownInitialized) {
+                        QStringList newLabels;
+                        for (auto it = labeled.cbegin(); it != labeled.cend(); ++it) {
+                            if (!slot.knownScopes.contains(it.key()) && !m_announcedScopes.contains(it.key())) {
+                                newLabels.push_back(it.value());
+                                m_announcedScopes.insert(it.key());
+                            }
+                        }
+                        if (!newLabels.isEmpty()) {
+                            notifier->emitNewDiscussions(newLabels);
+                        }
+                    }
+                    slot.knownScopes = QSet<QString>(labeled.keyBegin(), labeled.keyEnd());
+                    slot.knownInitialized = true;
+
+                    // Prune announced keys absent from both current snapshots
+                    // so a scope that disappears and later reappears notifies
+                    // again (snapshot semantics); keys still present in either
+                    // variant are retained to keep cross-filter overlap
+                    // deduplicated.
+                    for (auto it = m_announcedScopes.begin(); it != m_announcedScopes.end();) {
+                        if (!m_filters[0].knownScopes.contains(*it) &&
+                            !m_filters[1].knownScopes.contains(*it)) {
+                            it = m_announcedScopes.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+                }
+            } else {
+                // Failures render only on the pages that asked, so a background
+                // refresh can't clobber another wallet's combo with the error row.
+                for (const auto& page : requesters) {
+                    if (page) page->applyDiscussionScopes(result);
+                }
+            }
+
+            // Drain the pending filter slots: the first pending slot dispatches
+            // now with its own force latch and requesters; the other (if any)
+            // drains on that fetch's completion. Neither variant is lost.
+            for (int i = 0; i < 2; ++i) {
+                FilterState& slot = m_filters[i];
+                if (!slot.pending) continue;
+                slot.pending = false;
+                const bool pendingForce = slot.pendingForce;
+                slot.pendingForce = false;
+                m_requesters = slot.pendingRequesters;
+                slot.pendingRequesters.clear();
+                dispatch(m_node, pendingForce, i == 1);
+                break;
+            }
+        });
+
+        // The body goes through the cosign bridge -> Nostr relays and blocks in
+        // poll() until they answer — the GUI-thread stall behind the ~2s freeze
+        // cadence. It touches only the node interface (bridge-mutex-serialized)
+        // and plain data — never a page or a widget.
+        m_future = QtConcurrent::run([node, force, onlyLive]() -> ModelsPage::DiscussionScopesFetchResult {
+            ModelsPage::DiscussionScopesFetchResult out;
+            out.onlyLiveVerified = onlyLive;
+
+            // Registry aliases: getmodelslist can wait on cs_main behind block
+            // validation, so it must not run on the GUI thread either.
+            try {
+                UniValue params(UniValue::VARR);
+                params.push_back(true); // short_view
+                const UniValue models = node->executeRpc("getmodelslist", params, "");
+                if (models.isArray()) {
+                    for (size_t i = 0; i < models.size(); ++i) {
+                        const UniValue& model = models[i];
+                        if (!model.isObject() || !model.exists("model_hash") ||
+                            !model.exists("model_name") || !model.exists("model_commit")) {
+                            continue;
+                        }
+                        out.modelAliases.append({QString::fromStdString(model["model_hash"].get_str()),
+                                                 QString("%1@%2")
+                                                     .arg(QString::fromStdString(model["model_name"].get_str()))
+                                                     .arg(QString::fromStdString(model["model_commit"].get_str()))});
+                    }
+                }
+            } catch (...) {
+            }
+
+            try {
+                UniValue params(UniValue::VARR);
+                params.push_back(0);   // since
+                params.push_back(50);  // limit
+                params.push_back(force);
+                params.push_back(onlyLive);
+
+                const UniValue result = node->executeRpc("cosign.discussion_scopes", params, "");
+                if (!result.isObject() || !result.exists("scopes") || !result["scopes"].isArray()) {
+                    return out;
+                }
+
+                const UniValue& scopes = result["scopes"];
+                for (size_t i = 0; i < scopes.size(); ++i) {
+                    const UniValue& scope = scopes[i];
+                    if (!scope.isObject() || !scope.exists("scope_type") || !scope.exists("scope_id")) {
+                        continue;
+                    }
+                    ModelsPage::DiscussionScopesFetchResult::Scope entry;
+                    entry.scopeType = QString::fromStdString(scope["scope_type"].get_str());
+                    entry.scopeId = QString::fromStdString(scope["scope_id"].get_str());
+                    if (scope.exists("latest_content_preview") && scope["latest_content_preview"].isStr()) {
+                        entry.preview = QString::fromStdString(scope["latest_content_preview"].get_str());
+                    }
+                    if (scope.exists("post_count")) {
+                        entry.postCount = scope["post_count"].getInt<uint64_t>();
+                    }
+                    if (scope.exists("model_identifier") && scope["model_identifier"].isStr()) {
+                        entry.modelIdentifier = QString::fromStdString(scope["model_identifier"].get_str());
+                    }
+                    out.scopes.append(entry);
+                }
+                out.success = true;
+            } catch (...) {
+                out.success = false;
+            }
+            return out;
+        });
+        watcher->setFuture(m_future);
+    }
+
+    bool m_inFlight{false};
+    bool m_inFlightOnlyLive{false};
+    interfaces::Node* m_node{nullptr};
+    FilterState m_filters[2];
+    QList<QPointer<ModelsPage>> m_subscribers;
+    QList<QPointer<ModelsPage>> m_requesters;
+    // Scope keys already announced as "new" — dedups the notification across
+    // filter variants (a scope surfacing in both variants notifies once).
+    QSet<QString> m_announcedScopes;
+    QFuture<ModelsPage::DiscussionScopesFetchResult> m_future;
+};
+
 } // namespace
 
 ModelsPage::ModelsPage(const PlatformStyle* platformStyle, QWidget* parent)
@@ -173,6 +465,9 @@ ModelsPage::ModelsPage(const PlatformStyle* platformStyle, QWidget* parent)
     connect(maturityTimer, &QTimer::timeout, this, &ModelsPage::onMaturityTimerTick);
     maturityTimer->start(10000);
 
+    // Receive discussion-scope results fetched on behalf of any wallet's page.
+    DiscussionScopesCoordinator::instance().subscribe(this);
+
     // Install wheel event filters to prevent accidental changes while scrolling
     GUIUtil::InstallWheelEventFilter(myDepositsFilterCombo);
     GUIUtil::InstallWheelEventFilter(registryFilterCombo);
@@ -181,6 +476,18 @@ ModelsPage::ModelsPage(const PlatformStyle* platformStyle, QWidget* parent)
 
 ModelsPage::~ModelsPage()
 {
+    // Bounded wait for this page's own in-flight discussion-posts bodies: they
+    // capture this page's WalletModel and must not outlive it (same shape as
+    // TradeBoardTab::waitForInflightShutdown()). The shared scopes fetch is
+    // owned by DiscussionScopesCoordinator and needs no wait here.
+    QElapsedTimer timer;
+    timer.start();
+    while (m_inflightBodies.load(std::memory_order_acquire) > 0 && timer.elapsed() < 5000) {
+        QThread::msleep(25);
+    }
+    if (m_inflightBodies.load(std::memory_order_acquire) > 0) {
+        LogPrintf("ModelsPage: shutdown timeout — discussion-posts fetch still in flight; proceeding anyway\n");
+    }
 }
 
 void ModelsPage::showEvent(QShowEvent* event)
@@ -197,6 +504,26 @@ void ModelsPage::showEvent(QShowEvent* event)
                 onTabChanged(tabWidget->currentIndex());
             }
         });
+    }
+}
+
+void ModelsPage::hideEvent(QHideEvent* event)
+{
+    QWidget::hideEvent(event);
+
+    // Mirror showEvent(): a spontaneous hide is a window minimize, where the
+    // spontaneous guard in showEvent() would never restart the timers on
+    // restore. Only stop for programmatic hides (page/wallet switch);
+    // showEvent() -> onTabChanged() restarts them when the Discussion tab comes
+    // back in front.
+    if (event->spontaneous()) {
+        return;
+    }
+    if (discScopesRefreshTimer) {
+        discScopesRefreshTimer->stop();
+    }
+    if (discRefreshTimer) {
+        discRefreshTimer->stop();
     }
 }
 
@@ -884,6 +1211,14 @@ void ModelsPage::onTabChanged(int index)
     }
 
     QWidget* current = tabWidget->widget(index);
+
+    // Both discussion timers drive cosign-bridge round-trips; only run them
+    // while the Discussion tab is actually in front.
+    if (current != discussionTab) {
+        if (discScopesRefreshTimer) discScopesRefreshTimer->stop();
+        if (discRefreshTimer) discRefreshTimer->stop();
+    }
+
     if (current == registerTab) {
         resetRegisterValidationState();
         if (!regHowItWorksShownOnce) {
@@ -918,6 +1253,12 @@ void ModelsPage::onTabChanged(int index)
     }
 
     if (current == discussionTab) {
+        if (discScopesRefreshTimer && !discScopesRefreshTimer->isActive()) {
+            discScopesRefreshTimer->start(30000);
+        }
+        // Recompute scope validity so the thread auto-refresh timer restarts
+        // when a valid scope is already selected.
+        onDiscussionScopeChanged();
         onDiscussionLoadActiveScopes(false);
         onDiscussionRefresh();
         return;
@@ -2933,47 +3274,24 @@ void ModelsPage::rememberDiscussionScopeAlias(const QString& scopeType, const QS
 
 void ModelsPage::loadDiscussionScopeAliases(bool force)
 {
+    // Local QSettings only. Registry-derived aliases (getmodelslist) arrive via
+    // the off-thread scopes fetch — that RPC can wait on cs_main behind block
+    // validation and must never run on the GUI thread (see
+    // DiscussionScopesCoordinator / applyDiscussionScopes()).
     if (discScopeAliasesLoaded && !force) return;
 
-    if (!discScopeAliasesLoaded || force) {
-        discScopeAliases.clear();
-        QSettings settings;
-        settings.beginGroup("discussion/scope_aliases");
-        const QStringList keys = settings.childKeys();
-        for (const QString& key : keys) {
-            const QString alias = settings.value(key).toString().trimmed();
-            if (!alias.isEmpty()) {
-                discScopeAliases.insert(key, alias);
-            }
+    discScopeAliases.clear();
+    QSettings settings;
+    settings.beginGroup("discussion/scope_aliases");
+    const QStringList keys = settings.childKeys();
+    for (const QString& key : keys) {
+        const QString alias = settings.value(key).toString().trimmed();
+        if (!alias.isEmpty()) {
+            discScopeAliases.insert(key, alias);
         }
-        settings.endGroup();
-        discScopeAliasesLoaded = true;
     }
-
-    if (!clientModel) return;
-
-    try {
-        UniValue params(UniValue::VARR);
-        params.push_back(true); // short_view
-        UniValue models = clientModel->node().executeRpc("getmodelslist", params, "");
-        if (!models.isArray()) return;
-
-        for (size_t i = 0; i < models.size(); ++i) {
-            const UniValue& model = models[i];
-            if (!model.isObject() || !model.exists("model_hash") ||
-                !model.exists("model_name") || !model.exists("model_commit")) {
-                continue;
-            }
-
-            const QString scopeId = QString::fromStdString(model["model_hash"].get_str());
-            const QString alias = QString("%1@%2")
-                .arg(QString::fromStdString(model["model_name"].get_str()))
-                .arg(QString::fromStdString(model["model_commit"].get_str()));
-            rememberDiscussionScopeAlias("model_prealert", scopeId, alias);
-            rememberDiscussionScopeAlias("model_challenge", scopeId, alias);
-        }
-    } catch (...) {
-    }
+    settings.endGroup();
+    discScopeAliasesLoaded = true;
 }
 
 QString ModelsPage::buildDiscussionScopeLabel(const QString& scopeType, const QString& scopeId, uint64_t postCount, const QString& preview) const
@@ -3295,7 +3613,9 @@ void ModelsPage::setupDiscussionTab()
         onDiscussionLoadActiveScopes(true);
     });
     connect(discHideScopesWithoutLiveVerifiedCheck, &QCheckBox::stateChanged, this, [this](int) {
-        onDiscussionLoadActiveScopes(true);
+        // Not a force refresh: the filter param changed, which already misses the
+        // shared cache (keyed on onlyLiveVerified) and re-queries the bridge.
+        onDiscussionLoadActiveScopes(false);
     });
     connect(discPostsTable, &QTableWidget::cellDoubleClicked,
             this, &ModelsPage::onDiscussionPostDoubleClicked);
@@ -3304,9 +3624,16 @@ void ModelsPage::setupDiscussionTab()
     // Auto-refresh timer (30 seconds)
     discRefreshTimer = new QTimer(this);
     connect(discRefreshTimer, &QTimer::timeout, this, &ModelsPage::onDiscussionAutoRefresh);
+    // Scope-discovery timer: started/stopped by onTabChanged()/hideEvent() so a
+    // hidden Discussion tab never drives relay fan-outs through the bridge.
+    // Periodic ticks are never force refreshes — force (bridge cache clear +
+    // relay re-query) is reserved for the manual refresh button.
     discScopesRefreshTimer = new QTimer(this);
-    connect(discScopesRefreshTimer, &QTimer::timeout, this, [this]() { onDiscussionLoadActiveScopes(true); });
-    discScopesRefreshTimer->start(30000);
+    connect(discScopesRefreshTimer, &QTimer::timeout, this, [this]() {
+        if (isVisible() && tabWidget && tabWidget->currentWidget() == discussionTab) {
+            onDiscussionLoadActiveScopes(false);
+        }
+    });
 
     GUIUtil::InstallWheelEventFilter(discScopeTypeCombo);
     GUIUtil::InstallWheelEventFilter(discMinStakeSpin);
@@ -3339,10 +3666,15 @@ void ModelsPage::onDiscussionScopeChanged()
     if (validScope && scopeType == "model_challenge") {
         validScope = discussionChallengeScopeExists(scopeId);
     }
-    discPostButton->setEnabled(validScope && validIdentifier && !discComposeEdit->toPlainText().trimmed().isEmpty());
+    discPostButton->setEnabled(validScope && validIdentifier &&
+                               !discComposeEdit->toPlainText().trimmed().isEmpty() &&
+                               !m_discPostInFlight);
 
-    // Start/stop auto-refresh based on valid scope
-    if (validScope) {
+    // Start/stop auto-refresh based on valid scope — but never start it while
+    // the Discussion tab is hidden; onTabChanged() re-enters this path on tab
+    // entry, which restarts it for an already-valid scope.
+    const bool discussionShown = isVisible() && tabWidget && tabWidget->currentWidget() == discussionTab;
+    if (validScope && discussionShown) {
         if (!discRefreshTimer->isActive()) {
             discRefreshTimer->start(30000);
         }
@@ -3378,8 +3710,9 @@ void ModelsPage::onDiscussionComposeChanged()
 
 void ModelsPage::onDiscussionAutoRefresh()
 {
-    // Only auto-refresh if the discussion tab is visible
-    if (tabWidget && tabWidget->currentWidget() == discussionTab) {
+    // Only auto-refresh while this page (not just its internal tab) is shown:
+    // a hidden wallet page must not drive bridge round-trips.
+    if (isVisible() && tabWidget && tabWidget->currentWidget() == discussionTab) {
         onDiscussionRefresh();
     }
 }
@@ -3437,11 +3770,46 @@ void ModelsPage::onDiscussionActiveScopeSelected(int index)
     onDiscussionRefresh(true);
 }
 
+bool ModelsPage::discussionScopesOnlyLiveFilter() const
+{
+    return discHideScopesWithoutLiveVerifiedCheck &&
+           discHideScopesWithoutLiveVerifiedCheck->isChecked();
+}
+
 void ModelsPage::onDiscussionLoadActiveScopes(bool force)
 {
     if (!clientModel || !walletModel || !discActiveScopesCombo) return;
+    // In-flight/pending/cache coordination is process-wide — see
+    // DiscussionScopesCoordinator at the top of this file.
+    DiscussionScopesCoordinator::instance().request(this, &clientModel->node(), force);
+}
 
-    loadDiscussionScopeAliases(force);
+// GUI-thread render half of onDiscussionLoadActiveScopes(): rebuilds the combos
+// from the off-thread fetch result (or the shared cache). All widget access
+// stays here.
+void ModelsPage::applyDiscussionScopes(const DiscussionScopesFetchResult& result)
+{
+    if (!discActiveScopesCombo) return;
+
+    if (!result.success) {
+        discActiveScopesCombo->blockSignals(true);
+        discActiveScopesCombo->clear();
+        discActiveScopesCombo->addItem(tr("(failed to load active discussions)"), "");
+        discActiveScopesCombo->blockSignals(false);
+        return;
+    }
+
+    loadDiscussionScopeAliases(false);
+    for (const auto& alias : result.modelAliases) {
+        rememberDiscussionScopeAlias("model_prealert", alias.first, alias.second);
+        rememberDiscussionScopeAlias("model_challenge", alias.first, alias.second);
+    }
+    for (const auto& scope : result.scopes) {
+        if (!scope.modelIdentifier.isEmpty()) {
+            rememberDiscussionScopeAlias(scope.scopeType, scope.scopeId, scope.modelIdentifier);
+        }
+    }
+
     if (discRecentScopesCombo) {
         for (int i = discRecentScopesCombo->count() - 1; i >= 1; --i) {
             const QString entry = discRecentScopesCombo->itemData(i).toString();
@@ -3458,82 +3826,55 @@ void ModelsPage::onDiscussionLoadActiveScopes(bool force)
         }
     }
 
-    try {
-        UniValue params(UniValue::VARR);
-        params.push_back(0);   // since
-        params.push_back(50);  // limit
-        params.push_back(force);
-        params.push_back(discHideScopesWithoutLiveVerifiedCheck &&
-                         discHideScopesWithoutLiveVerifiedCheck->isChecked());
-
-        UniValue result = clientModel->node().executeRpc("cosign.discussion_scopes", params, "");
-        if (!result.isObject() || !result.exists("scopes") || !result["scopes"].isArray()) {
-            return;
+    discActiveScopesCombo->blockSignals(true);
+    discActiveScopesCombo->clear();
+    discActiveScopesCombo->addItem(tr("(load active discussions from relay)"), "");
+    for (const auto& scope : result.scopes) {
+        const QString label = buildDiscussionScopeLabel(scope.scopeType, scope.scopeId, scope.postCount, scope.preview);
+        if (label.isEmpty()) {
+            continue;
         }
-
-        discActiveScopesCombo->blockSignals(true);
-        discActiveScopesCombo->clear();
-        discActiveScopesCombo->addItem(tr("(load active discussions from relay)"), "");
-        QSet<QString> currentScopes;
-        QStringList newDiscussionLabels;
-
-        const UniValue& scopes = result["scopes"];
-        for (size_t i = 0; i < scopes.size(); i++) {
-            const UniValue& scope = scopes[i];
-            if (!scope.isObject() || !scope.exists("scope_type") || !scope.exists("scope_id")) {
-                continue;
-            }
-
-            const QString scopeType = QString::fromStdString(scope["scope_type"].get_str());
-            const QString scopeId = QString::fromStdString(scope["scope_id"].get_str());
-            const QString preview = (scope.exists("latest_content_preview") && scope["latest_content_preview"].isStr())
-                ? QString::fromStdString(scope["latest_content_preview"].get_str())
-                : QString();
-            const uint64_t postCount = (scope.exists("post_count"))
-                ? scope["post_count"].getInt<uint64_t>()
-                : 0;
-            if (scope.exists("model_identifier") && scope["model_identifier"].isStr()) {
-                rememberDiscussionScopeAlias(scopeType, scopeId, QString::fromStdString(scope["model_identifier"].get_str()));
-            }
-
-            QString label = buildDiscussionScopeLabel(scopeType, scopeId, postCount, preview);
-            if (label.isEmpty()) {
-                continue;
-            }
-
-            const QString entry = scopeType + ":" + scopeId;
-            currentScopes.insert(entry);
-            if (discKnownDiscussionScopesInitialized && !discKnownDiscussionScopes.contains(entry)) {
-                newDiscussionLabels.push_back(label);
-            }
-            discActiveScopesCombo->addItem(label, QVariant(entry));
-        }
-        discActiveScopesCombo->blockSignals(false);
-
-        if (discKnownDiscussionScopesInitialized && !newDiscussionLabels.isEmpty()) {
-            const int totalNew = newDiscussionLabels.size();
-            QString body;
-            const int previewCount = std::min(totalNew, 3);
-            for (int i = 0; i < previewCount; ++i) {
-                if (!body.isEmpty()) body += "\n";
-                body += "- " + newDiscussionLabels[i];
-            }
-            if (totalNew > previewCount) {
-                body += tr("\n...and %1 more").arg(totalNew - previewCount);
-            }
-            Q_EMIT this->message(tr("New discussions"), body, CClientUIInterface::MSG_INFORMATION);
-        }
-
-        discKnownDiscussionScopes = currentScopes;
-        discKnownDiscussionScopesInitialized = true;
-    } catch (...) {
-        if (discActiveScopesCombo) {
-            discActiveScopesCombo->blockSignals(true);
-            discActiveScopesCombo->clear();
-            discActiveScopesCombo->addItem(tr("(failed to load active discussions)"), "");
-            discActiveScopesCombo->blockSignals(false);
-        }
+        discActiveScopesCombo->addItem(label, QVariant(scope.scopeType + ":" + scope.scopeId));
     }
+    discActiveScopesCombo->blockSignals(false);
+}
+
+// Labeled scope keys ("type:id" -> display label) of a scopes result, using
+// this page's alias map (converged across pages via shared QSettings plus the
+// result's own aliases, applied in applyDiscussionScopes()). Label-less scopes
+// are excluded, so a scope becomes notifiable once it later gains a valid
+// alias — matching the old per-page behavior.
+QHash<QString, QString> ModelsPage::labeledDiscussionScopes(const DiscussionScopesFetchResult& result) const
+{
+    QHash<QString, QString> labeled;
+    for (const auto& scope : result.scopes) {
+        const QString label = buildDiscussionScopeLabel(scope.scopeType, scope.scopeId, scope.postCount, scope.preview);
+        if (label.isEmpty()) {
+            continue;
+        }
+        labeled.insert(scope.scopeType + ":" + scope.scopeId, label);
+    }
+    return labeled;
+}
+
+// Emits the process-wide "New discussions" notification. The coordinator calls
+// this on exactly one page per discovery (each page's message() lands in the
+// same BitcoinGUI, so per-page emission would notify once per loaded wallet).
+void ModelsPage::emitNewDiscussions(const QStringList& newDiscussionLabels)
+{
+    if (newDiscussionLabels.isEmpty()) return;
+
+    const int totalNew = newDiscussionLabels.size();
+    QString body;
+    const int previewCount = std::min(totalNew, 3);
+    for (int i = 0; i < previewCount; ++i) {
+        if (!body.isEmpty()) body += "\n";
+        body += "- " + newDiscussionLabels[i];
+    }
+    if (totalNew > previewCount) {
+        body += tr("\n...and %1 more").arg(totalNew - previewCount);
+    }
+    Q_EMIT this->message(tr("New discussions"), body, CClientUIInterface::MSG_INFORMATION);
 }
 
 void ModelsPage::onDiscussionHowItWorks()
@@ -3617,8 +3958,8 @@ void ModelsPage::onDiscussionRefresh(bool force)
 {
     if (!clientModel || !walletModel) return;
 
-    QString scopeId = discScopeIdEdit->text().trimmed();
-    QString scopeType = discScopeTypeCombo->currentData().toString();
+    const QString scopeId = discScopeIdEdit->text().trimmed();
+    const QString scopeType = discScopeTypeCombo->currentData().toString();
     if (!kHex64Re.match(scopeId).hasMatch()) {
         discStatusLabel->setText(tr("Enter a valid 64-char hex hash to view discussion"));
         discPostsTable->setRowCount(0);
@@ -3629,57 +3970,142 @@ void ModelsPage::onDiscussionRefresh(bool force)
         discPostsTable->setRowCount(0);
         return;
     }
+
+    // Coalesce concurrent calls; the continuation re-dispatches so a refresh
+    // requested mid-fetch (e.g. after a scope change) is never lost and a
+    // manual force keeps its semantics (mirrors TradeBoardTab).
+    if (m_discListInFlight) {
+        m_discListPending = true;
+        if (force) m_discListPendingForce = true;
+        return;
+    }
+    m_discListInFlight = true;
+
     discStatusLabel->setText(tr("Loading..."));
+    dispatchDiscussionListFetch(scopeType, scopeId, force);
+}
 
-    const auto fetchDiscussionPosts = [this, &scopeType, &scopeId, force]() {
-        // Call cosign.discussion_list RPC
-        UniValue params(UniValue::VARR);
-        params.push_back(scopeType.toStdString());
-        params.push_back(scopeId.toStdString());
-        params.push_back(0);   // since
-        params.push_back(200); // limit
-        params.push_back(force); // force_refresh — bypasses bridge cache on manual Refresh
+void ModelsPage::dispatchDiscussionListFetch(const QString& scopeType, const QString& scopeId, bool force)
+{
+    WalletModel* const wm = walletModel;
+    interfaces::Node* const node = &clientModel->node();
 
-        return clientModel->node().executeRpc("cosign.discussion_list", params, "");
-    };
+    // Backs the destructor's bounded wait: the body captures wm, so no body may
+    // outlive this page.
+    m_inflightBodies.fetch_add(1, std::memory_order_acq_rel);
+    auto bodyDone = std::shared_ptr<void>(nullptr, [counter = &m_inflightBodies](void*) {
+        counter->fetch_sub(1, std::memory_order_acq_rel);
+    });
+
+    auto* watcher = new QFutureWatcher<DiscussionListFetchResult>(this);
+    connect(watcher, &QFutureWatcher<DiscussionListFetchResult>::finished, this, [this, watcher]() {
+        watcher->deleteLater();
+        const DiscussionListFetchResult fetch = watcher->result();
+        renderDiscussionPosts(fetch);
+        m_discListInFlight = false;
+        if (m_discListPending) {
+            m_discListPending = false;
+            const bool pendingForce = m_discListPendingForce;
+            m_discListPendingForce = false;
+            onDiscussionRefresh(pendingForce);
+        }
+    });
+    // discussion_list goes through the cosign bridge -> Nostr relays (and the
+    // init_bb fallback is a bridge spawn + round-trip) — blocking work that
+    // must never run on the GUI thread. The body touches only wm/node, which
+    // are bridge-mutex-serialized, and plain data — never `this` or a widget.
+    watcher->setFuture(QtConcurrent::run([wm, node, bodyDone, scopeType, scopeId, force]() -> DiscussionListFetchResult {
+        (void)bodyDone; // keeps the destructor-wait counter held for the body's duration
+        DiscussionListFetchResult out;
+        out.scopeType = scopeType;
+        out.scopeId = scopeId;
+
+        const auto fetchDiscussionPosts = [&]() {
+            // Call cosign.discussion_list RPC
+            UniValue params(UniValue::VARR);
+            params.push_back(scopeType.toStdString());
+            params.push_back(scopeId.toStdString());
+            params.push_back(0);   // since
+            params.push_back(200); // limit
+            params.push_back(force); // force_refresh — bypasses bridge cache on manual Refresh
+
+            return node->executeRpc("cosign.discussion_list", params, "");
+        };
+
+        try {
+            try {
+                out.result = fetchDiscussionPosts();
+                out.bbInitialized = true;
+                out.success = true;
+            } catch (const UniValue& e) {
+                const QString err = FormatRpcError(e);
+                const bool needsInit =
+                    err.contains("init_bb first", Qt::CaseInsensitive) ||
+                    err.contains("not initialized", Qt::CaseInsensitive);
+
+                if (!needsInit) {
+                    throw;
+                }
+
+                QStringList defaultRelays = {
+                    "wss://relay.damus.io",
+                    "wss://nos.lol",
+                    "wss://relay.snort.social"
+                };
+                auto initResult = wm->bulletinBoardInit(defaultRelays);
+                if (!initResult.success) {
+                    out.errorText = QCoreApplication::translate("ModelsPage", "Bulletin board init failed: %1").arg(initResult.error);
+                    return out;
+                }
+
+                out.bbInitialized = true;
+                out.result = fetchDiscussionPosts();
+                out.success = true;
+            }
+        } catch (const UniValue& e) {
+            out.errorText = QCoreApplication::translate("ModelsPage", "Error: %1").arg(FormatRpcError(e));
+        } catch (const std::exception& e) {
+            out.errorText = QCoreApplication::translate("ModelsPage", "Error: %1").arg(e.what());
+        }
+        return out;
+    }));
+}
+
+// GUI-thread render half of onDiscussionRefresh(): rebuilds the posts table
+// from the off-thread fetch result. All widget access stays here.
+void ModelsPage::renderDiscussionPosts(const DiscussionListFetchResult& fetch)
+{
+    if (!discPostsTable || !discStatusLabel) return;
+
+    // Drop stale renders: the user changed scope while the fetch was in
+    // flight; the coalesced pending re-dispatch fetches the new scope.
+    const QString currentScopeId = discScopeIdEdit ? discScopeIdEdit->text().trimmed() : QString();
+    const QString currentScopeType = discScopeTypeCombo ? discScopeTypeCombo->currentData().toString() : QString();
+    if (fetch.scopeId != currentScopeId || fetch.scopeType != currentScopeType) {
+        return;
+    }
+
+    if (fetch.bbInitialized) {
+        discBbInitialized = true;
+    }
+
+    if (!fetch.success) {
+        discStatusLabel->setText(fetch.errorText);
+        discPostsTable->setRowCount(0);
+        return;
+    }
+
+    const QString& scopeType = fetch.scopeType;
+    const QString& scopeId = fetch.scopeId;
+    const UniValue& result = fetch.result;
+
+    if (!result.isObject() || !result.exists("posts")) {
+        discStatusLabel->setText(tr("No posts or bridge unavailable"));
+        discPostsTable->setRowCount(0);
+        return;
+    }
 
     try {
-        UniValue result;
-        try {
-            result = fetchDiscussionPosts();
-            discBbInitialized = true;
-        } catch (const UniValue& e) {
-            const QString err = FormatRpcError(e);
-            const bool needsInit =
-                err.contains("init_bb first", Qt::CaseInsensitive) ||
-                err.contains("not initialized", Qt::CaseInsensitive);
-
-            if (!needsInit) {
-                throw;
-            }
-
-            QStringList defaultRelays = {
-                "wss://relay.damus.io",
-                "wss://nos.lol",
-                "wss://relay.snort.social"
-            };
-            auto initResult = walletModel->bulletinBoardInit(defaultRelays);
-            if (!initResult.success) {
-                discStatusLabel->setText(tr("Bulletin board init failed: %1").arg(initResult.error));
-                discPostsTable->setRowCount(0);
-                return;
-            }
-
-            discBbInitialized = true;
-            result = fetchDiscussionPosts();
-        }
-
-        if (!result.isObject() || !result.exists("posts")) {
-            discStatusLabel->setText(tr("No posts or bridge unavailable"));
-            discPostsTable->setRowCount(0);
-            return;
-        }
-
         int currentHeight = result.exists("current_height") ? result["current_height"].getInt<int>() : 0;
         const UniValue& posts = result["posts"];
 
@@ -3885,6 +4311,10 @@ void ModelsPage::onDiscussionRefresh(bool force)
 void ModelsPage::onDiscussionPost()
 {
     if (!clientModel || !walletModel) return;
+    // One post at a time: the disabled button alone is not enough, because
+    // typing during the in-flight post runs onDiscussionScopeChanged(), which
+    // recomputes the button state.
+    if (m_discPostInFlight) return;
 
     QString content = discComposeEdit->toPlainText().trimmed();
     if (content.isEmpty()) {
@@ -3944,43 +4374,95 @@ void ModelsPage::onDiscussionPost()
         discRefreshTimer->stop();
     }
 
-    try {
-        UniValue params(UniValue::VARR);
-        params.push_back(scopeType.toStdString());
-        params.push_back(scopeId.toStdString());
-        params.push_back(content.toStdString());
-        params.push_back(200); // expiry_blocks
-        params.push_back(discMinStakeSpin->value()); // min_stake
-        params.push_back(modelIdentifier.toStdString());
+    // cosign.discussion_post builds a BIP-322 proof and publishes to Nostr
+    // relays through the bridge — a multi-second round-trip that must not run
+    // on the GUI thread. Params are frozen here; the body touches only the
+    // node interface and plain data — never `this` or a widget.
+    m_discPostInFlight = true;
+    interfaces::Node* const node = &clientModel->node();
+    const std::string walletName = walletModel->getWalletName().toStdString();
+    const int minStake = discMinStakeSpin->value();
 
-        UniValue result = clientModel->node().executeRpc(
-            "cosign.discussion_post", params,
-            walletModel->getWalletName().toStdString());
+    // Backs the destructor's bounded wait so the body cannot outlive teardown.
+    m_inflightBodies.fetch_add(1, std::memory_order_acq_rel);
+    auto bodyDone = std::shared_ptr<void>(nullptr, [counter = &m_inflightBodies](void*) {
+        counter->fetch_sub(1, std::memory_order_acq_rel);
+    });
 
-        discComposeEdit->clear();
-        discStatusLabel->setText(tr("Posted successfully"));
-        onDiscussionLoadActiveScopes(false);
+    struct PostResult {
+        bool success{false};
+        QString error;
+    };
+    auto* watcher = new QFutureWatcher<PostResult>(this);
+    connect(watcher, &QFutureWatcher<PostResult>::finished, this,
+            [this, watcher, restartScopesTimer, restartThreadTimer, scopeType, scopeId, content]() {
+        watcher->deleteLater();
+        const PostResult post = watcher->result();
+        m_discPostInFlight = false;
 
-        // Refresh to show new post (force to bypass cache)
-        QTimer::singleShot(1000, this, [this]() { onDiscussionRefresh(true); });
+        const bool discussionShown = isVisible() && tabWidget && tabWidget->currentWidget() == discussionTab;
 
-    } catch (const UniValue& e) {
-        showError(tr("Failed to post: %1").arg(FormatRpcError(e)));
-        discStatusLabel->setText(tr("Post failed"));
-    } catch (const std::exception& e) {
-        showError(tr("Failed to post: %1").arg(e.what()));
-        discStatusLabel->setText(tr("Post failed"));
-    }
+        if (post.success) {
+            // Only clear the draft if it is still the submitted text — the
+            // user may have started a new draft while the post was in flight.
+            if (discComposeEdit && discComposeEdit->toPlainText().trimmed() == content) {
+                discComposeEdit->clear();
+            }
+            discStatusLabel->setText(tr("Posted successfully"));
+            if (discussionShown) {
+                onDiscussionLoadActiveScopes(false);
+            }
 
-    if (restartScopesTimer && discScopesRefreshTimer && !discScopesRefreshTimer->isActive()) {
-        discScopesRefreshTimer->start(30000);
-    }
-    if (restartThreadTimer && discRefreshTimer && !discRefreshTimer->isActive()) {
-        discRefreshTimer->start(30000);
-    }
+            // Refresh to show the new post (force to bypass cache), but only
+            // if the page is still shown and still on the submitted scope when
+            // the delayed callback fires.
+            QTimer::singleShot(1000, this, [this, scopeType, scopeId]() {
+                if (!isVisible() || !tabWidget || tabWidget->currentWidget() != discussionTab) return;
+                if (!discScopeIdEdit || !discScopeTypeCombo) return;
+                if (discScopeIdEdit->text().trimmed() != scopeId ||
+                    discScopeTypeCombo->currentData().toString() != scopeType) {
+                    return;
+                }
+                onDiscussionRefresh(true);
+            });
+        } else {
+            showError(tr("Failed to post: %1").arg(post.error));
+            discStatusLabel->setText(tr("Post failed"));
+        }
 
-    // Re-evaluate button state based on current form contents
-    onDiscussionScopeChanged();
+        // Restart the timers only if the Discussion tab is still in front —
+        // the user may have navigated away during the post.
+        if (discussionShown && restartScopesTimer && discScopesRefreshTimer && !discScopesRefreshTimer->isActive()) {
+            discScopesRefreshTimer->start(30000);
+        }
+        if (discussionShown && restartThreadTimer && discRefreshTimer && !discRefreshTimer->isActive()) {
+            discRefreshTimer->start(30000);
+        }
+
+        // Re-evaluate button state based on current form contents
+        onDiscussionScopeChanged();
+    });
+    watcher->setFuture(QtConcurrent::run([node, bodyDone, scopeType, scopeId, content, minStake, modelIdentifier, walletName]() -> PostResult {
+        (void)bodyDone; // keeps the destructor-wait counter held for the body's duration
+        PostResult out;
+        try {
+            UniValue params(UniValue::VARR);
+            params.push_back(scopeType.toStdString());
+            params.push_back(scopeId.toStdString());
+            params.push_back(content.toStdString());
+            params.push_back(200); // expiry_blocks
+            params.push_back(minStake); // min_stake
+            params.push_back(modelIdentifier.toStdString());
+
+            node->executeRpc("cosign.discussion_post", params, walletName);
+            out.success = true;
+        } catch (const UniValue& e) {
+            out.error = FormatRpcError(e);
+        } catch (const std::exception& e) {
+            out.error = QString::fromUtf8(e.what());
+        }
+        return out;
+    }));
 }
 
 void ModelsPage::onDiscussionPostDoubleClicked(int row, int /*column*/)

@@ -18,6 +18,7 @@
 #include <vector>
 
 #include <QCache>
+#include <QMutex>
 #include <QObject>
 #include <QPair>
 #include <QVariantMap>
@@ -1475,6 +1476,11 @@ private:
     std::unique_ptr<interfaces::Handler> m_handler_can_get_addrs_changed;
     ClientModel* m_client_model;
     interfaces::Node& m_node;
+    // Bulletin-board identity state, guarded by m_bulletin_board_mutex: read
+    // and written from the GUI thread and from TradeBoardTab/ModelsPage
+    // QtConcurrent worker bodies (bulletinBoardInit(), the init_bb replay in
+    // executeBulletinBoardRpc(), getBridgeNostrPubkey()).
+    QMutex m_bulletin_board_mutex;
     QString m_bulletin_board_key_path;
     QString m_bulletin_board_pubkey;
     QStringList m_bulletin_board_relays;

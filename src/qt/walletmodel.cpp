@@ -25,12 +25,13 @@
 #include <QPair>
 #include <QRegularExpression>
 #include <QStandardPaths>
-#include <QUuid>
 #include <QStringList>
 #include <cmath>
 
+#include <chainparams.h>
 #include <logging.h>
 #include <common/args.h> // for GetBoolArg
+#include <util/fs.h>
 #include <interfaces/handler.h>
 #include <interfaces/node.h>
 #include <key_io.h>
@@ -1418,8 +1419,11 @@ WalletModel::BulletinBoardInitResult WalletModel::bulletinBoardInit(const QStrin
             }
         }
 
-        if (resolved_key_path.isEmpty() && !m_bulletin_board_key_path.isEmpty()) {
-            resolved_key_path = m_bulletin_board_key_path;
+        if (resolved_key_path.isEmpty()) {
+            QMutexLocker lock(&m_bulletin_board_mutex);
+            if (!m_bulletin_board_key_path.isEmpty()) {
+                resolved_key_path = m_bulletin_board_key_path;
+            }
         }
 
         if (resolved_key_path.isEmpty()) {
@@ -1439,14 +1443,30 @@ WalletModel::BulletinBoardInitResult WalletModel::bulletinBoardInit(const QStrin
                 keyDir.mkpath(".");
             }
 
-            QString sanitizedWallet = getWalletName();
-            if (sanitizedWallet.isEmpty()) {
-                sanitizedWallet = QStringLiteral("default");
-            }
-            sanitizedWallet.replace(QRegularExpression(QStringLiteral("[^a-zA-Z0-9_-]")), QStringLiteral("_"));
-
-            const QString uuid = QUuid::createUuid().toString(QUuid::WithoutBraces);
-            resolved_key_path = keyDir.filePath(QStringLiteral("%1_%2.nsec").arg(sanitizedWallet, uuid));
+            // One deterministic path per network for the whole process. The
+            // bridge runs a single bulletin-board manager per network and
+            // ignores later same-network init paths (stdio.rs handle_init_bb
+            // is idempotent), so per-wallet paths never yielded per-wallet
+            // identities — they only produced churn: the old UUID suffix meant
+            // a fresh keypair every restart, and each wallet caching its own
+            // proposed path let a post-respawn replay switch the process
+            // identity. A stable path gives one persistent Nostr identity
+            // across wallets, restarts, and replays, and makes concurrent
+            // resolution races benign (every resolver computes the same path).
+            QString network = QString::fromStdString(Params().GetChainTypeString());
+            network.replace(QRegularExpression(QStringLiteral("[^a-zA-Z0-9_-]")), QStringLiteral("_"));
+            // Scope the filename to this node's datadir as well:
+            // AppDataLocation is per OS account, not per -datadir, so two Qt
+            // instances on the same network with different datadirs would
+            // otherwise resolve the same key file — racing the bridge's
+            // non-atomic key exists/write and contending for its sled
+            // databases, whose paths are derived from the key filename.
+            const QByteArray datadirUtf8 =
+                QByteArray::fromStdString(fs::PathToString(gArgs.GetDataDirNet()));
+            const QString datadirTag = QString::fromLatin1(
+                QCryptographicHash::hash(datadirUtf8, QCryptographicHash::Sha256).toHex().left(12));
+            resolved_key_path = keyDir.filePath(
+                QStringLiteral("bulletin_board_%1_%2.nsec").arg(network, datadirTag));
         }
 
         if (!resolved_key_path.isEmpty()) {
@@ -1459,17 +1479,25 @@ WalletModel::BulletinBoardInitResult WalletModel::bulletinBoardInit(const QStrin
         UniValue response = m_client_model->node().executeRpc("cosign.init_bb", params, "");
 
         result.success = true;
-        if (!resolved_key_path.isEmpty()) {
-            m_bulletin_board_key_path = resolved_key_path;
-        }
-        // Cache the relay list so executeBulletinBoardRpc() can replay init_bb
-        // transparently after a bridge process respawn.
-        m_bulletin_board_relays = relays;
 
         // Extract pubkey
         if (response.exists("pubkey") && response["pubkey"].isStr()) {
             result.pubkey = QString::fromStdString(response["pubkey"].get_str());
-            m_bulletin_board_pubkey = result.pubkey;
+        }
+
+        {
+            // This method runs on the GUI thread and inside QtConcurrent worker
+            // bodies (ModelsPage init fallback, executeBulletinBoardRpc replay).
+            QMutexLocker lock(&m_bulletin_board_mutex);
+            if (!resolved_key_path.isEmpty()) {
+                m_bulletin_board_key_path = resolved_key_path;
+            }
+            // Cache the relay list so executeBulletinBoardRpc() can replay
+            // init_bb transparently after a bridge process respawn.
+            m_bulletin_board_relays = relays;
+            if (!result.pubkey.isEmpty()) {
+                m_bulletin_board_pubkey = result.pubkey;
+            }
         }
 
         // Extract relays array
@@ -1504,7 +1532,12 @@ UniValue WalletModel::executeBulletinBoardRpc(const std::string& method, const U
         const bool needsInit =
             errorMsg.contains("init_bb first", Qt::CaseInsensitive) ||
             errorMsg.contains("not initialized", Qt::CaseInsensitive);
-        if (!needsInit || m_bulletin_board_relays.isEmpty()) {
+        QStringList cached_relays;
+        {
+            QMutexLocker lock(&m_bulletin_board_mutex);
+            cached_relays = m_bulletin_board_relays;
+        }
+        if (!needsInit || cached_relays.isEmpty()) {
             throw;
         }
         // The bridge process was respawned (transport error, response timeout,
@@ -1513,7 +1546,7 @@ UniValue WalletModel::executeBulletinBoardRpc(const std::string& method, const U
         // retry the original call once. Same identity, same network.
         LogPrintf("WalletModel::executeBulletinBoardRpc: bridge needs init_bb for method %s, replaying with cached relays\n",
                   method.c_str());
-        auto initResult = bulletinBoardInit(m_bulletin_board_relays);
+        auto initResult = bulletinBoardInit(cached_relays);
         if (!initResult.success) {
             LogPrintf("WalletModel::executeBulletinBoardRpc: replay init_bb failed: %s\n",
                       initResult.error.toStdString().c_str());
@@ -3827,6 +3860,7 @@ WalletModel::CreateProofOfFundsResult WalletModel::createDiscussionProof(
 
 QString WalletModel::getBridgeNostrPubkey()
 {
+    QMutexLocker lock(&m_bulletin_board_mutex);
     return m_bulletin_board_pubkey;
 }
 
