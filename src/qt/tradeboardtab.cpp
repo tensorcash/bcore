@@ -47,6 +47,7 @@
 #include <QGroupBox>
 #include <QMessageBox>
 #include <QDateTime>
+#include <QElapsedTimer>
 #include <QAbstractButton>
 #include <QTimer>
 #include <QInputDialog>
@@ -3289,7 +3290,20 @@ void TradeBoardTab::dispatchOffersFetch(bool force_refresh)
         return;
     }
     if (!bbInitialized) {
-        LogPrintf("TradeBoardTab::dispatchOffersFetch() WARNING: BB not initialized, skipping update\n");
+        // Rate-limited: on a wallet whose bulletin board never initializes,
+        // this fired on every poll tick — thousands of identical lines per
+        // session. Log once per minute with the suppressed count.
+        // GUI-thread-only statics.
+        static QElapsedTimer s_bbWarnTimer;
+        static int s_bbWarnSuppressed = 0;
+        if (!s_bbWarnTimer.isValid() || s_bbWarnTimer.elapsed() >= 60000) {
+            LogPrintf("TradeBoardTab::dispatchOffersFetch() WARNING: BB not initialized, skipping update (%d similar suppressed in last 60s)\n",
+                      s_bbWarnSuppressed);
+            s_bbWarnSuppressed = 0;
+            s_bbWarnTimer.start();
+        } else {
+            ++s_bbWarnSuppressed;
+        }
         return;
     }
 

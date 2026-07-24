@@ -8365,7 +8365,7 @@ static bool CheckMerkleRoot(const CBlock& block, BlockValidationState& state)
 }
 
 static bool CheckPOWFast(const CBlock& block) {  
-    LogPrintf("%s: CheckPOWFast for %s block", __func__, block.GetHash().ToString());
+    LogDebug(BCLog::VALIDATION, "%s: CheckPOWFast for %s block", __func__, block.GetHash().ToString());
     // Accept either commitment format here; strict enforcement happens later in ContextualCheckBlock.
     const bool legacy_ok = (block.pow.GetHash() == block.hashPoW);
     const bool merkle_ok = (block.pow.GetMerkleRoot() == block.hashPoW);
@@ -8378,10 +8378,10 @@ static bool CheckPOWFast(const CBlock& block) {
         return false;
     }
     ValidationResponseValue status;
-    LogPrintf("%s: QuickSmell %s start \n", __func__, block.GetHash().ToString());
+    LogDebug(BCLog::VALIDATION, "%s: QuickSmell %s start \n", __func__, block.GetHash().ToString());
     if (!g_ValidationApi->GetRequestStatus(block.GetHash(), ValidationReqType::Quick_Smell, status))
     {
-        LogPrintf("%s: Quick %s send the validation request\n", __func__, block.GetHash().ToString());
+        LogDebug(BCLog::VALIDATION, "%s: Quick %s send the validation request\n", __func__, block.GetHash().ToString());
         g_ValidationApi->EnqueueApiRequest(block, ValidationReqType::Quick_Smell, ValidationResponseBehavior::Nothing);
         // Never wait on the remote validator while cs_main is held. If this
         // backend has a bounded local quick verifier, use that verdict to keep
@@ -8392,8 +8392,8 @@ static bool CheckPOWFast(const CBlock& block) {
             return true;
         }
     }
-    LogPrintf("%s: QuickSmell %s status=%d\n", __func__, block.GetHash().ToString(), static_cast<int>(status));
-    LogPrintf("%s: QuickSmell %s get the validation answer\n", __func__, block.GetHash().ToString());
+    LogDebug(BCLog::VALIDATION, "%s: QuickSmell %s status=%d\n", __func__, block.GetHash().ToString(), static_cast<int>(status));
+    LogDebug(BCLog::VALIDATION, "%s: QuickSmell %s get the validation answer\n", __func__, block.GetHash().ToString());
     if (status == ValidationResponseValue::Quick_OK_Smell_OK || status == ValidationResponseValue::Quick_Fail_Smell_OK)
         block.m_checked_smell_api = true;
     else
@@ -8567,7 +8567,7 @@ bool CheckBlock(const CBlock& block, BlockValidationState& state, const Consensu
     {
         return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-fast-pow", "fast pow blob validation failure");
     }
-    LogPrintf("CheckPOWFast block smell %d", static_cast<uint8_t>(block.m_checked_smell_api));
+    LogDebug(BCLog::VALIDATION, "CheckPOWFast block smell %d", static_cast<uint8_t>(block.m_checked_smell_api));
     // Check the merkle root.
     if (fCheckMerkleRoot && !CheckMerkleRoot(block, state)) {
         return false;
