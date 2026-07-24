@@ -164,6 +164,10 @@ public:
     virtual bool UsesRequestStatusForBlockProcessing() const { return false; }
 };
 
+//! Public read-only verification lookup endpoint (keyless /v1/public/status/* only).
+//! No trailing slash: a trailing '/' yields '//v1/public/status' -> 404.
+inline constexpr const char* PUBLIC_VERIFY_ENDPOINT{"https://verify.tensorcash.org"};
+
 class ValidationAPI : public IValidationAPI {
 private:
     struct HttpEndpoint {
@@ -455,7 +459,7 @@ private:
         std::optional<std::chrono::steady_clock::time_point> finalize_deadline;
     };
 public:
-    ValidationAPI(ChainstateManager& chainman, const Consensus::Params& consensusParams, bool desktop_mode = false);
+    ValidationAPI(ChainstateManager& chainman, const Consensus::Params& consensusParams, bool desktop_mode = false, bool force_public_endpoint = false);
     ~ValidationAPI() override;
 
     void SendApiRequest(const CBlock& block, const ValidationReqType& type, const ValidationResponseBehavior& behavior) override;
@@ -534,6 +538,10 @@ private:
     HttpConfig http_config_;
     bool m_http_mode{false};
     bool m_desktop_mode{false};
+    //! When set, the HTTP backend is pinned to PUBLIC_VERIFY_ENDPOINT and every
+    //! URL override (CLI or environment) is ignored. Used when a disallowed
+    //! -validationapi=mock is redirected on a non-mockable chain.
+    bool m_force_public_endpoint{false};
     void* context{nullptr};
     void* reqPush{nullptr};
     void* solPull{nullptr};

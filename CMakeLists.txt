@@ -110,6 +110,8 @@ option(BUILD_UTIL "Build bitcoin-util executable." ${BUILD_TESTS})
 
 option(BUILD_ZK_TESTS "Build ZK tests with real Groth16 test vectors (requires blst)." OFF)
 
+option(ENABLE_MOCK_VALIDATION_ANY_CHAIN "Honor -validationapi=mock on non-mockable chains (mainnet/testnet). Functional-test builds only: release builds must keep this OFF so mock validation on a real network is redirected to the pinned public verification endpoint." OFF)
+
 option(BUILD_UTIL_CHAINSTATE "Build experimental bitcoin-chainstate executable." OFF)
 option(BUILD_KERNEL_LIB "Build experimental bitcoinkernel library." ${BUILD_UTIL_CHAINSTATE})
 
@@ -633,6 +635,11 @@ if(BUILD_ZK_TESTS)
   message(STATUS "ZK tests with real test vectors enabled (BUILD_ZK_TESTS=ON)")
 else()
   message(STATUS "ZK tests using mock data (BUILD_ZK_TESTS=OFF)")
+endif()
+
+if(ENABLE_MOCK_VALIDATION_ANY_CHAIN)
+  target_compile_definitions(core_interface INTERFACE ENABLE_MOCK_VALIDATION_ANY_CHAIN)
+  message(WARNING "Mock validation is honored on ALL chains, including mainnet (ENABLE_MOCK_VALIDATION_ANY_CHAIN=ON). Functional-test builds only — never release this binary.")
 endif()
 
 # If the {CXX,LD}FLAGS environment variables are defined during building depends
